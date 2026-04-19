@@ -24,6 +24,7 @@ _speaker_verify = ECAPASpeakerVerifyService()
 # call_id별 enrollment 상태 (Redis 전환 전 인메모리 관리)
 _enrollment_buffers: dict[str, bytearray] = {}
 _enrollment_done: dict[str, bool] = {}
+_verify_results: dict[str, list[dict]] = {}
 
 _PCM_BYTES_PER_SEC = 16000 * 2  # 16kHz, 16-bit mono
 
@@ -58,10 +59,31 @@ async def _try_enroll(call_id: str, pcm_chunk: bytes) -> None:
             logger.error(f"call_id={call_id} enrollment 처리 실패: {e}")
 
 
+def _print_verify_summary(call_id: str) -> None:
+    results = _verify_results.get(call_id, [])
+    if not results:
+        logger.info(f"[VERIFY SUMMARY] call_id={call_id} 검증 없음 (enrollment 미완료)")
+        return
+    total = len(results)
+    passed = sum(1 for r in results if r["verified"])
+    failed = total - passed
+    logger.info(
+        f"\n{'=' * 50}\n"
+        f"[VERIFY SUMMARY] call_id={call_id}\n"
+        f"  총 검증 횟수 : {total}\n"
+        f"  통과(본인)   : {passed} ({passed / total * 100:.1f}%)\n"
+        f"  거부(타인)   : {failed} ({failed / total * 100:.1f}%)\n"
+        f"{'=' * 50}"
+    )
+
+
 def _cleanup_enrollment(call_id: str) -> None:
-    """통화 종료 시 enrollment 버퍼 정리."""
+    """통화 종료 시 enrollment 버퍼 및 결과 정리."""
+    _print_verify_summary(call_id)
     _enrollment_buffers.pop(call_id, None)
     _enrollment_done.pop(call_id, None)
+    _verify_results.pop(call_id, None)
+    _speaker_verify.cleanup(call_id)
 
 
 @router.post("/incoming")
@@ -147,13 +169,18 @@ async def call_websocket(
 
                     await _try_enroll(call_id, chunk)
 
+                    is_verified = False
+                    if _enrollment_done.get(call_id, False):
+                        is_verified = await _speaker_verify.verify(chunk, call_id)
+                        _verify_results.setdefault(call_id, []).append({"verified": is_verified})
+
                     state: CallState = {
                         "call_id": call_id,
                         "tenant_id": tenant_id,
                         "turn_index": turn_index,
                         "audio_chunk": chunk,
                         "is_speech": False,
-                        "is_speaker_verified": False,
+                        "is_speaker_verified": is_verified,
                         "raw_transcript": "",
                         "normalized_text": "",
                         "query_embedding": [],
