@@ -49,3 +49,6 @@ httpx==0.27.2
 
 # Utils
 python-multipart==0.0.12
+
+torch
+torchaudio

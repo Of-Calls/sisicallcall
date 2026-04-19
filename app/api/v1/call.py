@@ -7,6 +7,7 @@ from fastapi.responses import Response
 from app.agents.conversational.graph import build_call_graph
 from app.agents.conversational.state import CallState
 from app.core.events import CALL_ENDED, CALL_STARTED
+from app.services.vad.silero import SileroVADService
 from app.utils.audio import mulaw_to_pcm16, reset_resample_state
 from app.utils.config import settings
 from app.utils.logger import get_logger
@@ -14,8 +15,9 @@ from app.utils.logger import get_logger
 logger = get_logger(__name__)
 router = APIRouter()
 
-# 그래프 싱글톤 (앱 기동 시 1회 컴파일)
+# 싱글톤 — 앱 기동 시 1회만 모델 로드
 _graph = build_call_graph()
+_vad = SileroVADService()
 
 
 @router.post("/incoming")
@@ -86,10 +88,18 @@ async def call_websocket(
                 pcm_bytes = mulaw_to_pcm16(mulaw_bytes)
                 audio_buffer.extend(pcm_bytes)
 
-                # 320ms 분량(16kHz, 16-bit mono = 10240 bytes) 누적 시 그래프 투입
+                # 320ms 분량(16kHz, 16-bit mono = 10240 bytes) 누적 후 VAD → 그래프 투입
                 if len(audio_buffer) >= 10240:
                     chunk = bytes(audio_buffer)
                     audio_buffer.clear()
+
+                    vad_result = await _vad.detect(chunk)
+                    logger.debug(
+                        f"call_id={call_id} VAD is_speech={vad_result['is_speech']} "
+                        f"score={vad_result['score']} duration_ms={vad_result['duration_ms']}"
+                    )
+                    if not vad_result["is_speech"]:
+                        continue
 
                     state: CallState = {
                         "call_id": call_id,

@@ -34,6 +34,9 @@ class Settings(BaseSettings):
     # KNN Router (신용 연구 완료 후 확정)
     knn_confidence_threshold: float = 0.85
 
+    # VAD (KDT-30 threshold 연구 완료 후 확정)
+    vad_threshold: float = 0.5
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 
 
