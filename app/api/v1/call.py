@@ -7,7 +7,7 @@ from fastapi.responses import Response
 from app.agents.conversational.graph import build_call_graph
 from app.agents.conversational.state import CallState
 from app.core.events import CALL_ENDED, CALL_STARTED
-from app.services.speaker_verify.ecapa import ECAPASpeakerVerifyService
+from app.services.speaker_verify.titanet import TitaNetSpeakerVerifyService
 from app.services.vad.silero import SileroVADService
 from app.utils.audio import mulaw_to_pcm16, reset_resample_state
 from app.utils.config import settings
@@ -19,7 +19,7 @@ router = APIRouter()
 # 싱글톤 — 앱 기동 시 1회만 모델 로드
 _graph = build_call_graph()
 _vad = SileroVADService()
-_speaker_verify = ECAPASpeakerVerifyService()
+_speaker_verify = TitaNetSpeakerVerifyService()
 
 # call_id별 enrollment 상태 (Redis 전환 전 인메모리 관리)
 _enrollment_buffers: dict[str, bytearray] = {}

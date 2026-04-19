@@ -52,3 +52,6 @@ python-multipart==0.0.12
 
 torch
 torchaudio
+
+# Speaker Verification
+nemo_toolkit[asr]
