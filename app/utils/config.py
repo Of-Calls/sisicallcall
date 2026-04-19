@@ -40,6 +40,11 @@ class Settings(BaseSettings):
     # Speaker Enrollment (KDT-40 실험용 — 3.0 / 5.0 / 10.0 전환 가능)
     enrollment_target_sec: float = 5.0
 
+    # ECAPA-TDNN (KDT-39 실험용 — threshold는 KDT-50 연구 완료 후 확정)
+    ecapa_model_source: str = "speechbrain/spkrec-ecapa-voxceleb"
+    ecapa_model_savedir: str = "C:/torch_cache/speechbrain/ecapa"
+    ecapa_similarity_threshold: float = 0.70
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 
 
