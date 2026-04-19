@@ -9,9 +9,11 @@ _stt_service: BaseSTTService = DeepgramSTTService()
 
 
 async def stt_node(state: CallState) -> dict:
-    try:
-        transcript = await _stt_service.transcribe(state["audio_chunk"])
-        return {"raw_transcript": transcript}
-    except Exception as e:
-        logger.error(f"STT 실패 call_id={state['call_id']}: {e}")
-        return {"raw_transcript": "", "error": str(e)}
+    # TODO: STT 검증 전 임시 스텁 (KDT-37)
+    return {"raw_transcript": ""}
+    # try:
+    #     transcript = await _stt_service.transcribe(state["audio_chunk"])
+    #     return {"raw_transcript": transcript}
+    # except Exception as e:
+    #     logger.error(f"STT 실패 call_id={state['call_id']}: {e}")
+    #     return {"raw_transcript": "", "error": str(e)}

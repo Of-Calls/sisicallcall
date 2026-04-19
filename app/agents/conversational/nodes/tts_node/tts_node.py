@@ -16,8 +16,10 @@ def _get_tts_service() -> BaseTTSService:
 
 
 async def tts_node(state: CallState) -> dict:
-    try:
-        await _get_tts_service().synthesize_and_stream(state["response_text"])
-    except Exception as e:
-        logger.error(f"TTS 실패 call_id={state['call_id']}: {e}")
+    # TODO: TTS 검증 전 임시 스텁 (KDT-37)
     return {"is_timeout": state.get("is_timeout", False)}
+    # try:
+    #     await _get_tts_service().synthesize_and_stream(state["response_text"])
+    # except Exception as e:
+    #     logger.error(f"TTS 실패 call_id={state['call_id']}: {e}")
+    # return {"is_timeout": state.get("is_timeout", False)}
