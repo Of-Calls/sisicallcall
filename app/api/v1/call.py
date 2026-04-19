@@ -7,6 +7,7 @@ from fastapi.responses import Response
 from app.agents.conversational.graph import build_call_graph
 from app.agents.conversational.state import CallState
 from app.core.events import CALL_ENDED, CALL_STARTED
+from app.services.speaker_verify.ecapa import ECAPASpeakerVerifyService
 from app.services.vad.silero import SileroVADService
 from app.utils.audio import mulaw_to_pcm16, reset_resample_state
 from app.utils.config import settings
@@ -18,6 +19,49 @@ router = APIRouter()
 # 싱글톤 — 앱 기동 시 1회만 모델 로드
 _graph = build_call_graph()
 _vad = SileroVADService()
+_speaker_verify = ECAPASpeakerVerifyService()
+
+# call_id별 enrollment 상태 (Redis 전환 전 인메모리 관리)
+_enrollment_buffers: dict[str, bytearray] = {}
+_enrollment_done: dict[str, bool] = {}
+
+_PCM_BYTES_PER_SEC = 16000 * 2  # 16kHz, 16-bit mono
+
+
+async def _try_enroll(call_id: str, pcm_chunk: bytes) -> None:
+    """VAD 통과 chunk를 enrollment buffer에 누적하고 목표 도달 시 stub 호출."""
+    if _enrollment_done.get(call_id, False):
+        return
+
+    if call_id not in _enrollment_buffers:
+        _enrollment_buffers[call_id] = bytearray()
+
+    _enrollment_buffers[call_id].extend(pcm_chunk)
+
+    accumulated_bytes = len(_enrollment_buffers[call_id])
+    target_bytes = int(settings.enrollment_target_sec * _PCM_BYTES_PER_SEC)
+    accumulated_ms = int(accumulated_bytes / _PCM_BYTES_PER_SEC * 1000)
+    target_ms = int(settings.enrollment_target_sec * 1000)
+    is_ready = accumulated_bytes >= target_bytes
+
+    logger.info(
+        f"call_id={call_id} enrollment 누적={accumulated_ms}ms / 목표={target_ms}ms "
+        f"ready={is_ready}"
+    )
+
+    if is_ready:
+        _enrollment_done[call_id] = True
+        enrollment_audio = bytes(_enrollment_buffers.pop(call_id))
+        try:
+            await _speaker_verify.extract_and_store(enrollment_audio, call_id)
+        except Exception as e:
+            logger.error(f"call_id={call_id} enrollment 처리 실패: {e}")
+
+
+def _cleanup_enrollment(call_id: str) -> None:
+    """통화 종료 시 enrollment 버퍼 정리."""
+    _enrollment_buffers.pop(call_id, None)
+    _enrollment_done.pop(call_id, None)
 
 
 @router.post("/incoming")
@@ -101,6 +145,8 @@ async def call_websocket(
                     if not vad_result["is_speech"]:
                         continue
 
+                    await _try_enroll(call_id, chunk)
+
                     state: CallState = {
                         "call_id": call_id,
                         "tenant_id": tenant_id,
@@ -132,12 +178,15 @@ async def call_websocket(
 
             elif event == "stop":
                 logger.info(f"[{CALL_ENDED}] call_id={call_id}")
+                _cleanup_enrollment(call_id)
                 reset_resample_state()
                 break
 
     except WebSocketDisconnect:
         logger.info(f"WebSocket 종료 call_id={call_id}")
+        _cleanup_enrollment(call_id)
         reset_resample_state()
     except Exception as e:
         logger.error(f"call_id={call_id} WebSocket 오류: {e}")
+        _cleanup_enrollment(call_id)
         reset_resample_state()

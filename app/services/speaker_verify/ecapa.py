@@ -13,5 +13,10 @@ class ECAPASpeakerVerifyService(BaseSpeakerVerifyService):
         raise NotImplementedError
 
     async def extract_and_store(self, audio_chunk: bytes, call_id: str) -> None:
-        # TODO(대영): voiceprint 추출 후 Redis call:{call_id}:voiceprint 저장
-        raise NotImplementedError
+        # TODO(대영): ECAPA-TDNN 추론 후 Redis call:{call_id}:voiceprint 저장
+        duration_ms = int(len(audio_chunk) / (16000 * 2) * 1000)
+        logger.info(
+            f"[STUB] call_id={call_id} voiceprint 추출 대상 "
+            f"audio={duration_ms}ms ({len(audio_chunk)} bytes) "
+            f"— ECAPA-TDNN 구현 후 실제 추론 예정"
+        )
