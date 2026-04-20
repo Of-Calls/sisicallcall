@@ -1,0 +1,101 @@
+# ==============================================================================
+# 시시콜콜 로컬 DB 환경
+# ------------------------------------------------------------------------------
+# 3개 서비스: PostgreSQL 16 / Redis 7 (AOF on) / ChromaDB 0.5
+#
+# 기동: make up
+# 중지: make down
+# 초기화: make reset  (볼륨 삭제)
+# ==============================================================================
+
+services:
+  # ----------------------------------------------------------------------------
+  # PostgreSQL — tenants / calls / transcripts / call_summaries / voc_analyses
+  #              face_embeddings / knn_intents / rag_documents / mcp_action_logs
+  # ----------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: sisicallcall-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-sisicallcall}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+      POSTGRES_DB: ${POSTGRES_DB:-sisicallcall}
+      # 한글 데이터 대비
+      LANG: C.UTF-8
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # 최초 기동 시 db/init/*.sql 파일을 알파벳 순서대로 자동 실행
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-sisicallcall} -d ${POSTGRES_DB:-sisicallcall}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+  # ----------------------------------------------------------------------------
+  # Redis — 세션 / Semantic Cache / Summary 동기 캐시 / barge-in 상태
+  # AOF persistence 활성화 (매초 flush)
+  # ----------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: sisicallcall-redis
+    command: >
+      redis-server
+      --appendonly yes
+      --appendfsync everysec
+      --maxmemory-policy allkeys-lru
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+  # ----------------------------------------------------------------------------
+  # ChromaDB — 고객사별 RAG 문서 벡터 (HTTP 서버 모드)
+  # 호스트 포트 8001 → 컨테이너 내부 8000 (FastAPI 8000 충돌 회피)
+  # ----------------------------------------------------------------------------
+  chromadb:
+    image: chromadb/chroma:0.5.23
+    container_name: sisicallcall-chromadb
+    ports:
+      - "${CHROMA_PORT:-8001}:8000"
+    volumes:
+      - chroma_data:/chroma/chroma
+    environment:
+      IS_PERSISTENT: "TRUE"
+      PERSIST_DIRECTORY: /chroma/chroma
+      ANONYMIZED_TELEMETRY: "FALSE"
+    healthcheck:
+      # ChromaDB 공식 이미지에 curl이 없을 수 있어 python urllib 사용
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/heartbeat').read()"
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    restart: unless-stopped
+
+# ------------------------------------------------------------------------------
+# Named volumes — 데이터는 docker-compose down 시에도 유지됨
+# make reset 실행 시에만 삭제됨 (docker compose down -v)
+# ------------------------------------------------------------------------------
+volumes:
+  postgres_data:
+    name: sisicallcall_postgres_data
+  redis_data:
+    name: sisicallcall_redis_data
+  chroma_data:
+    name: sisicallcall_chroma_data

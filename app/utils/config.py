@@ -18,7 +18,7 @@ class Settings(BaseSettings):
     google_application_credentials: str = ""
 
     # PostgreSQL
-    database_url: str = "postgresql://sisicollcoll:password@localhost:5432/sisicollcoll"
+    database_url: str = "postgresql://sisicallcall:changeme@localhost:5432/sisicallcall"
 
     # Redis
     redis_url: str = "redis://localhost:6379"
