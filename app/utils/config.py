@@ -41,7 +41,7 @@ class Settings(BaseSettings):
     enrollment_target_sec: float = 5.0
 
     # TitaNet (KDT-39 실험용 — threshold는 KDT-50 연구 완료 후 확정)
-    titanet_model_name: str = "nvidia/speakerverification_en_titanet_small"
+    titanet_model_name: str = "titanet_small"
     titanet_similarity_threshold: float = 0.70
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}

@@ -3,8 +3,8 @@ from abc import ABC, abstractmethod
 
 class BaseSpeakerVerifyService(ABC):
     @abstractmethod
-    async def verify(self, audio_chunk: bytes, call_id: str) -> bool:
-        """화자 검증 — voiceprint 와 비교해 동일 화자 여부 반환."""
+    async def verify(self, audio_chunk: bytes, call_id: str) -> tuple[bool, float]:
+        """화자 검증 — (동일 화자 여부, cosine similarity) 반환."""
         raise NotImplementedError
 
     @abstractmethod
