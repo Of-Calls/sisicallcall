@@ -50,3 +50,10 @@ CLAUDE.md
 docs/
 
 copy_*.py
+
+.cursor/
+.cursorrules
+AGENTS.md
+.claude/
+.claude/skills/
+CLAUDE.md
