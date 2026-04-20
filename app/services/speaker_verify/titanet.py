@@ -38,7 +38,7 @@ class TitaNetSpeakerVerifyService(BaseSpeakerVerifyService):
         audio_signal_len = torch.tensor([audio_signal.shape[1]])  # [1]
         with torch.no_grad():
             _, emb = self._model.forward(
-                input_signal=audio_signal, input_signal_len=audio_signal_len
+                input_signal=audio_signal, input_signal_length=audio_signal_len
             )
         return emb.squeeze().numpy()
 
@@ -57,10 +57,10 @@ class TitaNetSpeakerVerifyService(BaseSpeakerVerifyService):
         except Exception as e:
             logger.error(f"call_id={call_id} voiceprint 추출 실패: {e}")
 
-    async def verify(self, audio_chunk: bytes, call_id: str) -> bool:
+    async def verify(self, audio_chunk: bytes, call_id: str) -> tuple[bool, float]:
         if call_id not in _voiceprints:
             logger.warning(f"call_id={call_id} voiceprint 없음 → bypass (True 반환)")
-            return True
+            return True, 1.0
 
         try:
             embedding = await self._extract_embedding(audio_chunk)
@@ -77,11 +77,11 @@ class TitaNetSpeakerVerifyService(BaseSpeakerVerifyService):
                 f"threshold={settings.titanet_similarity_threshold} "
                 f"verified={is_verified}"
             )
-            return is_verified
+            return is_verified, similarity
 
         except Exception as e:
             logger.error(f"call_id={call_id} 화자 검증 실패: {e}")
-            return False
+            return False, 0.0
 
     def cleanup(self, call_id: str) -> None:
         if _voiceprints.pop(call_id, None) is not None:
