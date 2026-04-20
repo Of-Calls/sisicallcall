@@ -25,17 +25,23 @@ _graph = build_call_graph()
 _vad = SileroVADService()
 _speaker_verify = ECAPASpeakerVerifyService()
 
-# call_id별 enrollment 상태 (Redis 전환 전 인메모리 관리)
+# call_id별 enrollment 상태
 _enrollment_buffers: dict[str, bytearray] = {}
 _enrollment_done: dict[str, bool] = {}
 _verify_results: dict[str, list[dict]] = {}
 
 # 평가 상태
-_eval_labels: dict[str, str] = {}  # call_id → "self" | "background" | "unknown"
+_eval_labels: dict[str, str] = {}       # call_id → "self" | "background" | "unknown"
+_verify_buffers: dict[str, bytearray] = {}  # 1.2초 sliding window
 
-_PCM_BYTES_PER_SEC = 16000 * 2  # 16kHz, 16-bit mono
+_PCM_BYTES_PER_SEC = 16000 * 2          # 16kHz, 16-bit mono
+_CHUNK_BYTES = 10240                     # 320ms
+_VERIFY_WINDOW_BYTES = int(1.2 * _PCM_BYTES_PER_SEC)  # 38400 bytes
+
 _MODEL_LABEL = "ecapa_tdnn"
 _EVAL_DIR = "C:/kdy/Final/eval_results"
+
+_LABEL_TO_SCORE_TYPE = {"self": "genuine", "background": "impostor"}
 
 
 def _get_csv_path(call_id: str) -> str:
@@ -49,7 +55,7 @@ def _write_csv_row(call_id: str, row: dict) -> None:
     with open(path, "a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(
             f,
-            fieldnames=["timestamp", "type", "label", "similarity", "verified", "latency_ms"],
+            fieldnames=["timestamp", "type", "label", "score_type", "similarity", "verified", "latency_ms"],
         )
         if is_new:
             writer.writeheader()
@@ -88,6 +94,7 @@ async def _try_enroll(call_id: str, pcm_chunk: bytes) -> None:
                 "timestamp": datetime.now().isoformat(),
                 "type": "enrollment",
                 "label": "",
+                "score_type": "",
                 "similarity": "",
                 "verified": "",
                 "latency_ms": f"{enrollment_ms:.1f}",
@@ -105,34 +112,35 @@ def _print_verify_summary(call_id: str) -> None:
     total = len(results)
     avg_latency = sum(r["latency_ms"] for r in results) / total
 
-    self_results = [r for r in results if r["label"] == "self"]
-    bg_results = [r for r in results if r["label"] == "background"]
+    genuine = [r for r in results if r["label"] == "self"]
+    impostor = [r for r in results if r["label"] == "background"]
 
-    tar = sum(1 for r in self_results if r["verified"]) / len(self_results) * 100 if self_results else None
-    frr = sum(1 for r in self_results if not r["verified"]) / len(self_results) * 100 if self_results else None
-    far = sum(1 for r in bg_results if r["verified"]) / len(bg_results) * 100 if bg_results else None
+    tar = sum(1 for r in genuine if r["verified"]) / len(genuine) * 100 if genuine else None
+    frr = sum(1 for r in genuine if not r["verified"]) / len(genuine) * 100 if genuine else None
+    far = sum(1 for r in impostor if r["verified"]) / len(impostor) * 100 if impostor else None
 
-    self_sim = [r["similarity"] for r in self_results if r["similarity"] > 0]
-    bg_sim = [r["similarity"] for r in bg_results if r["similarity"] > 0]
+    genuine_sim = [r["similarity"] for r in genuine if r["similarity"] > 0]
+    impostor_sim = [r["similarity"] for r in impostor if r["similarity"] > 0]
 
     lines = [
         f"\n{'=' * 55}",
         f"[VERIFY SUMMARY] model={_MODEL_LABEL} call_id={call_id}",
         f"  총 검증 횟수        : {total}",
         f"  평균 레이턴시       : {avg_latency:.1f}ms",
+        f"  threshold           : {settings.ecapa_similarity_threshold}",
     ]
     if tar is not None:
         lines += [
-            f"  --- 본인(self) {len(self_results)}회 ---",
-            f"  TAR (통과율)        : {tar:.1f}%",
-            f"  FRR (거부율)        : {frr:.1f}%",
-            f"  similarity 평균     : {sum(self_sim)/len(self_sim):.4f}" if self_sim else "  similarity 없음",
+            f"  --- genuine(self) {len(genuine)}회 ---",
+            f"  TAR                 : {tar:.1f}%",
+            f"  FRR                 : {frr:.1f}%",
+            f"  similarity 평균     : {sum(genuine_sim)/len(genuine_sim):.4f}" if genuine_sim else "  similarity 없음",
         ]
     if far is not None:
         lines += [
-            f"  --- 배경(background) {len(bg_results)}회 ---",
-            f"  FAR (barge-in 비율) : {far:.1f}%",
-            f"  similarity 평균     : {sum(bg_sim)/len(bg_sim):.4f}" if bg_sim else "  similarity 없음",
+            f"  --- impostor(background) {len(impostor)}회 ---",
+            f"  FAR (barge-in율)    : {far:.1f}%",
+            f"  similarity 평균     : {sum(impostor_sim)/len(impostor_sim):.4f}" if impostor_sim else "  similarity 없음",
         ]
     lines.append("=" * 55)
     logger.info("\n".join(lines))
@@ -144,6 +152,7 @@ def _cleanup_enrollment(call_id: str) -> None:
     _enrollment_done.pop(call_id, None)
     _verify_results.pop(call_id, None)
     _eval_labels.pop(call_id, None)
+    _verify_buffers.pop(call_id, None)
     _speaker_verify.cleanup(call_id)
 
 
@@ -157,13 +166,9 @@ async def mark_label(call_id: str, label: str = Query(...)):
 
 @router.post("/incoming")
 async def incoming_call(request: Request):
-    """
-    Twilio가 전화 수신 시 호출하는 webhook.
-    TwiML을 반환해 Twilio Media Streams WebSocket 연결을 지시한다.
-    """
     form = await request.form()
     call_sid = form.get("CallSid", "unknown")
-    tenant_id = form.get("To", "unknown")  # Twilio 수신 번호 → tenant 식별자 (임시)
+    tenant_id = form.get("To", "unknown")
 
     logger.info(f"[{CALL_STARTED}] call_sid={call_sid} tenant_id={tenant_id}")
 
@@ -187,10 +192,6 @@ async def call_websocket(
     call_id: str,
     tenant_id: str = Query(default="unknown"),
 ):
-    """
-    Twilio Media Streams WebSocket 엔드포인트.
-    오디오 청크를 수신해 LangGraph 파이프라인에 투입한다.
-    """
     await websocket.accept()
     logger.info(f"WebSocket 연결 수락 call_id={call_id}")
 
@@ -223,8 +224,7 @@ async def call_websocket(
                 pcm_bytes = mulaw_to_pcm16(mulaw_bytes)
                 audio_buffer.extend(pcm_bytes)
 
-                # 320ms 분량(16kHz, 16-bit mono = 10240 bytes) 누적 후 VAD → 그래프 투입
-                if len(audio_buffer) >= 10240:
+                if len(audio_buffer) >= _CHUNK_BYTES:
                     chunk = bytes(audio_buffer)
                     audio_buffer.clear()
 
@@ -240,30 +240,44 @@ async def call_websocket(
 
                     is_verified = False
                     if _enrollment_done.get(call_id, False):
-                        t0 = time.perf_counter()
-                        is_verified, similarity = await _speaker_verify.verify(chunk, call_id)
-                        latency_ms = (time.perf_counter() - t0) * 1000
+                        # 1.2초 sliding window 누적
+                        if call_id not in _verify_buffers:
+                            _verify_buffers[call_id] = bytearray()
+                        _verify_buffers[call_id].extend(chunk)
 
-                        label = _eval_labels.get(call_id, "unknown")
-                        _verify_results.setdefault(call_id, []).append({
-                            "verified": is_verified,
-                            "similarity": similarity,
-                            "label": label,
-                            "latency_ms": latency_ms,
-                        })
-                        _write_csv_row(call_id, {
-                            "timestamp": datetime.now().isoformat(),
-                            "type": "verify",
-                            "label": label,
-                            "similarity": f"{similarity:.4f}",
-                            "verified": is_verified,
-                            "latency_ms": f"{latency_ms:.1f}",
-                        })
-                        logger.info(
-                            f"[EVAL] call_id={call_id} label={label} "
-                            f"similarity={similarity:.4f} verified={is_verified} "
-                            f"latency={latency_ms:.1f}ms"
-                        )
+                        if len(_verify_buffers[call_id]) >= _VERIFY_WINDOW_BYTES:
+                            # 최근 1.2초 추출
+                            verify_audio = bytes(_verify_buffers[call_id][-_VERIFY_WINDOW_BYTES:])
+                            # 320ms stride: 가장 오래된 청크 제거
+                            del _verify_buffers[call_id][:_CHUNK_BYTES]
+
+                            t0 = time.perf_counter()
+                            is_verified, similarity = await _speaker_verify.verify(verify_audio, call_id)
+                            latency_ms = (time.perf_counter() - t0) * 1000
+
+                            label = _eval_labels.get(call_id, "unknown")
+                            score_type = _LABEL_TO_SCORE_TYPE.get(label, "unknown")
+
+                            _verify_results.setdefault(call_id, []).append({
+                                "verified": is_verified,
+                                "similarity": similarity,
+                                "label": label,
+                                "latency_ms": latency_ms,
+                            })
+                            _write_csv_row(call_id, {
+                                "timestamp": datetime.now().isoformat(),
+                                "type": "verify",
+                                "label": label,
+                                "score_type": score_type,
+                                "similarity": f"{similarity:.4f}",
+                                "verified": is_verified,
+                                "latency_ms": f"{latency_ms:.1f}",
+                            })
+                            logger.info(
+                                f"[EVAL] call_id={call_id} label={label} score_type={score_type} "
+                                f"similarity={similarity:.4f} verified={is_verified} "
+                                f"latency={latency_ms:.1f}ms"
+                            )
 
                     state: CallState = {
                         "call_id": call_id,
