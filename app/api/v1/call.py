@@ -1,5 +1,9 @@
 import base64
+import csv
 import json
+import os
+import time
+from datetime import datetime
 
 from fastapi import APIRouter, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response
@@ -26,11 +30,33 @@ _enrollment_buffers: dict[str, bytearray] = {}
 _enrollment_done: dict[str, bool] = {}
 _verify_results: dict[str, list[dict]] = {}
 
+# 평가 상태
+_eval_labels: dict[str, str] = {}  # call_id → "self" | "background" | "unknown"
+
 _PCM_BYTES_PER_SEC = 16000 * 2  # 16kHz, 16-bit mono
+_MODEL_LABEL = "ecapa_tdnn"
+_EVAL_DIR = "C:/kdy/Final/eval_results"
+
+
+def _get_csv_path(call_id: str) -> str:
+    os.makedirs(_EVAL_DIR, exist_ok=True)
+    return f"{_EVAL_DIR}/{_MODEL_LABEL}_{call_id}.csv"
+
+
+def _write_csv_row(call_id: str, row: dict) -> None:
+    path = _get_csv_path(call_id)
+    is_new = not os.path.exists(path)
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=["timestamp", "type", "label", "similarity", "verified", "latency_ms"],
+        )
+        if is_new:
+            writer.writeheader()
+        writer.writerow(row)
 
 
 async def _try_enroll(call_id: str, pcm_chunk: bytes) -> None:
-    """VAD 통과 chunk를 enrollment buffer에 누적하고 목표 도달 시 stub 호출."""
     if _enrollment_done.get(call_id, False):
         return
 
@@ -54,7 +80,18 @@ async def _try_enroll(call_id: str, pcm_chunk: bytes) -> None:
         _enrollment_done[call_id] = True
         enrollment_audio = bytes(_enrollment_buffers.pop(call_id))
         try:
+            t0 = time.perf_counter()
             await _speaker_verify.extract_and_store(enrollment_audio, call_id)
+            enrollment_ms = (time.perf_counter() - t0) * 1000
+            logger.info(f"[EVAL] call_id={call_id} enrollment latency={enrollment_ms:.1f}ms")
+            _write_csv_row(call_id, {
+                "timestamp": datetime.now().isoformat(),
+                "type": "enrollment",
+                "label": "",
+                "similarity": "",
+                "verified": "",
+                "latency_ms": f"{enrollment_ms:.1f}",
+            })
         except Exception as e:
             logger.error(f"call_id={call_id} enrollment 처리 실패: {e}")
 
@@ -64,26 +101,58 @@ def _print_verify_summary(call_id: str) -> None:
     if not results:
         logger.info(f"[VERIFY SUMMARY] call_id={call_id} 검증 없음 (enrollment 미완료)")
         return
+
     total = len(results)
-    passed = sum(1 for r in results if r["verified"])
-    failed = total - passed
-    logger.info(
-        f"\n{'=' * 50}\n"
-        f"[VERIFY SUMMARY] call_id={call_id}\n"
-        f"  총 검증 횟수 : {total}\n"
-        f"  통과(본인)   : {passed} ({passed / total * 100:.1f}%)\n"
-        f"  거부(타인)   : {failed} ({failed / total * 100:.1f}%)\n"
-        f"{'=' * 50}"
-    )
+    avg_latency = sum(r["latency_ms"] for r in results) / total
+
+    self_results = [r for r in results if r["label"] == "self"]
+    bg_results = [r for r in results if r["label"] == "background"]
+
+    tar = sum(1 for r in self_results if r["verified"]) / len(self_results) * 100 if self_results else None
+    frr = sum(1 for r in self_results if not r["verified"]) / len(self_results) * 100 if self_results else None
+    far = sum(1 for r in bg_results if r["verified"]) / len(bg_results) * 100 if bg_results else None
+
+    self_sim = [r["similarity"] for r in self_results if r["similarity"] > 0]
+    bg_sim = [r["similarity"] for r in bg_results if r["similarity"] > 0]
+
+    lines = [
+        f"\n{'=' * 55}",
+        f"[VERIFY SUMMARY] model={_MODEL_LABEL} call_id={call_id}",
+        f"  총 검증 횟수        : {total}",
+        f"  평균 레이턴시       : {avg_latency:.1f}ms",
+    ]
+    if tar is not None:
+        lines += [
+            f"  --- 본인(self) {len(self_results)}회 ---",
+            f"  TAR (통과율)        : {tar:.1f}%",
+            f"  FRR (거부율)        : {frr:.1f}%",
+            f"  similarity 평균     : {sum(self_sim)/len(self_sim):.4f}" if self_sim else "  similarity 없음",
+        ]
+    if far is not None:
+        lines += [
+            f"  --- 배경(background) {len(bg_results)}회 ---",
+            f"  FAR (barge-in 비율) : {far:.1f}%",
+            f"  similarity 평균     : {sum(bg_sim)/len(bg_sim):.4f}" if bg_sim else "  similarity 없음",
+        ]
+    lines.append("=" * 55)
+    logger.info("\n".join(lines))
 
 
 def _cleanup_enrollment(call_id: str) -> None:
-    """통화 종료 시 enrollment 버퍼 및 결과 정리."""
     _print_verify_summary(call_id)
     _enrollment_buffers.pop(call_id, None)
     _enrollment_done.pop(call_id, None)
     _verify_results.pop(call_id, None)
+    _eval_labels.pop(call_id, None)
     _speaker_verify.cleanup(call_id)
+
+
+@router.post("/mark/{call_id}")
+async def mark_label(call_id: str, label: str = Query(...)):
+    """현재 구간 라벨 설정. label=self | background"""
+    _eval_labels[call_id] = label
+    logger.info(f"[EVAL] call_id={call_id} label → {label}")
+    return {"call_id": call_id, "label": label}
 
 
 @router.post("/incoming")
@@ -171,8 +240,30 @@ async def call_websocket(
 
                     is_verified = False
                     if _enrollment_done.get(call_id, False):
-                        is_verified = await _speaker_verify.verify(chunk, call_id)
-                        _verify_results.setdefault(call_id, []).append({"verified": is_verified})
+                        t0 = time.perf_counter()
+                        is_verified, similarity = await _speaker_verify.verify(chunk, call_id)
+                        latency_ms = (time.perf_counter() - t0) * 1000
+
+                        label = _eval_labels.get(call_id, "unknown")
+                        _verify_results.setdefault(call_id, []).append({
+                            "verified": is_verified,
+                            "similarity": similarity,
+                            "label": label,
+                            "latency_ms": latency_ms,
+                        })
+                        _write_csv_row(call_id, {
+                            "timestamp": datetime.now().isoformat(),
+                            "type": "verify",
+                            "label": label,
+                            "similarity": f"{similarity:.4f}",
+                            "verified": is_verified,
+                            "latency_ms": f"{latency_ms:.1f}",
+                        })
+                        logger.info(
+                            f"[EVAL] call_id={call_id} label={label} "
+                            f"similarity={similarity:.4f} verified={is_verified} "
+                            f"latency={latency_ms:.1f}ms"
+                        )
 
                     state: CallState = {
                         "call_id": call_id,

@@ -58,11 +58,11 @@ class ECAPASpeakerVerifyService(BaseSpeakerVerifyService):
         except Exception as e:
             logger.error(f"call_id={call_id} voiceprint 추출 실패: {e}")
 
-    async def verify(self, audio_chunk: bytes, call_id: str) -> bool:
+    async def verify(self, audio_chunk: bytes, call_id: str) -> tuple[bool, float]:
         """발화 오디오와 등록된 voiceprint의 cosine similarity로 화자 검증."""
         if call_id not in _voiceprints:
             logger.warning(f"call_id={call_id} voiceprint 없음 → bypass (True 반환)")
-            return True
+            return True, 1.0
 
         try:
             embedding = await self._extract_embedding(audio_chunk)
@@ -79,11 +79,11 @@ class ECAPASpeakerVerifyService(BaseSpeakerVerifyService):
                 f"threshold={settings.ecapa_similarity_threshold} "
                 f"verified={is_verified}"
             )
-            return is_verified
+            return is_verified, similarity
 
         except Exception as e:
             logger.error(f"call_id={call_id} 화자 검증 실패: {e}")
-            return False
+            return False, 0.0
 
     def cleanup(self, call_id: str) -> None:
         """통화 종료 시 voiceprint 메모리 해제."""
