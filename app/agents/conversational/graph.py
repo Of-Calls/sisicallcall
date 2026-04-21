@@ -71,57 +71,57 @@ def build_call_graph():
 
     # 노드 등록
     graph.add_node("vad", vad_node)
-    graph.add_node("speaker_verify", speaker_verify_node)
-    graph.add_node("stt", stt_node)
-    graph.add_node("norm_text", norm_text_node)
-    graph.add_node("cache", cache_node)
-    graph.add_node("knn_router", knn_router_node)
-    graph.add_node("intent_router_llm", intent_router_llm_node)
-    graph.add_node("faq_branch", faq_branch_node)
-    graph.add_node("task_branch", task_branch_node)
-    graph.add_node("auth_branch", auth_branch_node)
-    graph.add_node("escalation_branch", escalation_branch_node)
-    graph.add_node("reviewer", reviewer_node)
-    graph.add_node("tts", tts_node)
+    # graph.add_node("speaker_verify", speaker_verify_node)
+    # graph.add_node("stt", stt_node)
+    # graph.add_node("norm_text", norm_text_node)
+    # graph.add_node("cache", cache_node)
+    # graph.add_node("knn_router", knn_router_node)
+    # graph.add_node("intent_router_llm", intent_router_llm_node)
+    # graph.add_node("faq_branch", faq_branch_node)
+    # graph.add_node("task_branch", task_branch_node)
+    # graph.add_node("auth_branch", auth_branch_node)
+    # graph.add_node("escalation_branch", escalation_branch_node)
+    # graph.add_node("reviewer", reviewer_node)
+    # graph.add_node("tts", tts_node)
 
     # 진입점
     graph.set_entry_point("vad")
 
     # 전처리 단계
-    graph.add_conditional_edges("vad", route_after_vad,
-        {"pass": "speaker_verify", "skip": END})
-    graph.add_conditional_edges("speaker_verify", route_after_speaker_verify,
-        {"pass": "stt", "reject": END})
-    graph.add_edge("stt", "norm_text")
-    graph.add_edge("norm_text", "cache")
+    # VAD 이후 로직 임시 중단: pass/skip 모두 종료
+    graph.add_conditional_edges("vad", route_after_vad, {"pass": END, "skip": END})
+    # graph.add_conditional_edges("speaker_verify", route_after_speaker_verify,
+    #     {"pass": "stt", "reject": END})
+    # graph.add_edge("stt", "norm_text")
+    # graph.add_edge("norm_text", "cache")
 
     # Gate 1 분기
-    graph.add_conditional_edges("cache", route_after_cache,
-        {"hit": "tts", "miss": "knn_router"})
+    # graph.add_conditional_edges("cache", route_after_cache,
+    #     {"hit": "tts", "miss": "knn_router"})
 
     # KNN → 브랜치 직행 또는 IntentRouterLLM fallback
-    graph.add_conditional_edges("knn_router", route_after_knn, {
-        "faq": "faq_branch",
-        "task": "task_branch",
-        "auth": "auth_branch",
-        "escalation": "escalation_branch",
-        "fallback_llm": "intent_router_llm",
-    })
+    # graph.add_conditional_edges("knn_router", route_after_knn, {
+    #     "faq": "faq_branch",
+    #     "task": "task_branch",
+    #     "auth": "auth_branch",
+    #     "escalation": "escalation_branch",
+    #     "fallback_llm": "intent_router_llm",
+    # })
 
     # IntentRouterLLM → 브랜치
-    graph.add_conditional_edges("intent_router_llm", route_to_branch, {
-        "faq": "faq_branch",
-        "task": "task_branch",
-        "auth": "auth_branch",
-        "escalation": "escalation_branch",
-    })
+    # graph.add_conditional_edges("intent_router_llm", route_to_branch, {
+    #     "faq": "faq_branch",
+    #     "task": "task_branch",
+    #     "auth": "auth_branch",
+    #     "escalation": "escalation_branch",
+    # })
 
     # 브랜치 → (조건부 Reviewer) → TTS
-    for branch in ("faq_branch", "task_branch", "auth_branch", "escalation_branch"):
-        graph.add_conditional_edges(branch, route_after_branch,
-            {"review": "reviewer", "skip_review": "tts"})
+    # for branch in ("faq_branch", "task_branch", "auth_branch", "escalation_branch"):
+    #     graph.add_conditional_edges(branch, route_after_branch,
+    #         {"review": "reviewer", "skip_review": "tts"})
 
-    graph.add_edge("reviewer", "tts")
-    graph.add_edge("tts", END)
+    # graph.add_edge("reviewer", "tts")
+    # graph.add_edge("tts", END)
 
     return graph.compile()

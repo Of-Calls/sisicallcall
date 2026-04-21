@@ -1,5 +1,8 @@
 import base64
 import json
+import wave
+from datetime import datetime
+from pathlib import Path
 
 from fastapi import APIRouter, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response
@@ -13,9 +16,19 @@ from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 router = APIRouter()
+_RECORDINGS_DIR = Path("recordings")
 
 # 그래프 싱글톤 (앱 기동 시 1회 컴파일)
 _graph = build_call_graph()
+
+
+def _save_pcm16_wav(file_path: Path, pcm16_audio: bytes, sample_rate: int = 16000) -> None:
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(file_path), "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(sample_rate)
+        wav_file.writeframes(pcm16_audio)
 
 
 @router.post("/incoming")
@@ -59,6 +72,8 @@ async def call_websocket(
 
     turn_index = 0
     audio_buffer = bytearray()
+    raw_audio_16k = bytearray()
+    vad_pass_audio_16k = bytearray()
 
     try:
         while True:
@@ -85,6 +100,7 @@ async def call_websocket(
                 mulaw_bytes = base64.b64decode(msg["media"]["payload"])
                 pcm_bytes = mulaw_to_pcm16(mulaw_bytes)
                 audio_buffer.extend(pcm_bytes)
+                raw_audio_16k.extend(pcm_bytes)
 
                 # 320ms 분량(16kHz, 16-bit mono = 10240 bytes) 누적 시 그래프 투입
                 if len(audio_buffer) >= 10240:
@@ -117,11 +133,24 @@ async def call_websocket(
                         "error": None,
                     }
 
-                    await _graph.ainvoke(state)
+                    result_state = await _graph.ainvoke(state)
+                    if result_state.get("is_speech", False):
+                        vad_pass_audio_16k.extend(chunk)
                     turn_index += 1
 
             elif event == "stop":
                 logger.info(f"[{CALL_ENDED}] call_id={call_id}")
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                raw_path = _RECORDINGS_DIR / f"{call_id}_{timestamp}_raw.wav"
+                vad_path = _RECORDINGS_DIR / f"{call_id}_{timestamp}_vad.wav"
+                _save_pcm16_wav(raw_path, bytes(raw_audio_16k))
+                _save_pcm16_wav(vad_path, bytes(vad_pass_audio_16k))
+                logger.info(
+                    "통화 오디오 저장 완료 call_id=%s raw=%s vad=%s",
+                    call_id,
+                    raw_path,
+                    vad_path,
+                )
                 reset_resample_state()
                 break
 
