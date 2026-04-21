@@ -33,6 +33,7 @@ _verify_results: dict[str, list[dict]] = {}
 # 평가 상태
 _eval_labels: dict[str, str] = {}       # call_id → "self" | "background" | "unknown"
 _verify_buffers: dict[str, bytearray] = {}  # 1.2초 sliding window
+_call_start_times: dict[str, float] = {}
 
 _PCM_BYTES_PER_SEC = 16000 * 2          # 16kHz, 16-bit mono
 _CHUNK_BYTES = 10240                     # 320ms
@@ -49,13 +50,24 @@ def _get_csv_path(call_id: str) -> str:
     return f"{_EVAL_DIR}/{_MODEL_LABEL}_{call_id}.csv"
 
 
+def _rename_csv_on_end(call_id: str) -> None:
+    old_path = _get_csv_path(call_id)
+    if not os.path.exists(old_path):
+        return
+    end_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+    new_path = f"{_EVAL_DIR}/{_MODEL_LABEL}_{end_time}.csv"
+    os.rename(old_path, new_path)
+
+
 def _write_csv_row(call_id: str, row: dict) -> None:
     path = _get_csv_path(call_id)
     is_new = not os.path.exists(path)
+    start = _call_start_times.get(call_id, time.perf_counter())
+    row["elapsed_sec"] = f"{time.perf_counter() - start:.1f}"
     with open(path, "a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(
             f,
-            fieldnames=["timestamp", "type", "label", "score_type", "similarity", "verified", "latency_ms"],
+            fieldnames=["timestamp", "elapsed_sec", "type", "label", "score_type", "similarity", "verified", "latency_ms"],
         )
         if is_new:
             writer.writeheader()
@@ -148,11 +160,13 @@ def _print_verify_summary(call_id: str) -> None:
 
 def _cleanup_enrollment(call_id: str) -> None:
     _print_verify_summary(call_id)
+    _rename_csv_on_end(call_id)
     _enrollment_buffers.pop(call_id, None)
     _enrollment_done.pop(call_id, None)
     _verify_results.pop(call_id, None)
     _eval_labels.pop(call_id, None)
     _verify_buffers.pop(call_id, None)
+    _call_start_times.pop(call_id, None)
     _speaker_verify.cleanup(call_id)
 
 
@@ -193,6 +207,7 @@ async def call_websocket(
     tenant_id: str = Query(default="unknown"),
 ):
     await websocket.accept()
+    _call_start_times[call_id] = time.perf_counter()
     logger.info(f"WebSocket 연결 수락 call_id={call_id}")
 
     turn_index = 0
