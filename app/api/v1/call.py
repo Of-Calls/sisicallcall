@@ -93,6 +93,7 @@ async def call_websocket(
     vad_pass_audio_16k = bytearray()
     vad_latency_ms_by_model: dict[str, list[float]] = {}
     vad_is_speech_by_model: dict[str, bool] = {}
+    vad_true_count_by_model: dict[str, int] = {}
     per_model_audio_16k: dict[str, bytearray] = {}
     finalized = False
 
@@ -113,8 +114,12 @@ async def call_websocket(
         _save_pcm16_wav(raw_path, bytes(raw_audio_16k))
         _save_pcm16_wav(vad_path, bytes(vad_pass_audio_16k))
         for model_name, model_audio in per_model_audio_16k.items():
-            model_file_name = f"{model_name}_{timestamp}.wav"
-            _save_pcm16_wav(_RECORDINGS_DIR / model_file_name, bytes(model_audio))
+            if model_name == "silero_v4":
+                # 요청사항: silero_v4 인식 파일은 recordings/silero_v4/*.wav 로 분리 저장
+                model_path = _RECORDINGS_DIR / "silero_v4" / f"{timestamp}.wav"
+            else:
+                model_path = _RECORDINGS_DIR / f"{model_name}_{timestamp}.wav"
+            _save_pcm16_wav(model_path, bytes(model_audio))
         logger.info(
             "통화 오디오 저장 완료 call_id=%s raw=%s vad=%s 모델별파일수=%s",
             call_id,
@@ -127,10 +132,14 @@ async def call_websocket(
             for model, values in vad_latency_ms_by_model.items():
                 if not values:
                     continue
+                true_count = vad_true_count_by_model.get(model, 0)
                 summary[model] = {
                     "처리된청크개수": len(values),
+                    "is_speech_true횟수": true_count,
+                    "is_speech_true비율": round(true_count / len(values), 4),
                     "평균ms": round(sum(values) / len(values), 3),
                     "중앙값ms": round(median(values), 3),
+                    "GT_TP_FP_FN": "N/A(라벨 미연결)",
                 }
             logger.info("통화 종료 VAD 모델별 지연 요약 call_id=%s 상세=%s", call_id, summary)
         reset_resample_state()
@@ -176,6 +185,7 @@ async def call_websocket(
                         "is_speaker_verified": False,
                         "vad_latency_ms_by_model": vad_latency_ms_by_model,
                         "vad_is_speech_by_model": vad_is_speech_by_model,
+                        "vad_true_count_by_model": vad_true_count_by_model,
                         "raw_transcript": "",
                         "normalized_text": "",
                         "query_embedding": [],
@@ -198,6 +208,7 @@ async def call_websocket(
                     result_state = await _graph.ainvoke(state)
                     vad_latency_ms_by_model = result_state.get("vad_latency_ms_by_model", vad_latency_ms_by_model)
                     vad_is_speech_by_model = result_state.get("vad_is_speech_by_model", vad_is_speech_by_model)
+                    vad_true_count_by_model = result_state.get("vad_true_count_by_model", vad_true_count_by_model)
                     for model, model_is_speech in vad_is_speech_by_model.items():
                         if not model_is_speech:
                             continue

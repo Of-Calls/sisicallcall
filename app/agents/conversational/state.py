@@ -15,6 +15,7 @@ class CallState(TypedDict):
     is_speaker_verified: bool
     vad_latency_ms_by_model: dict[str, list[float]]
     vad_is_speech_by_model: dict[str, bool]
+    vad_true_count_by_model: dict[str, int]
 
     # STT 결과
     raw_transcript: str
