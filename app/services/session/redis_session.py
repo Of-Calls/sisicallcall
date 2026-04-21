@@ -1,4 +1,4 @@
-from datetime import datetime, time
+from datetime import datetime, time, timedelta, timezone
 from typing import Optional
 
 from app.utils.config import settings
@@ -14,6 +14,10 @@ logger = get_logger(__name__)
 
 _WEEKDAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 
+# TODO(tenant.settings 이관): 업종 확장 시 tenant별 timezone 필드로 전환
+# KST는 DST 없어 영원히 +09:00이므로 IANA zoneinfo(tzdata 의존) 대신 고정 offset 사용
+_KST = timezone(timedelta(hours=9))
+
 
 class RedisSessionService:
     def __init__(self):
@@ -27,7 +31,7 @@ class RedisSessionService:
         self, tenant_id: str, now: Optional[datetime] = None
     ) -> bool:
         """현재 시각이 tenant 운영시간 내인지 판정. 데이터 부재/에러 시 False."""
-        now = now or datetime.now()
+        now = now or datetime.now(_KST)
         weekday = _WEEKDAYS[now.weekday()]
         key = self._tenant_key(tenant_id, "business_hours")
         try:
@@ -47,7 +51,11 @@ class RedisSessionService:
             logger.error("business_hours parse error tenant=%s value=%s: %s", tenant_id, value, e)
             return False
 
-        return start <= now.time() <= end
+        current = now.time()
+        # 야간업종 대응: start > end이면 자정을 건너뛰는 운영시간 (예: "22:00-02:00")
+        if start <= end:
+            return start <= current <= end
+        return current >= start or current <= end
 
     async def get_available_agent_count(self, tenant_id: str) -> int:
         """상담원 가용 수 조회. 키 부재/에러 시 0 반환."""
