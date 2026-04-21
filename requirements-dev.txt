@@ -1,0 +1,7 @@
+# Development / test-only dependencies.
+# Not included in production images.
+# Install: venv/Scripts/pip install -r requirements-dev.txt
+#
+# Test framework
+pytest==8.3.3
+pytest-asyncio==0.24.0
