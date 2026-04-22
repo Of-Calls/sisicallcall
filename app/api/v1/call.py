@@ -56,6 +56,7 @@ _verify_results: dict[str, dict[str, list]] = {n: {} for n in _SERVICES}
 # call별 (모델 공유)
 _eval_labels: dict[str, str] = {}
 _call_start_times: dict[str, float] = {}
+_enrollment_latencies: dict[str, dict[str, float]] = {n: {} for n in _SERVICES}
 
 
 # ── CSV helpers ───────────────────────────────────────────────────────────────
@@ -108,6 +109,7 @@ async def _try_enroll(model_name: str, call_id: str, pcm_chunk: bytes) -> None:
         t0 = time.perf_counter()
         await _SERVICES[model_name].extract_and_store(enrollment_audio, call_id)
         enrollment_ms = (time.perf_counter() - t0) * 1000
+        _enrollment_latencies[model_name][call_id] = enrollment_ms
         logger.info(f"[EVAL] {model_name} call_id={call_id} enrollment latency={enrollment_ms:.1f}ms")
         _write_csv_row(model_name, call_id, {
             "timestamp": datetime.now().isoformat(),
@@ -169,12 +171,14 @@ def _print_verify_summary(model_name: str, call_id: str) -> None:
 
     total = len(results)
     avg_latency = sum(r["latency_ms"] for r in results) / total
+    enrollment_ms = _enrollment_latencies[model_name].get(call_id)
     genuine = [r for r in results if r["label"] == "self"]
     impostor = [r for r in results if r["label"] == "background"]
 
     tar = sum(1 for r in genuine if r["verified"]) / len(genuine) * 100 if genuine else None
     frr = sum(1 for r in genuine if not r["verified"]) / len(genuine) * 100 if genuine else None
     far = sum(1 for r in impostor if r["verified"]) / len(impostor) * 100 if impostor else None
+    rej_rate = (100 - far) if far is not None else None
 
     genuine_sim = [r["similarity"] for r in genuine if r["similarity"] > 0]
     impostor_sim = [r["similarity"] for r in impostor if r["similarity"] > 0]
@@ -186,17 +190,21 @@ def _print_verify_summary(model_name: str, call_id: str) -> None:
         f"  평균 레이턴시       : {avg_latency:.1f}ms",
         f"  threshold           : {_THRESHOLDS[model_name]}",
     ]
+    if enrollment_ms is not None:
+        lines.append(f"  enrollment 생성시간 : {enrollment_ms:.1f}ms")
     if tar is not None:
         lines += [
             f"  --- genuine(self) {len(genuine)}회 ---",
             f"  TAR                 : {tar:.1f}%",
             f"  FRR                 : {frr:.1f}%",
             f"  similarity 평균     : {sum(genuine_sim)/len(genuine_sim):.4f}" if genuine_sim else "  similarity 없음",
+            f"  similarity 최저     : {min(genuine_sim):.4f}" if genuine_sim else "  similarity 최저 없음",
         ]
     if far is not None:
         lines += [
             f"  --- impostor(background) {len(impostor)}회 ---",
             f"  FAR (barge-in율)    : {far:.1f}%",
+            f"  타인 거부율         : {rej_rate:.1f}%",
             f"  similarity 평균     : {sum(impostor_sim)/len(impostor_sim):.4f}" if impostor_sim else "  similarity 없음",
         ]
     lines.append("=" * 55)
@@ -214,6 +222,8 @@ def _cleanup_all(call_id: str) -> None:
         _SERVICES[mn].cleanup(call_id)
     _eval_labels.pop(call_id, None)
     _call_start_times.pop(call_id, None)
+    for mn in _SERVICES:
+        _enrollment_latencies[mn].pop(call_id, None)
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────

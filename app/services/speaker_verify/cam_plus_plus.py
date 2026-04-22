@@ -32,13 +32,16 @@ class CAMPlusPlusSpeakerVerifyService(BaseSpeakerVerifyService):
             raise
 
     def _extract_embedding_sync(self, audio_chunk: bytes) -> np.ndarray:
+        import torch
         samples = np.frombuffer(audio_chunk, dtype=np.int16).astype(np.float32) / 32768.0
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
             sf.write(f.name, samples, _SAMPLE_RATE)
             tmp_path = f.name
         try:
-            result = self._pipeline(tmp_path)
-            return np.array(result["spk_embedding"])
+            processed = self._pipeline.preprocess([tmp_path])
+            with torch.no_grad():
+                emb = self._pipeline.model(processed[0].unsqueeze(0))
+            return emb.squeeze(0).cpu().numpy()
         finally:
             os.unlink(tmp_path)
 
