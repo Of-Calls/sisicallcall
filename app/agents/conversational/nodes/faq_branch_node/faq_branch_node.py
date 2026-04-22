@@ -1,14 +1,13 @@
-import asyncio
-
 from app.agents.conversational.state import CallState
+from app.agents.conversational.utils.stall import FALLBACK_MESSAGE, _run_with_stall
 from app.services.llm.base import BaseLLMService
 from app.services.llm.gpt4o_mini import GPT4OMiniService
 from app.services.rag.base import BaseRAGService
 from app.services.rag.chroma import ChromaRAGService
 from app.utils.logger import get_logger
 
-# FAQ 브랜치 — RAG + GPT-4o-mini 2초 하드컷 (langgraph_spec.md §6.2, feature_spec.md §4.5)
-# 타임아웃 시 RAG top-1 청크 원본을 그대로 전달 (자연어 재구성 생략)
+# FAQ 브랜치 — RAG + GPT-4o-mini 3초 하드컷 (RFC 001 v0.2 §6.8)
+# stall trigger 1초, TTSOutputChannel 경유
 
 logger = get_logger(__name__)
 
@@ -17,8 +16,6 @@ _llm: BaseLLMService = GPT4OMiniService()
 
 FAQ_LLM_TIMEOUT_SEC = 3.0
 RAG_TOP_K = 3
-
-FALLBACK_MESSAGE = "확인이 어려워 담당자에게 연결해 드리겠습니다."
 
 # TODO(agents.md 이관): 담당자 배정 후 프롬프트를 agents.md 로 이관
 FAQ_SYSTEM_PROMPT = """당신은 고객센터 FAQ 응답 AI입니다.
@@ -37,11 +34,17 @@ def _compose_user_message(normalized_text: str, rag_results: list[str]) -> str:
     return f"참고 자료:\n{joined}\n\n고객 질문: {normalized_text}"
 
 
+def _pick_stall_msg(state: CallState) -> str:
+    """CallState 에서 FAQ 대기 멘트 선택. 없으면 general → 하드코딩 순으로 fallback."""
+    msgs = state.get("stall_messages") or {}
+    return msgs.get("faq") or msgs.get("general") or "잠시만요, 확인해 드리겠습니다."
+
+
 async def faq_branch_node(state: CallState) -> dict:
     call_id = state["call_id"]
     query_embedding = state.get("query_embedding") or []
 
-    # RAG 검색 — 임베딩 없으면 스킵 (cache_node에서 실패한 경우)
+    # RAG 검색 — 임베딩 없으면 스킵 (cache_node 에서 실패한 경우)
     rag_results: list[str] = []
     if query_embedding:
         try:
@@ -55,36 +58,30 @@ async def faq_branch_node(state: CallState) -> dict:
 
     user_message = _compose_user_message(state["normalized_text"], rag_results)
 
-    try:
-        response_text = await asyncio.wait_for(
-            _llm.generate(
-                system_prompt=FAQ_SYSTEM_PROMPT,
-                user_message=user_message,
-                temperature=0.1,
-                max_tokens=300,
-            ),
-            timeout=FAQ_LLM_TIMEOUT_SEC,
-        )
-        return {
-            "rag_results": rag_results,
-            "response_text": response_text.strip() or FALLBACK_MESSAGE,
-            "response_path": "faq",
-            "is_timeout": False,
-        }
-    except asyncio.TimeoutError:
-        logger.warning("faq branch timeout call_id=%s", call_id)
-        fallback = rag_results[0] if rag_results else FALLBACK_MESSAGE
-        return {
-            "rag_results": rag_results,
-            "response_text": fallback,
-            "response_path": "faq",
-            "is_timeout": True,
-        }
-    except Exception as e:
-        logger.error("faq branch error call_id=%s: %s", call_id, e)
-        return {
-            "rag_results": rag_results,
-            "response_text": FALLBACK_MESSAGE,
-            "response_path": "faq",
-            "is_timeout": False,
-        }
+    # LLM 호출 + stall trigger race — RFC 001 v0.2 §6.5
+    response_text, is_timeout = await _run_with_stall(
+        coro=_llm.generate(
+            system_prompt=FAQ_SYSTEM_PROMPT,
+            user_message=user_message,
+            temperature=0.1,
+            max_tokens=300,
+        ),
+        call_id=call_id,
+        stall_msg=_pick_stall_msg(state),
+        stall_audio_field="faq",
+        delay=state.get("stall_delay_sec", 1.0),
+        hardcut_sec=FAQ_LLM_TIMEOUT_SEC,
+        rag_results=rag_results,
+        fallback_text=FALLBACK_MESSAGE,
+    )
+
+    # LLM 이 공백만 반환한 엣지 케이스도 FALLBACK 으로 보정
+    if not response_text:
+        response_text = FALLBACK_MESSAGE
+
+    return {
+        "rag_results": rag_results,
+        "response_text": response_text,
+        "response_path": "faq",
+        "is_timeout": is_timeout,
+    }

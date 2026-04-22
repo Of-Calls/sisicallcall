@@ -70,3 +70,25 @@ class RedisSessionService:
             return int(value) if value else 0
         except (ValueError, TypeError):
             return 0
+
+    # RFC 001 v0.2 §6.5 — run_turn 진입 시 pre-load 되어 CallState["stall_messages"] 에 주입됨
+    _DEFAULT_STALL_MESSAGES = {"general": "잠시만요, 확인해 드리겠습니다."}
+
+    async def get_stall_messages(self, tenant_id: str) -> dict:
+        """대기 멘트 문구 조회. 키 부재/에러 시 하드코딩 기본값 반환.
+
+        반환 dict 는 반드시 'general' 키를 포함한다 (브랜치별 fallback 용도).
+        """
+        key = self._tenant_key(tenant_id, "stall_messages")
+        try:
+            value = await self._redis.hgetall(key)
+        except Exception as e:
+            logger.error("redis stall_messages lookup failed tenant=%s: %s", tenant_id, e)
+            return dict(self._DEFAULT_STALL_MESSAGES)
+
+        if not value or "general" not in value:
+            # general 누락 시 기본값으로 병합 (브랜치별 문구만 있고 general 없는 엣지 케이스 방어)
+            merged = dict(self._DEFAULT_STALL_MESSAGES)
+            merged.update(value or {})
+            return merged
+        return value

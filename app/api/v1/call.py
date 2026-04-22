@@ -7,6 +7,8 @@ from fastapi.responses import Response
 from app.agents.conversational.graph import build_call_graph
 from app.agents.conversational.state import CallState
 from app.core.events import CALL_ENDED, CALL_STARTED
+from app.services.session.redis_session import RedisSessionService
+from app.services.tts.channel import tts_channel
 from app.utils.audio import mulaw_to_pcm16, reset_resample_state
 from app.utils.config import settings
 from app.utils.logger import get_logger
@@ -16,6 +18,7 @@ router = APIRouter()
 
 # 그래프 싱글톤 (앱 기동 시 1회 컴파일)
 _graph = build_call_graph()
+_session_service = RedisSessionService()
 
 
 @router.post("/incoming")
@@ -59,6 +62,8 @@ async def call_websocket(
 
     turn_index = 0
     audio_buffer = bytearray()
+    stall_messages: dict = {}   # "start" 이벤트에서 로드
+    channel_opened = False
 
     try:
         while True:
@@ -76,6 +81,21 @@ async def call_websocket(
                 logger.info(
                     f"call_id={call_id} stream_sid={stream_sid} tenant_id={tenant_id}"
                 )
+
+                # RFC 001 v0.2 — TTSOutputChannel open + stall_messages pre-load
+                try:
+                    await tts_channel.open(
+                        call_id=call_id,
+                        tenant_id=tenant_id,
+                        websocket=websocket,
+                        stream_sid=stream_sid,
+                    )
+                    channel_opened = True
+                except TypeError:
+                    # MockTTSOutputChannel 은 websocket/stream_sid 인자를 모름 — 기본 시그니처로 재시도
+                    await tts_channel.open(call_id=call_id, tenant_id=tenant_id)
+                    channel_opened = True
+                stall_messages = await _session_service.get_stall_messages(tenant_id)
 
             elif event == "media":
                 track = msg["media"].get("track", "inbound")
@@ -115,6 +135,9 @@ async def call_websocket(
                         "reviewer_verdict": None,
                         "is_timeout": False,
                         "error": None,
+                        # RFC 001 v0.2 — stall utterance settings
+                        "stall_messages": stall_messages,
+                        "stall_delay_sec": 1.0,
                     }
 
                     await _graph.ainvoke(state)
@@ -123,11 +146,17 @@ async def call_websocket(
             elif event == "stop":
                 logger.info(f"[{CALL_ENDED}] call_id={call_id}")
                 reset_resample_state()
+                if channel_opened:
+                    await tts_channel.flush(call_id)
                 break
 
     except WebSocketDisconnect:
         logger.info(f"WebSocket 종료 call_id={call_id}")
         reset_resample_state()
+        if channel_opened:
+            await tts_channel.flush(call_id)
     except Exception as e:
         logger.error(f"call_id={call_id} WebSocket 오류: {e}")
         reset_resample_state()
+        if channel_opened:
+            await tts_channel.flush(call_id)

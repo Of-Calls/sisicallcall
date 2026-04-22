@@ -198,3 +198,81 @@ async def test_agent_count_non_numeric(service):
 async def test_agent_count_redis_exception(service):
     service._redis.hget = AsyncMock(side_effect=TimeoutError("redis slow"))
     assert await service.get_available_agent_count("t1") == 0
+
+
+# ---------------------------------------------------------------------------
+# get_stall_messages (RFC 001 v0.2 §6.5)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_stall_messages_full_hash(service):
+    """해시에 general + 브랜치별 문구 모두 있는 정상 케이스."""
+    service._redis.hgetall = AsyncMock(return_value={
+        "general": "잠시만요, 확인해 드리겠습니다.",
+        "faq": "관련 정보를 찾아보고 있어요.",
+        "task": "업무를 처리하고 있어요.",
+        "auth": "본인 확인 중이에요.",
+    })
+
+    result = await service.get_stall_messages("t1")
+
+    assert result["general"] == "잠시만요, 확인해 드리겠습니다."
+    assert result["faq"] == "관련 정보를 찾아보고 있어요."
+    assert result["task"] == "업무를 처리하고 있어요."
+    assert result["auth"] == "본인 확인 중이에요."
+
+
+@pytest.mark.asyncio
+async def test_stall_messages_partial_only_general(service):
+    """해시에 general 만 있는 경우 (MVP 최소 구성)."""
+    service._redis.hgetall = AsyncMock(return_value={
+        "general": "잠시만요.",
+    })
+
+    result = await service.get_stall_messages("t1")
+
+    assert result == {"general": "잠시만요."}
+
+
+@pytest.mark.asyncio
+async def test_stall_messages_missing_key_returns_default(service):
+    """키가 아예 없으면 (빈 해시) 기본값 반환."""
+    service._redis.hgetall = AsyncMock(return_value={})
+
+    result = await service.get_stall_messages("t1")
+
+    assert result == {"general": "잠시만요, 확인해 드리겠습니다."}
+
+
+@pytest.mark.asyncio
+async def test_stall_messages_general_missing_merges_default(service):
+    """브랜치별 문구는 있지만 general 누락된 엣지 케이스 — default 의 general 로 병합."""
+    service._redis.hgetall = AsyncMock(return_value={
+        "faq": "FAQ 전용 문구",
+    })
+
+    result = await service.get_stall_messages("t1")
+
+    # general 이 default 로 채워져야 함
+    assert result["general"] == "잠시만요, 확인해 드리겠습니다."
+    assert result["faq"] == "FAQ 전용 문구"
+
+
+@pytest.mark.asyncio
+async def test_stall_messages_redis_exception_returns_default(service):
+    service._redis.hgetall = AsyncMock(side_effect=ConnectionError("redis down"))
+
+    result = await service.get_stall_messages("t1")
+
+    assert result == {"general": "잠시만요, 확인해 드리겠습니다."}
+
+
+@pytest.mark.asyncio
+async def test_stall_messages_queries_correct_key(service):
+    """tenant_id 의 하이픈 제거 + 키 suffix 검증."""
+    service._redis.hgetall = AsyncMock(return_value={"general": "x"})
+
+    await service.get_stall_messages("abc-def-123")
+
+    call_args = service._redis.hgetall.call_args
+    assert call_args.args[0] == "tenant:abcdef123:stall_messages"

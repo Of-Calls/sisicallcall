@@ -1,4 +1,4 @@
-from typing import Optional, TypedDict
+from typing import NotRequired, Optional, TypedDict
 
 
 class CallState(TypedDict):
@@ -46,3 +46,8 @@ class CallState(TypedDict):
     # 에러 / 타임아웃
     is_timeout: bool
     error: Optional[str]
+
+    # 대기 멘트 (RFC 001 v0.2) — run_turn 진입 시 tenant settings 에서 pre-load
+    # 노드는 .get() 로 안전 접근. 키 부재 시 _run_with_stall 이 하드코딩 기본값 사용.
+    stall_messages: NotRequired[dict]   # {"general": "잠시만요...", "faq": "...", ...}
+    stall_delay_sec: NotRequired[float] # 기본 1.0

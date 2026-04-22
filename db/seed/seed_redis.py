@@ -6,6 +6,7 @@ Redis 시드 — tenant별 운영시간 및 상담원 가용성 초기값
 설정 키:
   - tenant:{tenant_id}:business_hours  (Hash)
   - tenant:{tenant_id}:agent_availability  (Hash)
+  - tenant:{tenant_id}:stall_messages  (Hash, RFC 001 v0.2) — 대기 멘트 문구
 
 주의:
   - PostgreSQL seed 먼저 실행 필요 (tenant_id 조회 위함).
@@ -47,6 +48,12 @@ TENANT_CONFIGS = {
             "total": "3",
             "available": "3",
         },
+        "stall_messages": {
+            "general": "잠시만요, 확인해 드리겠습니다.",
+            "faq": "관련 정보를 찾아보고 있어요, 잠시만 기다려 주세요.",
+            "task": "예약 정보를 확인하고 있어요, 잠시만요.",
+            "auth": "본인 확인을 진행하고 있어요, 잠시만요.",
+        },
     },
     "+821000000002": {  # 한밭식당
         "business_hours": {
@@ -61,6 +68,11 @@ TENANT_CONFIGS = {
         "agent_availability": {
             "total": "1",
             "available": "1",
+        },
+        "stall_messages": {
+            "general": "잠시만요, 확인해 드리겠습니다.",
+            "faq": "메뉴 정보를 찾아보고 있어요, 잠시만 기다려 주세요.",
+            "task": "주문을 처리하고 있어요, 잠시만 기다려 주세요.",
         },
     },
 }
@@ -102,7 +114,13 @@ async def seed():
             await r.delete(aa_key)
             await r.hset(aa_key, mapping=config["agent_availability"])
 
-            print(f"  ✅ {row['name']}: business_hours + agent_availability 설정")
+            # stall_messages (RFC 001 v0.2)
+            if "stall_messages" in config:
+                sm_key = f"tenant:{tenant_id_no_hyphen}:stall_messages"
+                await r.delete(sm_key)
+                await r.hset(sm_key, mapping=config["stall_messages"])
+
+            print(f"  ✅ {row['name']}: business_hours + agent_availability + stall_messages 설정")
 
         # 최종 통계
         keys = await r.keys("tenant:*")
