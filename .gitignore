@@ -58,4 +58,5 @@ AGENTS.md
 .claude/skills/
 CLAUDE.md
 
+# vad 테스트 중 인식된 구간 음성 파일
 recordings/

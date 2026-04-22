@@ -9,9 +9,9 @@ from statistics import median
 from fastapi import APIRouter, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response
 
-from app.agents.conversational.graph import build_call_graph
-from app.agents.conversational.state import CallState
 from app.core.events import CALL_ENDED, CALL_STARTED
+from app.services.vad.benchmark import compare_vad_models
+from app.services.stt.deepgram import DeepgramSTTService
 from app.utils.audio import mulaw_to_pcm16, reset_resample_state
 from app.utils.config import settings
 from app.utils.logger import get_logger
@@ -20,18 +20,50 @@ logger = get_logger(__name__)
 router = APIRouter()
 _RECORDINGS_DIR = Path("recordings")
 _ORIGIN_RECORDINGS_DIR = _RECORDINGS_DIR / "origin"
+_stt_service: DeepgramSTTService | None = None
+_stt_unavailable_reason = ""
+STT_MIN_BUFFER_BYTES = 16000 * 2  # 약 1초(16kHz, 16-bit mono)
 
-# 그래프 싱글톤 (앱 기동 시 1회 컴파일)
-_graph = build_call_graph()
+
+def _get_stt_service() -> DeepgramSTTService | None:
+    global _stt_service, _stt_unavailable_reason
+    if _stt_service:
+        return _stt_service
+    if _stt_unavailable_reason:
+        return None
+    if not settings.deepgram_api_key.strip():
+        _stt_unavailable_reason = "DEEPGRAM_API_KEY 없음"
+        logger.warning("STT 비활성화: %s", _stt_unavailable_reason)
+        return None
+    try:
+        _stt_service = DeepgramSTTService()
+    except Exception as e:
+        _stt_unavailable_reason = str(e)
+        logger.warning("STT 비활성화: %s", e)
+        return None
+    return _stt_service
 
 
-def _save_pcm16_wav(file_path: Path, pcm16_audio: bytes, sample_rate: int = 16000) -> None:
+def _sanitize_path_name(name: str) -> str:
+    cleaned = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in name.strip())
+    return cleaned or "unknown"
+
+
+def _save_pcm16_audio(
+    file_path: Path, pcm16_audio: bytes, sample_rate: int = 16000, extension: str = "wav"
+) -> None:
     file_path.parent.mkdir(parents=True, exist_ok=True)
-    with wave.open(str(file_path), "wb") as wav_file:
-        wav_file.setnchannels(1)
-        wav_file.setsampwidth(2)
-        wav_file.setframerate(sample_rate)
-        wav_file.writeframes(pcm16_audio)
+    if extension == "wav":
+        with wave.open(str(file_path), "wb") as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(sample_rate)
+            wav_file.writeframes(pcm16_audio)
+        return
+    if extension == "pcm":
+        file_path.write_bytes(pcm16_audio)
+        return
+    raise ValueError(f"지원하지 않는 확장자: {extension}")
 
 
 def _clear_directory_if_not_empty(dir_path: Path) -> None:
@@ -82,49 +114,78 @@ async def call_websocket(
 ):
     """
     Twilio Media Streams WebSocket 엔드포인트.
-    오디오 청크를 수신해 LangGraph 파이프라인에 투입한다.
+    오디오 청크를 수신해 VAD 모델들을 직접 실행한다.
     """
     await websocket.accept()
     logger.info(f"WebSocket 연결 수락 call_id={call_id}")
 
-    turn_index = 0
     audio_buffer = bytearray()
     raw_audio_16k = bytearray()
-    vad_pass_audio_16k = bytearray()
     vad_latency_ms_by_model: dict[str, list[float]] = {}
     vad_is_speech_by_model: dict[str, bool] = {}
     vad_true_count_by_model: dict[str, int] = {}
     per_model_audio_16k: dict[str, bytearray] = {}
+    stt_transcript_by_model: dict[str, list[str]] = {}
+    stt_audio_buffer_by_model: dict[str, bytearray] = {}
     finalized = False
+    scenario_name = _sanitize_path_name(tenant_id)
+    recording_ext = "wav"
+
+    async def _transcribe_and_store(model_name: str, audio_bytes: bytes) -> None:
+        stt_service = _get_stt_service()
+        if not stt_service:
+            return
+        transcript = await stt_service.transcribe(audio_bytes)
+        if transcript:
+            stt_transcript_by_model.setdefault(model_name, []).append(transcript)
+            logger.info(
+                "STT 전사 성공 call_id=%s model=%s 글자수=%s",
+                call_id,
+                model_name,
+                len(transcript),
+            )
+            return
+        logger.info("STT 전사 결과 없음 call_id=%s model=%s", call_id, model_name)
+
+    async def _flush_stt_buffers(force: bool = False) -> None:
+        for model_name, model_buf in stt_audio_buffer_by_model.items():
+            if not model_buf:
+                continue
+            if (not force) and len(model_buf) < STT_MIN_BUFFER_BYTES:
+                continue
+            await _transcribe_and_store(model_name, bytes(model_buf))
+            model_buf.clear()
 
     def _finalize_call() -> None:
-        nonlocal finalized
+        nonlocal finalized, scenario_name, recording_ext
         if finalized:
             return
         finalized = True
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-        # 이전 저장 파일이 남아 있으면 디렉토리 정리 후 저장
-        _clear_directory_if_not_empty(_RECORDINGS_DIR)
-        _clear_directory_if_not_empty(_ORIGIN_RECORDINGS_DIR)
+        scenario_dir = _RECORDINGS_DIR / scenario_name
+        raw_scenario_dir = _ORIGIN_RECORDINGS_DIR / scenario_name
 
-        raw_path = _ORIGIN_RECORDINGS_DIR / f"{call_id}_{timestamp}_raw.wav"
-        vad_path = _RECORDINGS_DIR / f"{call_id}_{timestamp}_vad.wav"
-        _save_pcm16_wav(raw_path, bytes(raw_audio_16k))
-        _save_pcm16_wav(vad_path, bytes(vad_pass_audio_16k))
+        # 이전 저장 파일이 남아 있으면 시나리오 디렉토리만 비운 뒤 저장
+        _clear_directory_if_not_empty(scenario_dir)
+        _clear_directory_if_not_empty(raw_scenario_dir)
+
+        raw_path = raw_scenario_dir / f"raw_{call_id}_{timestamp}.{recording_ext}"
+        _save_pcm16_audio(raw_path, bytes(raw_audio_16k), extension=recording_ext)
         for model_name, model_audio in per_model_audio_16k.items():
-            if model_name == "silero_v4":
-                # 요청사항: silero_v4 인식 파일은 recordings/silero_v4/*.wav 로 분리 저장
-                model_path = _RECORDINGS_DIR / "silero_v4" / f"{timestamp}.wav"
-            else:
-                model_path = _RECORDINGS_DIR / f"{model_name}_{timestamp}.wav"
-            _save_pcm16_wav(model_path, bytes(model_audio))
+            safe_model_name = _sanitize_path_name(model_name)
+            model_path = scenario_dir / f"{safe_model_name}.{recording_ext}"
+            _save_pcm16_audio(model_path, bytes(model_audio), extension=recording_ext)
+            transcript_path = scenario_dir / f"{safe_model_name}.txt"
+            transcript_lines = stt_transcript_by_model.get(model_name, [])
+            transcript_path.write_text("\n".join(transcript_lines), encoding="utf-8")
         logger.info(
-            "통화 오디오 저장 완료 call_id=%s raw=%s vad=%s 모델별파일수=%s",
+            "통화 오디오 저장 완료 call_id=%s scenario=%s ext=%s raw=%s 모델별파일수=%s",
             call_id,
+            scenario_name,
+            recording_ext,
             raw_path,
-            vad_path,
             len(per_model_audio_16k),
         )
         if vad_latency_ms_by_model:
@@ -141,7 +202,9 @@ async def call_websocket(
                     "중앙값ms": round(median(values), 3),
                     "GT_TP_FP_FN": "N/A(라벨 미연결)",
                 }
-            logger.info("통화 종료 VAD 모델별 지연 요약 call_id=%s 상세=%s", call_id, summary)
+            logger.info(
+                "통화 종료 VAD 모델별 지연 요약 call_id=%s 상세=%s", call_id, summary
+            )
         reset_resample_state()
 
     try:
@@ -157,8 +220,18 @@ async def call_websocket(
                 stream_sid = msg.get("streamSid", "")
                 custom_params = msg.get("start", {}).get("customParameters", {})
                 tenant_id = custom_params.get("tenant_id", tenant_id)
+                scenario_name = _sanitize_path_name(
+                    custom_params.get("scenario_name", custom_params.get("scenario", tenant_id))
+                )
+                requested_ext = str(custom_params.get("recording_ext", "wav")).strip().lower()
+                recording_ext = requested_ext if requested_ext in {"wav", "pcm"} else "wav"
                 logger.info(
-                    f"call_id={call_id} stream_sid={stream_sid} tenant_id={tenant_id}"
+                    "call_id=%s stream_sid=%s tenant_id=%s scenario=%s ext=%s",
+                    call_id,
+                    stream_sid,
+                    tenant_id,
+                    scenario_name,
+                    recording_ext,
                 )
 
             elif event == "media":
@@ -171,60 +244,46 @@ async def call_websocket(
                 audio_buffer.extend(pcm_bytes)
                 raw_audio_16k.extend(pcm_bytes)
 
-                # 320ms 분량(16kHz, 16-bit mono = 10240 bytes) 누적 시 그래프 투입
+                # 320ms 분량(16kHz, 16-bit mono = 10240 bytes) 누적 시 VAD 실행
                 if len(audio_buffer) >= 10240:
                     chunk = bytes(audio_buffer)
                     audio_buffer.clear()
 
-                    state: CallState = {
-                        "call_id": call_id,
-                        "tenant_id": tenant_id,
-                        "turn_index": turn_index,
-                        "audio_chunk": chunk,
-                        "is_speech": False,
-                        "is_speaker_verified": False,
-                        "vad_latency_ms_by_model": vad_latency_ms_by_model,
-                        "vad_is_speech_by_model": vad_is_speech_by_model,
-                        "vad_true_count_by_model": vad_true_count_by_model,
-                        "raw_transcript": "",
-                        "normalized_text": "",
-                        "query_embedding": [],
-                        "cache_hit": False,
-                        "knn_intent": None,
-                        "knn_confidence": 0.0,
-                        "primary_intent": None,
-                        "secondary_intents": [],
-                        "routing_reason": None,
-                        "session_view": {},
-                        "rag_results": [],
-                        "response_text": "",
-                        "response_path": "",
-                        "reviewer_applied": False,
-                        "reviewer_verdict": None,
-                        "is_timeout": False,
-                        "error": None,
-                    }
-
-                    result_state = await _graph.ainvoke(state)
-                    vad_latency_ms_by_model = result_state.get("vad_latency_ms_by_model", vad_latency_ms_by_model)
-                    vad_is_speech_by_model = result_state.get("vad_is_speech_by_model", vad_is_speech_by_model)
-                    vad_true_count_by_model = result_state.get("vad_true_count_by_model", vad_true_count_by_model)
-                    for model, model_is_speech in vad_is_speech_by_model.items():
-                        if not model_is_speech:
+                    results = await compare_vad_models(
+                        chunk,
+                        excluded_models={"deepgram_vad"},
+                    )
+                    speech_model_names: list[str] = []
+                    for result in results:
+                        vad_latency_ms_by_model.setdefault(result.model, []).append(
+                            result.latency_ms
+                        )
+                        vad_is_speech_by_model[result.model] = result.is_speech
+                        if not result.is_speech:
                             continue
-                        per_model_audio_16k.setdefault(model, bytearray()).extend(chunk)
-                    if result_state.get("is_speech", False):
-                        vad_pass_audio_16k.extend(chunk)
-                    turn_index += 1
+                        speech_model_names.append(result.model)
+                        vad_true_count_by_model[result.model] = (
+                            vad_true_count_by_model.get(result.model, 0) + 1
+                        )
+                        per_model_audio_16k.setdefault(
+                            result.model, bytearray()
+                        ).extend(chunk)
+                    if speech_model_names:
+                        for model_name in speech_model_names:
+                            stt_audio_buffer_by_model.setdefault(model_name, bytearray()).extend(chunk)
+                        await _flush_stt_buffers(force=False)
 
             elif event == "stop":
                 logger.info(f"[{CALL_ENDED}] call_id={call_id}")
+                await _flush_stt_buffers(force=True)
                 _finalize_call()
                 break
 
     except WebSocketDisconnect:
         logger.info(f"WebSocket 종료 call_id={call_id}")
+        await _flush_stt_buffers(force=True)
         _finalize_call()
     except Exception as e:
         logger.error(f"call_id={call_id} WebSocket 오류: {e}")
+        await _flush_stt_buffers(force=True)
         _finalize_call()

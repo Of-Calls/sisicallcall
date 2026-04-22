@@ -14,6 +14,14 @@ DEEPGRAM_SAMPLE_RATE = 16000
 DEEPGRAM_CHANNELS = 1
 DEEPGRAM_SAMPLE_WIDTH_BYTES = 2  # 16-bit
 
+# VAD 민감도 튜닝 상수
+ENERGY_FALLBACK_THRESHOLD = 0.5
+WEBRTC_MODE = 3  # 0(덜 공격적) ~ 3(더 공격적)
+WEBRTC_FRAME_MS = 30
+WEBRTC_SPEECH_RATIO_THRESHOLD = 0.5
+SILERO_V4_THRESHOLD = 0.5
+SILERO_V5_THRESHOLD = 0.5
+
 
 @dataclass
 class VADResult:
@@ -24,7 +32,9 @@ class VADResult:
     note: str = ""
 
 
-def _energy_fallback(pcm16_16k: bytes, threshold: int = 220) -> bool:
+def _energy_fallback(
+    pcm16_16k: bytes, threshold: int = ENERGY_FALLBACK_THRESHOLD
+) -> bool:
     if not pcm16_16k:
         return False
     return audioop.rms(pcm16_16k, 2) >= threshold
@@ -43,7 +53,9 @@ def _pcm16_to_float32_list(audio_chunk: bytes) -> list[float]:
     return [v / 32768.0 for v in values]
 
 
-def _pcm16_to_wav_bytes(audio_chunk: bytes, sample_rate: int = DEEPGRAM_SAMPLE_RATE) -> bytes:
+def _pcm16_to_wav_bytes(
+    audio_chunk: bytes, sample_rate: int = DEEPGRAM_SAMPLE_RATE
+) -> bytes:
     buf = BytesIO()
     with wave.open(buf, "wb") as wav_file:
         wav_file.setnchannels(DEEPGRAM_CHANNELS)
@@ -81,7 +93,7 @@ class WebRTCVADService(_BenchmarkVADService):
         try:
             import webrtcvad
 
-            self._vad = webrtcvad.Vad(2)
+            self._vad = webrtcvad.Vad(WEBRTC_MODE)
             self.available = True
             self.note = ""
         except Exception:
@@ -97,7 +109,7 @@ class WebRTCVADService(_BenchmarkVADService):
         def _infer() -> bool:
             if not self._vad:
                 return _energy_fallback(audio_chunk)
-            frame_size = int(16000 * 30 / 1000) * 2
+            frame_size = int(16000 * WEBRTC_FRAME_MS / 1000) * 2
             if len(audio_chunk) < frame_size:
                 padded = audio_chunk + b"\x00" * (frame_size - len(audio_chunk))
                 return self._vad.is_speech(padded, 16000)
@@ -107,7 +119,9 @@ class WebRTCVADService(_BenchmarkVADService):
                 total_frames += 1
                 if self._vad.is_speech(audio_chunk[i : i + frame_size], 16000):
                     speech_frames += 1
-            return (speech_frames / max(total_frames, 1)) >= 0.3
+            return (
+                speech_frames / max(total_frames, 1)
+            ) >= WEBRTC_SPEECH_RATIO_THRESHOLD
 
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, _infer)
@@ -154,10 +168,17 @@ class SileroV4VADService(_BenchmarkVADService):
         def _infer() -> bool:
             if not (self._torch and self._get_speech_timestamps and self._model):
                 return _energy_fallback(audio_chunk)
-            waveform = self._torch.tensor(_pcm16_to_float32_list(audio_chunk), dtype=self._torch.float32)
+            waveform = self._torch.tensor(
+                _pcm16_to_float32_list(audio_chunk), dtype=self._torch.float32
+            )
             if waveform.numel() == 0:
                 return False
-            speech_ts = self._get_speech_timestamps(waveform, self._model, sampling_rate=16000)
+            speech_ts = self._get_speech_timestamps(
+                waveform,
+                self._model,
+                sampling_rate=16000,
+                threshold=SILERO_V4_THRESHOLD,
+            )
             return len(speech_ts) > 0
 
         loop = asyncio.get_running_loop()
@@ -205,10 +226,17 @@ class SileroV5VADService(_BenchmarkVADService):
         def _infer() -> bool:
             if not (self._torch and self._get_speech_timestamps and self._model):
                 return _energy_fallback(audio_chunk)
-            waveform = self._torch.tensor(_pcm16_to_float32_list(audio_chunk), dtype=self._torch.float32)
+            waveform = self._torch.tensor(
+                _pcm16_to_float32_list(audio_chunk), dtype=self._torch.float32
+            )
             if waveform.numel() == 0:
                 return False
-            speech_ts = self._get_speech_timestamps(waveform, self._model, sampling_rate=16000)
+            speech_ts = self._get_speech_timestamps(
+                waveform,
+                self._model,
+                sampling_rate=16000,
+                threshold=SILERO_V5_THRESHOLD,
+            )
             return len(speech_ts) > 0
 
         loop = asyncio.get_running_loop()
@@ -260,17 +288,24 @@ class DeepgramVADService(_BenchmarkVADService):
         def _infer() -> bool:
             if not (self._client and self._options):
                 return _energy_fallback(audio_chunk)
-            if len(audio_chunk) < (DEEPGRAM_SAMPLE_RATE // 10) * DEEPGRAM_SAMPLE_WIDTH_BYTES:
+            if (
+                len(audio_chunk)
+                < (DEEPGRAM_SAMPLE_RATE // 10) * DEEPGRAM_SAMPLE_WIDTH_BYTES
+            ):
                 # 너무 짧은 청크(약 100ms 미만)는 API 호출 대신 로컬 fallback 사용
                 return _energy_fallback(audio_chunk)
             try:
                 # Deepgram 전달 포맷: 16kHz / mono / 16-bit WAV
-                wav_bytes = _pcm16_to_wav_bytes(audio_chunk, sample_rate=DEEPGRAM_SAMPLE_RATE)
+                wav_bytes = _pcm16_to_wav_bytes(
+                    audio_chunk, sample_rate=DEEPGRAM_SAMPLE_RATE
+                )
                 payload = {
                     "buffer": wav_bytes,
                     "mimetype": "audio/wav",
                 }
-                response = self._client.listen.prerecorded.v("1").transcribe_file(payload, self._options)
+                response = self._client.listen.prerecorded.v("1").transcribe_file(
+                    payload, self._options
+                )
                 transcript = (
                     response.results.channels[0].alternatives[0].transcript
                     if response and response.results and response.results.channels
@@ -298,7 +333,10 @@ async def preload_vad_models() -> None:
     await asyncio.gather(*(service.initialize() for service in _VAD_SERVICES))
     logger.info(
         "VAD 모델 프리로드 완료: %s",
-        [{"모델": s.name, "사용가능": s.available, "비고": s.note} for s in _VAD_SERVICES],
+        [
+            {"모델": s.name, "사용가능": s.available, "비고": s.note}
+            for s in _VAD_SERVICES
+        ],
     )
 
 
@@ -315,7 +353,13 @@ async def _timed_run(service: _BenchmarkVADService, audio: bytes) -> VADResult:
     )
 
 
-async def compare_vad_models(pcm16_16k: bytes) -> list[VADResult]:
-    jobs = [_timed_run(service, pcm16_16k) for service in _VAD_SERVICES]
+async def compare_vad_models(
+    pcm16_16k: bytes,
+    *,
+    excluded_models: set[str] | None = None,
+) -> list[VADResult]:
+    excluded = excluded_models or set()
+    services = [service for service in _VAD_SERVICES if service.name not in excluded]
+    jobs = [_timed_run(service, pcm16_16k) for service in services]
     results = await asyncio.gather(*jobs)
     return sorted(results, key=lambda r: r.latency_ms)

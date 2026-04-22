@@ -4,8 +4,6 @@ from app.services.vad.benchmark import compare_vad_models
 
 async def vad_node(state: CallState) -> dict:
     results = await compare_vad_models(state["audio_chunk"])
-    speech_votes = sum(1 for result in results if result.is_speech)
-    is_speech = speech_votes >= 2
     latency_by_model = dict(state.get("vad_latency_ms_by_model", {}))
     is_speech_by_model = dict(state.get("vad_is_speech_by_model", {}))
     true_count_by_model = dict(state.get("vad_true_count_by_model", {}))
@@ -15,7 +13,8 @@ async def vad_node(state: CallState) -> dict:
         if result.is_speech:
             true_count_by_model[result.model] = true_count_by_model.get(result.model, 0) + 1
     return {
-        "is_speech": is_speech,
+        # 통합 판정은 다수결이 아닌 "모델 중 하나라도 True"로만 계산한다.
+        "is_speech": any(is_speech_by_model.values()),
         "vad_latency_ms_by_model": latency_by_model,
         "vad_is_speech_by_model": is_speech_by_model,
         "vad_true_count_by_model": true_count_by_model,
