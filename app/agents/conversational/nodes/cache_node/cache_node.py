@@ -1,12 +1,12 @@
 from app.agents.conversational.state import CallState
 from app.services.cache.semantic_cache import SemanticCacheService
 from app.services.embedding.base import BaseEmbeddingService
-from app.services.embedding.mock import MockEmbeddingService
+from app.services.embedding.local import BGEM3LocalEmbeddingService
 from app.utils.logger import get_logger
 
 # 임베딩은 Cache 노드에서 1회만 생성하고 KNN/FAQ 노드가 재사용 (langgraph_spec §4.4)
-# TODO(BGE-M3 이관): 희영 R-02 완료 후 MockEmbeddingService → BGE-M3 구현체 교체
-_embedding_service: BaseEmbeddingService = MockEmbeddingService()
+# TODO(BGE-M3 이관): 희영 R-02 완료 후 로컬/API 구현체 확정 교체
+_embedding_service: BaseEmbeddingService = BGEM3LocalEmbeddingService()
 _cache_service = SemanticCacheService()
 
 logger = get_logger(__name__)

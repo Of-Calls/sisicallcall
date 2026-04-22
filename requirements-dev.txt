@@ -5,3 +5,9 @@
 # Test framework
 pytest==8.3.3
 pytest-asyncio==0.24.0
+
+# BGE-M3 로컬 임베딩 (희영 연구용 — 로컬 테스트 전용)
+# chromadb 0.5.23 requires tokenizers<=0.20.3, transformers 4.44.2 requires tokenizers<0.20
+FlagEmbedding
+tokenizers>=0.19,<0.20
+transformers==4.44.2

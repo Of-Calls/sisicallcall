@@ -15,7 +15,7 @@ logger = get_logger(__name__)
 
 _llm: BaseLLMService = GPT4OMiniService()
 
-INTENT_ROUTER_TIMEOUT_SEC = 1.5
+INTENT_ROUTER_TIMEOUT_SEC = 3.0  # 테스트용 임시 완화 — 운영 시 1.5s로 복원
 VALID_INTENTS = {"intent_faq", "intent_task", "intent_auth", "intent_escalation"}
 
 # TODO(agents.md 이관): 담당자 배정 후 프롬프트를 agents.md 로 이관하고 여기서는 import

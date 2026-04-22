@@ -29,6 +29,10 @@ def route_after_speaker_verify(state: CallState) -> str:
     return "pass" if state["is_speaker_verified"] else "reject"
 
 
+def route_after_stt(state: CallState) -> str:
+    return "pass" if state["raw_transcript"] else "skip"
+
+
 def route_after_cache(state: CallState) -> str:
     return "hit" if state["cache_hit"] else "miss"
 
@@ -92,7 +96,8 @@ def build_call_graph():
         {"pass": "speaker_verify", "skip": END})
     graph.add_conditional_edges("speaker_verify", route_after_speaker_verify,
         {"pass": "stt", "reject": END})
-    graph.add_edge("stt", "norm_text")
+    graph.add_conditional_edges("stt", route_after_stt,
+        {"pass": "norm_text", "skip": END})
     graph.add_edge("norm_text", "cache")
 
     # Gate 1 분기

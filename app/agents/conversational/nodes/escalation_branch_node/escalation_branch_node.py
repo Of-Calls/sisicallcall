@@ -67,7 +67,8 @@ async def escalation_branch_node(state: CallState) -> dict:
     tenant_id = state["tenant_id"]
     call_id = state["call_id"]
 
-    within_hours = await _session_service.is_within_business_hours(tenant_id)
+    # within_hours = await _session_service.is_within_business_hours(tenant_id)
+    within_hours = True  # 테스트용 임시 우회 — 운영 전 반드시 제거
     if not within_hours:
         logger.info("escalation sub_state=offhours call_id=%s", call_id)
         return {

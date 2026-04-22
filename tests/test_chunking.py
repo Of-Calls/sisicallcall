@@ -24,6 +24,7 @@ load_dotenv()
 
 from app.services.chunking.paragraph import ParagraphChunkingService
 from app.services.chunking.pdf_processor import PDFProcessor
+from app.services.chunking.semantic import SemanticChunkingService
 from app.services.embedding.mock import MockEmbeddingService
 from app.services.rag.chroma import ChromaRAGService
 
@@ -52,7 +53,97 @@ MRI 검사는 사전 예약이 필요합니다. 검사 전 6시간 금식이 필
 
 
 # ==============================================================================
-# 통합 테스트: PDF → ChromaDB
+# 단위 테스트: 시맨틱 청킹 (Mock 임베딩)
+# ==============================================================================
+
+async def test_semantic_chunking():
+    print("\n[2] 시맨틱 청킹 테스트 (Mock 임베딩)")
+    embedder = MockEmbeddingService()
+    chunker = SemanticChunkingService(embedder)
+    sample = """서울중앙병원 진료 안내입니다. 저희 병원은 내과, 외과, 정형외과, 신경과, 산부인과 등 다양한 진료과목을 운영하고 있으며 최신 의료 장비를 갖추고 있습니다.
+
+MRI 검사는 사전 예약이 필요합니다. 검사 전 6시간 금식이 필요하며 금속 물질 제거 후 입실하셔야 합니다. 폐소공포증이 있으신 분은 사전에 담당 의사와 상담하시기 바랍니다.
+
+영업시간은 평일 오전 9시부터 오후 6시까지이며 토요일은 오전 9시부터 오후 1시까지 운영합니다. 일요일 및 공휴일은 휴진입니다."""
+
+    chunks = await chunker.chunk(sample)
+    print(f"  청크 수: {len(chunks)}")
+    for i, c in enumerate(chunks):
+        print(f"  [{i}] ({len(c)}자) {c[:60]}...")
+    assert len(chunks) >= 1, "청크가 1개 이상이어야 합니다"
+    print("  ✅ 시맨틱 청킹 통과 (Mock 임베딩 — 유사도 무작위, 경계 감지 미보장)")
+
+
+# ==============================================================================
+# 통합 테스트: 시맨틱 청킹 + BGE-M3 + LLM 분류 (PDF → ChromaDB)
+# ==============================================================================
+
+async def test_pdf_pipeline_semantic():
+    try:
+        from app.services.embedding.local import BGEM3LocalEmbeddingService
+        embedder = BGEM3LocalEmbeddingService()
+    except Exception as e:
+        print(f"\n[3] BGE-M3 로컬 모델 로딩 실패 — 건너뜀: {e}")
+        print("    pip install FlagEmbedding 후 재시도하세요.")
+        return
+
+    from app.utils.config import settings
+    use_real_llm = bool(settings.openai_api_key)
+    llm_label = "실제 GPT-4o-mini" if use_real_llm else "Mock LLM"
+    print(f"\n[3] 시맨틱 청킹 PDF 파이프라인 테스트 (BGE-M3 로컬, {llm_label})")
+
+    pdf_path = os.path.join(os.path.dirname(__file__), "sample.pdf")
+    if not os.path.exists(pdf_path):
+        print(f"  ⚠️  {pdf_path} 없음 — PDF 파이프라인 테스트 건너뜀")
+        return
+
+    import asyncpg
+    conn = await asyncpg.connect(settings.database_url)
+    try:
+        row = await conn.fetchrow(
+            "SELECT id FROM tenants WHERE twilio_number = $1", "+821000000001"
+        )
+    finally:
+        await conn.close()
+
+    if not row:
+        print("  ❌ tenant 없음 — seed_postgres.py 먼저 실행하세요")
+        return
+
+    tenant_id = str(row["id"])
+    print(f"  tenant_id: {tenant_id}")
+
+    llm = _make_real_llm() if use_real_llm else _make_mock_llm()
+    processor = PDFProcessor(
+        chunker=SemanticChunkingService(embedder),
+        embedder=embedder,
+        rag=ChromaRAGService(),
+        llm=llm,
+    )
+
+    doc_id = await processor.process(
+        pdf_path=pdf_path,
+        tenant_id=tenant_id,
+        file_name="sample_semantic.pdf",
+        industry="hospital",
+    )
+    print(f"  document_id: {doc_id}")
+
+    rag = ChromaRAGService()
+    col_name = rag._collection_name(tenant_id)
+    import chromadb
+    client = chromadb.HttpClient(host=settings.chroma_host, port=settings.chroma_port)
+    col = client.get_collection(col_name)
+    count = col.count()
+    print(f"  ChromaDB 컬렉션 '{col_name}' 문서 수: {count}")
+    assert count > 0, "ChromaDB에 문서가 저장되어야 합니다"
+    print("  ✅ 시맨틱 청킹 PDF 파이프라인 통과")
+
+    return tenant_id
+
+
+# ==============================================================================
+# 통합 테스트: PDF → ChromaDB (기존 단락 청킹)
 # ==============================================================================
 
 async def test_pdf_pipeline():
@@ -119,17 +210,19 @@ async def test_pdf_pipeline():
 # ==============================================================================
 
 async def test_search(tenant_id: str):
-    print("\n[3] ChromaDB 검색 테스트 (Mock 임베딩)")
-    print("  ⚠️  Mock 임베딩은 난수 기반이라 의미 유사도가 없습니다.")
-    print("      파이프라인 동작 확인 용도로만 사용하세요.")
-    print("      BGE-M3 연결 후 실제 유사 검색이 가능합니다.\n")
+    try:
+        from app.services.embedding.local import BGEM3LocalEmbeddingService
+        embedder = BGEM3LocalEmbeddingService()
+        print("\n[검색] ChromaDB 검색 테스트 (BGE-M3 임베딩)")
+    except Exception:
+        embedder = MockEmbeddingService()
+        print("\n[검색] ChromaDB 검색 테스트 (Mock 임베딩 — 의미 유사도 없음)")
 
     query = input("  검색할 텍스트를 입력하세요: ").strip()
     if not query:
         print("  입력 없음 — 검색 테스트 건너뜀")
         return
 
-    embedder = MockEmbeddingService()
     rag = ChromaRAGService()
 
     query_embedding = await embedder.embed(query)
@@ -157,9 +250,9 @@ def _make_mock_llm():
 
     class MockLLMService(BaseLLMService):
         async def generate(self, system_prompt, user_message, temperature=0.1, max_tokens=512):
-            chunks = json.loads(user_message)
+            # user_message는 단일 청크 텍스트 — JSON 단일 객체 반환
             return json.dumps(
-                [{"category": "테스트", "product_name": f"항목{i}"} for i in range(len(chunks))],
+                {"category": "테스트", "product_name": "테스트 항목"},
                 ensure_ascii=False,
             )
 
@@ -172,10 +265,13 @@ def _make_mock_llm():
 
 async def main():
     await test_paragraph_chunking()
-    tenant_id = await test_pdf_pipeline()
+    await test_semantic_chunking()
+    tenant_id = await test_pdf_pipeline_semantic()
+    if not tenant_id:
+        tenant_id = await test_pdf_pipeline()
     if tenant_id:
         await test_search(tenant_id)
-    print("\n🎉 모든 테스트 완료")
+    print("\n모든 테스트 완료")
 
 
 if __name__ == "__main__":
