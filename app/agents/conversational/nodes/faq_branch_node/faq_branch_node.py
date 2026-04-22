@@ -15,7 +15,7 @@ logger = get_logger(__name__)
 _rag: BaseRAGService = ChromaRAGService()
 _llm: BaseLLMService = GPT4OMiniService()
 
-FAQ_LLM_TIMEOUT_SEC = 2.0
+FAQ_LLM_TIMEOUT_SEC = 3.0
 RAG_TOP_K = 3
 
 FALLBACK_MESSAGE = "확인이 어려워 담당자에게 연결해 드리겠습니다."
