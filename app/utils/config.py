@@ -44,6 +44,11 @@ class Settings(BaseSettings):
     titanet_model_name: str = "titanet_large"
     titanet_similarity_threshold: float = 0.40
 
+    # ECAPA-TDNN
+    ecapa_model_source: str = "speechbrain/spkrec-ecapa-voxceleb"
+    ecapa_model_savedir: str = "C:/torch_cache/speechbrain/ecapa"
+    ecapa_similarity_threshold: float = 0.40
+
     # Step 2 모델 threshold (KDT-71 실험용)
     cam_similarity_threshold: float = 0.40
     eres2net_base_similarity_threshold: float = 0.40

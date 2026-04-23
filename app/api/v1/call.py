@@ -13,6 +13,7 @@ from app.agents.conversational.graph import build_call_graph
 from app.agents.conversational.state import CallState
 from app.core.events import CALL_ENDED, CALL_STARTED
 from app.services.speaker_verify.cam_plus_plus import CAMPlusPlusSpeakerVerifyService
+from app.services.speaker_verify.ecapa import ECAPASpeakerVerifyService
 from app.services.speaker_verify.eres2net import ERes2NetSpeakerVerifyService
 from app.services.speaker_verify.titanet import TitaNetSpeakerVerifyService
 from app.services.vad.silero import SileroVADService
@@ -26,19 +27,22 @@ router = APIRouter()
 _graph = build_call_graph()
 _vad = SileroVADService()
 
-# Step1 우승 모델 + Step2 비교군 (Step1 결과 확정 전까지 titanet_large 고정)
 _SERVICES = {
-    "titanet_large": TitaNetSpeakerVerifyService(),
+    "titanet_large": TitaNetSpeakerVerifyService(model_name="titanet_large"),
+    "titanet_small": TitaNetSpeakerVerifyService(model_name="titanet_small"),
+    "ecapa_tdnn":    ECAPASpeakerVerifyService(),
     "cam_plus_plus": CAMPlusPlusSpeakerVerifyService(),
     "eres2net_base": ERes2NetSpeakerVerifyService(variant="base"),
-    "eres2net_v2": ERes2NetSpeakerVerifyService(variant="v2"),
+    "eres2net_v2":   ERes2NetSpeakerVerifyService(variant="v2"),
 }
 
 _THRESHOLDS: dict[str, float] = {
     "titanet_large": settings.titanet_similarity_threshold,
+    "titanet_small": settings.titanet_similarity_threshold,
+    "ecapa_tdnn":    settings.ecapa_similarity_threshold,
     "cam_plus_plus": settings.cam_similarity_threshold,
     "eres2net_base": settings.eres2net_base_similarity_threshold,
-    "eres2net_v2": settings.eres2net_v2_similarity_threshold,
+    "eres2net_v2":   settings.eres2net_v2_similarity_threshold,
 }
 
 _PCM_BYTES_PER_SEC = 16000 * 2
@@ -337,8 +341,8 @@ async def call_websocket(
                         if not isinstance(res, Exception):
                             verify_outcomes[mn] = res
 
-                # 상태 머신용 is_verified — titanet_large 결과 우선
-                is_verified = verify_outcomes.get("titanet_large", (False, 0.0))[0]
+                # 상태 머신용 is_verified — eres2net_base 결과 우선
+                is_verified = verify_outcomes.get("eres2net_base", (False, 0.0))[0]
 
                 state: CallState = {
                     "call_id": call_id,

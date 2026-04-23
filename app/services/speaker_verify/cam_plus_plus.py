@@ -4,6 +4,7 @@ import tempfile
 
 import numpy as np
 import soundfile as sf
+import torch
 
 from app.services.speaker_verify.base import BaseSpeakerVerifyService
 from app.utils.config import settings
@@ -13,18 +14,21 @@ logger = get_logger(__name__)
 
 _SAMPLE_RATE = 16000
 _MODEL_ID = "damo/speech_campplus_sv_zh-cn_16k-common"
+_DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+_MS_DEVICE = "gpu" if torch.cuda.is_available() else "cpu"
 _voiceprints: dict[str, np.ndarray] = {}
 
 
 class CAMPlusPlusSpeakerVerifyService(BaseSpeakerVerifyService):
     def __init__(self) -> None:
-        logger.info("CAM++ 모델 로드 중...")
+        logger.info(f"CAM++ 모델 로드 중... (device={_DEVICE})")
         try:
             from modelscope.pipelines import pipeline as ms_pipeline
             from modelscope.utils.constant import Tasks
             self._pipeline = ms_pipeline(
                 task=Tasks.speaker_verification,
                 model=_MODEL_ID,
+                device=_MS_DEVICE,
             )
             logger.info("CAM++ 모델 로드 완료")
         except Exception as e:
@@ -32,7 +36,6 @@ class CAMPlusPlusSpeakerVerifyService(BaseSpeakerVerifyService):
             raise
 
     def _extract_embedding_sync(self, audio_chunk: bytes) -> np.ndarray:
-        import torch
         samples = np.frombuffer(audio_chunk, dtype=np.int16).astype(np.float32) / 32768.0
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
             sf.write(f.name, samples, _SAMPLE_RATE)
@@ -40,7 +43,7 @@ class CAMPlusPlusSpeakerVerifyService(BaseSpeakerVerifyService):
         try:
             processed = self._pipeline.preprocess([tmp_path])
             with torch.no_grad():
-                emb = self._pipeline.model(processed[0].unsqueeze(0))
+                emb = self._pipeline.model(processed[0].unsqueeze(0).to(_DEVICE))
             return emb.squeeze(0).cpu().numpy()
         finally:
             os.unlink(tmp_path)

@@ -1,11 +1,11 @@
 from app.agents.conversational.state import CallState
-from app.services.stt.base import BaseSTTService
-from app.services.stt.deepgram import DeepgramSTTService
+# from app.services.stt.base import BaseSTTService
+# from app.services.stt.deepgram import DeepgramSTTService
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-_stt_service: BaseSTTService = DeepgramSTTService()
+# _stt_service: BaseSTTService = DeepgramSTTService()
 
 
 async def stt_node(state: CallState) -> dict:
