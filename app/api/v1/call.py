@@ -4,15 +4,13 @@ import shutil
 import wave
 from datetime import datetime
 from pathlib import Path
-from statistics import median
 
 from fastapi import APIRouter, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response
 
 from app.agents.conversational.graph import build_call_graph
+from app.agents.conversational.nodes.stt_node.stt_node import stt_node
 from app.core.events import CALL_ENDED, CALL_STARTED
-from app.services.vad.benchmark import compare_vad_models
-from app.services.stt.deepgram import DeepgramSTTService
 from app.utils.audio import mulaw_to_pcm16, reset_resample_state
 from app.utils.config import settings
 from app.utils.logger import get_logger
@@ -22,8 +20,7 @@ router = APIRouter()
 _RECORDINGS_DIR = Path("recordings")
 _ORIGIN_RECORDINGS_DIR = _RECORDINGS_DIR / "origin"
 _call_graph = build_call_graph()
-_stt_service: DeepgramSTTService | None = None
-_stt_unavailable_reason = ""
+VAD_MODEL_NAME = "webrtc_vad"
 # 실시간 파이프라인 기본 단위: 20ms PCM16 frame
 SAMPLE_RATE = 16000
 SAMPLE_WIDTH_BYTES = 2
@@ -40,25 +37,6 @@ STT_INTERIM_MIN_BYTES = int(
 STT_FINAL_TRIGGER_FRAMES = int(STT_FINAL_SILENCE_MS / FRAME_MS)
 STT_FINAL_COMMIT_DELAY_FRAMES = int(STT_FINAL_COMMIT_DELAY_MS / FRAME_MS)
 STT_FINAL_FRAMES = STT_FINAL_TRIGGER_FRAMES + STT_FINAL_COMMIT_DELAY_FRAMES
-
-
-def _get_stt_service() -> DeepgramSTTService | None:
-    global _stt_service, _stt_unavailable_reason
-    if _stt_service:
-        return _stt_service
-    if _stt_unavailable_reason:
-        return None
-    if not settings.deepgram_api_key.strip():
-        _stt_unavailable_reason = "DEEPGRAM_API_KEY 없음"
-        logger.warning("STT 비활성화: %s", _stt_unavailable_reason)
-        return None
-    try:
-        _stt_service = DeepgramSTTService()
-    except Exception as e:
-        _stt_unavailable_reason = str(e)
-        logger.warning("STT 비활성화: %s", e)
-        return None
-    return _stt_service
 
 
 def _sanitize_path_name(name: str) -> str:
@@ -143,9 +121,8 @@ async def call_websocket(
 
     audio_buffer = bytearray()
     raw_audio_16k = bytearray()
-    vad_latency_ms_by_model: dict[str, list[float]] = {}
-    vad_is_speech_by_model: dict[str, bool] = {}
-    vad_true_count_by_model: dict[str, int] = {}
+    vad_total_frames = 0
+    vad_speech_frames = 0
     per_model_audio_16k: dict[str, bytearray] = {}
     stt_transcript_by_model: dict[str, list[str]] = {}
     # interim: 짧은 주기 STT용 / speech: 최종 확정 STT용 누적 버퍼
@@ -159,10 +136,10 @@ async def call_websocket(
     recording_ext = "wav"
 
     async def _transcribe(model_name: str, audio_bytes: bytes) -> str:
-        stt_service = _get_stt_service()
-        if not stt_service:
-            return ""
-        transcript = await stt_service.transcribe(audio_bytes)
+        # STT는 노드 경유로 실행(whisper service 재사용)
+        _ = model_name
+        result = await stt_node({"audio_chunk": audio_bytes})
+        transcript = result.get("raw_transcript", "")
         return transcript.strip() if transcript else ""
 
     async def _run_interim_stt(model_name: str) -> None:
@@ -243,22 +220,15 @@ async def call_websocket(
             raw_path,
             len(per_model_audio_16k),
         )
-        if vad_latency_ms_by_model:
-            summary = {}
-            for model, values in vad_latency_ms_by_model.items():
-                if not values:
-                    continue
-                true_count = vad_true_count_by_model.get(model, 0)
-                summary[model] = {
-                    "처리된청크개수": len(values),
-                    "is_speech_true횟수": true_count,
-                    "is_speech_true비율": round(true_count / len(values), 4),
-                    "평균ms": round(sum(values) / len(values), 3),
-                    "중앙값ms": round(median(values), 3),
+        if vad_total_frames > 0:
+            summary = {
+                VAD_MODEL_NAME: {
+                    "처리프레임수": vad_total_frames,
+                    "is_speech_true횟수": vad_speech_frames,
+                    "is_speech_true비율": round(vad_speech_frames / vad_total_frames, 4),
                 }
-            logger.info(
-                "통화 종료 VAD 모델별 지연 요약 call_id=%s 상세=%s", call_id, summary
-            )
+            }
+            logger.info("통화 종료 VAD 요약 call_id=%s 상세=%s", call_id, summary)
         reset_resample_state()
 
     try:
@@ -309,6 +279,7 @@ async def call_websocket(
                     chunk = bytes(audio_buffer[:FRAME_BYTES])
                     del audio_buffer[:FRAME_BYTES]
                     turn_index += 1
+                    vad_total_frames += 1
 
                     graph_state = await _call_graph.ainvoke(
                         {
@@ -319,50 +290,22 @@ async def call_websocket(
                         }
                     )
                     if not graph_state.get("is_speech", False):
+                        stt_silence_frames_by_model[VAD_MODEL_NAME] = (
+                            stt_silence_frames_by_model.get(VAD_MODEL_NAME, 0) + 1
+                        )
+                        await _run_final_stt(VAD_MODEL_NAME, force=False)
                         continue
 
-                    results = await compare_vad_models(
-                        chunk,
-                        excluded_models={"deepgram_vad"},
+                    vad_speech_frames += 1
+                    stt_silence_frames_by_model[VAD_MODEL_NAME] = 0
+                    per_model_audio_16k.setdefault(VAD_MODEL_NAME, bytearray()).extend(chunk)
+                    stt_interim_buffer_by_model.setdefault(VAD_MODEL_NAME, bytearray()).extend(
+                        chunk
                     )
-                    active_models = {result.model for result in results}
-                    for result in results:
-                        vad_latency_ms_by_model.setdefault(result.model, []).append(
-                            result.latency_ms
-                        )
-                        vad_is_speech_by_model[result.model] = result.is_speech
-                        if not result.is_speech:
-                            # bridge-out: 무음이 누적되면 final commit 조건 도달 여부를 검사한다.
-                            stt_silence_frames_by_model[result.model] = (
-                                stt_silence_frames_by_model.get(result.model, 0) + 1
-                            )
-                            await _run_final_stt(result.model, force=False)
-                            continue
-
-                        # bridge-in: speech가 다시 들어오면 무음 카운터를 리셋하고 버퍼를 누적한다.
-                        stt_silence_frames_by_model[result.model] = 0
-                        vad_true_count_by_model[result.model] = (
-                            vad_true_count_by_model.get(result.model, 0) + 1
-                        )
-                        per_model_audio_16k.setdefault(
-                            result.model, bytearray()
-                        ).extend(chunk)
-                        stt_interim_buffer_by_model.setdefault(
-                            result.model, bytearray()
-                        ).extend(chunk)
-                        stt_speech_buffer_by_model.setdefault(
-                            result.model, bytearray()
-                        ).extend(chunk)
-                        await _run_interim_stt(result.model)
-
-                    # 이번 프레임 결과에 없는 모델도 무음 누적으로 처리
-                    for model_name in (
-                        set(stt_speech_buffer_by_model.keys()) - active_models
-                    ):
-                        stt_silence_frames_by_model[model_name] = (
-                            stt_silence_frames_by_model.get(model_name, 0) + 1
-                        )
-                        await _run_final_stt(model_name, force=False)
+                    stt_speech_buffer_by_model.setdefault(VAD_MODEL_NAME, bytearray()).extend(
+                        chunk
+                    )
+                    await _run_interim_stt(VAD_MODEL_NAME)
 
             elif event == "stop":
                 logger.info(f"[{CALL_ENDED}] call_id={call_id}")
