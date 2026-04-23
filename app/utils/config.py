@@ -47,12 +47,28 @@ class Settings(BaseSettings):
     # TitaNet 화자 검증 (대영 R-01 연구 결과 — titanet_large 채택)
     titanet_model_name: str = "titanet_large"
     titanet_similarity_threshold: float = 0.40
-    titanet_enrollment_sec: float = 5.0   # voiceprint 등록에 사용할 첫 발화 누적 시간
+    titanet_enrollment_sec: float = 3.0   # voiceprint 등록에 사용할 첫 발화 누적 시간
 
     # TTS 합성 엔진 — "google" (Cloud TTS) | "xtts" (Coqui XTTS v2 로컬, 팀원 목소리)
     tts_provider: str = "google"
     # XTTS reference audio 경로 (zero-shot voice cloning용 WAV 파일)
     xtts_reference_path: str = "voice/speaker_reference.wav"
+
+    # SMS Provider — "solapi" (기본) | "twilio"
+    sms_provider: str = "solapi"
+    solapi_api_key: str = ""
+    solapi_api_secret: str = ""
+    solapi_sender_number: str = ""
+
+    # Face Auth (M3+)
+    arcface_model_name: str = "buffalo_l"
+    arcface_similarity_threshold: float = 0.6
+    arcface_max_retries: int = 3
+    liveness_instruction_count: int = 3
+    liveness_hmac_secret: str = "change-me-in-production"
+    auth_session_ttl_sec: int = 600
+    auth_enable_test_register: bool = False
+    auth_web_base_url: str = "http://localhost:3000"
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 

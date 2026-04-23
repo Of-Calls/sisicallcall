@@ -62,3 +62,6 @@ class CallState(TypedDict):
     # 빈 STT 연속 횟수 — call.py 에서 주입, stt_node 에서 증가.
     # N회 초과 시 escalation 처리 (안내 멘트 → 상담원 연결).
     empty_stt_count: NotRequired[int]
+
+    # voiceprint 등록 완료 여부 — enrollment_node 에서 관리 (관측용)
+    enrollment_done: NotRequired[bool]

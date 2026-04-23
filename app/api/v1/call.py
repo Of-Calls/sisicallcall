@@ -12,6 +12,7 @@ from app.agents.conversational.graph import build_call_graph
 from app.agents.conversational.state import CallState
 from app.core.events import CALL_ENDED, CALL_STARTED
 from app.services.session.redis_session import RedisSessionService
+from app.services.stt.deepgram_streaming import DeepgramStreamingSTTService
 from app.services.tts.channel import tts_channel
 from app.utils.audio import mulaw_to_pcm16, reset_resample_state
 from app.utils.config import settings
@@ -23,6 +24,7 @@ router = APIRouter()
 # 그래프 싱글톤 (앱 기동 시 1회 컴파일)
 _graph = build_call_graph()
 _session_service = RedisSessionService()
+_streaming_stt = DeepgramStreamingSTTService()
 
 # 발화 감지 파라미터 — Silero VAD(주미) 구현 전 임시 에너지 기반 묵음 감지
 _SPEECH_RMS_THRESHOLD = 1200   # RMS 임계값 (묵음 vs 발화) — TTS 에코 필터링 목적으로 800→1200 상향
@@ -35,7 +37,7 @@ _DEFAULT_GREETING = "안녕하세요, 고객센터입니다. 무엇을 도와드
 _DEFAULT_OFFHOURS_GREETING = (
     "안녕하세요, 고객센터입니다. "
     "현재 상담원 운영 시간이 아니지만 기본적인 문의는 도와드릴 수 있습니다. "
-    "말씀해 주세요."
+    "무엇을 도와드릴까요?"
 )
 
 # 침묵 감지 파라미터
@@ -191,6 +193,12 @@ async def call_websocket(
                     channel_opened = True
                 stall_messages = await _session_service.get_stall_messages(tenant_id)
 
+                # Deepgram 스트리밍 연결 개설 — 통화 전체에서 재사용
+                try:
+                    await _streaming_stt.open(call_id)
+                except Exception as _stt_err:
+                    logger.warning("STT 스트리밍 연결 실패 call_id=%s: %s (prerecorded 폴백)", call_id, _stt_err)
+
                 # 연결 즉시 인사말 발송 — 영업시간 내/외에 따라 다른 멘트
                 within_hours = await _session_service.is_within_business_hours(tenant_id)
                 greeting = await _get_greeting(tenant_id, within_hours)
@@ -210,6 +218,7 @@ async def call_websocket(
                 mulaw_bytes = base64.b64decode(msg["media"]["payload"])
                 pcm_bytes = mulaw_to_pcm16(mulaw_bytes)
                 rms = audioop.rms(pcm_bytes, 2)
+                await _streaming_stt.send(call_id, pcm_bytes)
 
                 if rms >= _SPEECH_RMS_THRESHOLD:
                     # 발화 구간 — 버퍼에 누적, 묵음 카운터 초기화
@@ -232,6 +241,7 @@ async def call_websocket(
                                 f"call_id={call_id} | 발화 완성 "
                                 f"{len(chunk)} bytes ({len(chunk)/32000:.1f}s) → 그래프 실행"
                             )
+                            streaming_transcript = await _streaming_stt.flush_transcript(call_id)
                             state: CallState = {
                                 "call_id": call_id,
                                 "tenant_id": tenant_id,
@@ -239,7 +249,7 @@ async def call_websocket(
                                 "audio_chunk": chunk,
                                 "is_speech": False,
                                 "is_speaker_verified": False,
-                                "raw_transcript": "",
+                                "raw_transcript": streaming_transcript,
                                 "normalized_text": "",
                                 "query_embedding": [],
                                 "cache_hit": False,
@@ -312,6 +322,7 @@ async def call_websocket(
             elif event == "stop":
                 logger.info(f"[{CALL_ENDED}] call_id={call_id}")
                 reset_resample_state()
+                await _streaming_stt.close(call_id)
                 if channel_opened:
                     await tts_channel.flush(call_id)
                 break
@@ -319,10 +330,12 @@ async def call_websocket(
     except WebSocketDisconnect:
         logger.info(f"WebSocket 종료 call_id={call_id}")
         reset_resample_state()
+        await _streaming_stt.close(call_id)
         if channel_opened:
             await tts_channel.flush(call_id)
     except Exception as e:
         logger.error(f"call_id={call_id} WebSocket 오류: {e}")
         reset_resample_state()
+        await _streaming_stt.close(call_id)
         if channel_opened:
             await tts_channel.flush(call_id)

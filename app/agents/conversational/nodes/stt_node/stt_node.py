@@ -13,18 +13,26 @@ _EMPTY_STT_ESCALATION_THRESHOLD = 3
 
 async def stt_node(state: CallState) -> dict:
     call_id = state.get("call_id", "unknown")
+
+    # Streaming 모드: call.py 에서 flush_transcript() 결과가 미리 담겨 옴 → 패스스루
+    pre_filled = (state.get("raw_transcript") or "").strip()
+    if pre_filled:
+        logger.info("STT 패스스루 (streaming) call_id=%s transcript='%s'", call_id, pre_filled)
+        return {"raw_transcript": pre_filled, "empty_stt_count": 0}
+
+    # Fallback: prerecorded (streaming 결과 없거나 연결 실패 시)
     audio_data = state.get("audio_chunk", b"")
     audio_length = len(audio_data)
 
-    logger.info("STT 디버깅 call_id=%s | 입력 데이터 크기: %d bytes", call_id, audio_length)
+    logger.info("STT prerecorded fallback call_id=%s | %d bytes", call_id, audio_length)
 
     try:
         if audio_length == 0:
-            logger.warning("STT 경고 call_id=%s | 빈 오디오 청크가 전달됨", call_id)
+            logger.warning("STT 경고 call_id=%s | 빈 오디오 청크", call_id)
             return _handle_empty_transcript(state, call_id)
 
         transcript = await _stt_service.transcribe(audio_data)
-        logger.info("STT 디버깅 call_id=%s | 변환 결과: '%s'", call_id, transcript)
+        logger.info("STT prerecorded call_id=%s | '%s'", call_id, transcript)
 
         if not transcript:
             return _handle_empty_transcript(state, call_id)

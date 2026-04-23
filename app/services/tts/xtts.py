@@ -32,7 +32,10 @@ class XTTSService(BaseTTSService):
     NATIVE_SAMPLE_RATE = 24000  # XTTS v2 출력 샘플레이트
     TARGET_SAMPLE_RATE = 8000   # Twilio Media Stream 입력 샘플레이트
     MAX_KO_CHARS = 90           # XTTS v2 한국어 입력 한계 95자, 안전 마진 적용
-    INTER_CHUNK_SILENCE_MS = 600  # 청크 사이 무음 — 자연스러운 호흡감 (~0.6초)
+    # 청크 사이 무음 — 문장 경계와 쉼표 경계를 차등 적용해 자연스러운 호흡감 부여
+    # (말하는 속도 자체는 유지, 청크 사이 휴지만 늘림)
+    INTER_SENTENCE_SILENCE_MS = 800  # 마침표/물음표/느낌표 끝 — 문장 경계
+    INTER_PHRASE_SILENCE_MS = 250    # 쉼표 분할로 생긴 중간 청크 — 짧은 호흡
 
     # 한국어 시간 표현은 시(時)를 순우리말로 읽는 게 자연스러움.
     # 09:00 → "아홉 시" (○), "구 시" (X)
@@ -50,6 +53,9 @@ class XTTSService(BaseTTSService):
         self._device = None
         self._gpt_cond_latent = None
         self._speaker_embedding = None
+        # 사전 합성 캐시 — 서버 시작 시 greeting 텍스트를 미리 합성해 저장.
+        # text(str) → μ-law bytes. 캐시 히트 시 재합성 없이 즉시 반환.
+        self._synthesis_cache: dict[str, bytes] = {}
 
     def _ensure_model(self):
         """첫 호출 시 모델 로드 + reference voice embedding 추출 + 캐싱."""
@@ -121,25 +127,32 @@ class XTTSService(BaseTTSService):
             return f"{period} {h_text} 시 {mm}분"
         return re.sub(r"(\d{1,2}):(\d{2})", time_replacer, text)
 
-    def _split_for_synthesis(self, text: str) -> list[str]:
+    def _split_for_synthesis(self, text: str) -> list[tuple[str, bool]]:
         """긴 텍스트를 합성 가능 청크로 분할.
 
-        1차: 마침표/물음표/느낌표 단위
-        2차: 청크가 한계 초과 시 쉼표 단위 추가 분할
+        1차: 마침표/물음표/느낌표 단위 → 문장 경계 (is_sentence_end=True)
+        2차: 청크가 한계 초과 시 쉼표 단위 추가 분할 → 구절 경계 (is_sentence_end=False)
+              단, 한 문장의 마지막 쉼표 분할 청크는 문장 끝이므로 True
+
+        Returns:
+            list of (chunk_text, is_sentence_end). is_sentence_end 는
+            해당 청크 다음에 문장 경계 silence(800ms) 를 넣을지,
+            구절 silence(250ms) 를 넣을지 결정한다.
         """
         max_chars = self.MAX_KO_CHARS
         sentences = re.split(r"(?<=[.!?。])\s*", text)
-        chunks: list[str] = []
+        chunks: list[tuple[str, bool]] = []
         for s in sentences:
             s = s.strip()
             if not s:
                 continue
             if len(s) <= max_chars:
-                chunks.append(s)
+                chunks.append((s, True))
                 continue
             # 쉼표 단위 2차 분할 + 누적 버퍼링
             parts = re.split(r"(?<=[,，、])\s*", s)
             buf = ""
+            sub_chunks: list[str] = []
             for p in parts:
                 p = p.strip()
                 if not p:
@@ -149,10 +162,13 @@ class XTTSService(BaseTTSService):
                     buf = joined
                 else:
                     if buf:
-                        chunks.append(buf)
+                        sub_chunks.append(buf)
                     buf = p
             if buf:
-                chunks.append(buf)
+                sub_chunks.append(buf)
+            # 한 문장 내부 분할: 마지막 청크만 문장 끝, 나머지는 구절 경계
+            for i, sc in enumerate(sub_chunks):
+                chunks.append((sc, i == len(sub_chunks) - 1))
         return chunks
 
     def _synthesize_sync(self, text: str) -> bytes:
@@ -166,26 +182,36 @@ class XTTSService(BaseTTSService):
             return b""
 
         wavs: list[np.ndarray] = []
-        for chunk in chunks:
+        is_sentence_end_flags: list[bool] = []
+        for chunk_text, is_sentence_end in chunks:
             out = self._model.synthesizer.tts_model.inference(
-                text=chunk,
+                text=chunk_text,
                 language=self.LANGUAGE,
                 gpt_cond_latent=self._gpt_cond_latent,
                 speaker_embedding=self._speaker_embedding,
                 temperature=0.7,
             )
             wavs.append(np.asarray(out["wav"], dtype=np.float32))
+            is_sentence_end_flags.append(is_sentence_end)
 
         if len(wavs) == 1:
             full_wav = wavs[0]
         else:
-            # 청크 사이에 무음 패딩 — 자연스러운 호흡감 부여
-            silence_samples = int(self.NATIVE_SAMPLE_RATE * self.INTER_CHUNK_SILENCE_MS / 1000)
-            silence = np.zeros(silence_samples, dtype=np.float32)
+            # 청크 사이에 무음 패딩 — 직전 청크가 문장 끝이면 800ms, 구절이면 250ms
+            sentence_silence_samples = int(
+                self.NATIVE_SAMPLE_RATE * self.INTER_SENTENCE_SILENCE_MS / 1000
+            )
+            phrase_silence_samples = int(
+                self.NATIVE_SAMPLE_RATE * self.INTER_PHRASE_SILENCE_MS / 1000
+            )
+            sentence_silence = np.zeros(sentence_silence_samples, dtype=np.float32)
+            phrase_silence = np.zeros(phrase_silence_samples, dtype=np.float32)
             interleaved: list[np.ndarray] = []
             for i, w in enumerate(wavs):
                 if i > 0:
-                    interleaved.append(silence)
+                    interleaved.append(
+                        sentence_silence if is_sentence_end_flags[i - 1] else phrase_silence
+                    )
                 interleaved.append(w)
             full_wav = np.concatenate(interleaved)
 
@@ -205,7 +231,20 @@ class XTTSService(BaseTTSService):
     async def synthesize(self, text: str) -> bytes:
         """텍스트 → μ-law 8kHz mono bytes (Twilio Media Stream 호환).
 
-        XTTS는 동기 코드라서 run_in_executor로 비동기 래핑.
+        캐시 히트 시 즉시 반환. 미스 시 XTTS 합성 후 반환 (캐시 저장 안 함 — 동적 응답은 캐시 불필요).
+        greeting 등 고정 텍스트는 warm_cache() 로 미리 합성해 둘 것.
         """
+        if text in self._synthesis_cache:
+            logger.debug("TTS 캐시 히트 text_len=%d", len(text))
+            return self._synthesis_cache[text]
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, self._synthesize_sync, text)
+
+    async def warm_cache(self, text: str) -> None:
+        """지정 텍스트를 미리 합성해 캐시에 저장 (서버 시작 시 greeting 워밍업용)."""
+        if not text or text in self._synthesis_cache:
+            return
+        loop = asyncio.get_running_loop()
+        audio = await loop.run_in_executor(None, self._synthesize_sync, text)
+        self._synthesis_cache[text] = audio
+        logger.info("TTS 캐시 저장 text_len=%d bytes=%d", len(text), len(audio))
