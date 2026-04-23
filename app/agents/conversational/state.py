@@ -51,3 +51,10 @@ class CallState(TypedDict):
     # 노드는 .get() 로 안전 접근. 키 부재 시 _run_with_stall 이 하드코딩 기본값 사용.
     stall_messages: NotRequired[dict]   # {"general": "잠시만요...", "faq": "...", ...}
     stall_delay_sec: NotRequired[float] # 기본 1.0
+
+    # cache_store_node 동작 결과 (관측·디버깅용)
+    cache_stored: NotRequired[bool]
+
+    # 응답이 fallback 메시지인지 (Semantic Cache 저장 차단용).
+    # 브랜치 노드가 명시적으로 설정. RAG miss / LLM 고정 fallback 텍스트 등.
+    is_fallback: NotRequired[bool]

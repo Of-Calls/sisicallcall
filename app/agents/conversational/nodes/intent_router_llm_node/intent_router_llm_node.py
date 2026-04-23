@@ -15,7 +15,10 @@ logger = get_logger(__name__)
 
 _llm: BaseLLMService = GPT4OMiniService()
 
-INTENT_ROUTER_TIMEOUT_SEC = 3.0  # 테스트용 임시 완화 — 운영 시 1.5s로 복원
+# 명세 초안은 1.5s 였으나 한국 ↔ OpenAI 네트워크 왕복(200~300ms) + 응답(0.5~2s) 합산 시
+# 매번 timeout 위험. 실통화 검증(2026-04-23) 결과 3.0s 가 현실적 값으로 확정.
+# 추후 OpenAI 클라이언트 connection keep-alive 도입 시 재검토.
+INTENT_ROUTER_TIMEOUT_SEC = 3.0
 VALID_INTENTS = {"intent_faq", "intent_task", "intent_auth", "intent_escalation"}
 
 # TODO(agents.md 이관): 담당자 배정 후 프롬프트를 agents.md 로 이관하고 여기서는 import

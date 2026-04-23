@@ -1,4 +1,5 @@
 import asyncio
+import os
 
 from app.agents.conversational.state import CallState
 from app.agents.summary.sync_mode import SyncSummaryAgent
@@ -18,10 +19,14 @@ _sync_summary = SyncSummaryAgent()
 SUMMARY_SYNC_TIMEOUT_SEC = 3.0
 STALL_DELAY_DEFAULT = 1.0
 
+# 영업시간 외 테스트 우회 토글 — .env 또는 셸에서 BYPASS_OFFHOURS=true 설정 시 항상 영업중 처리.
+# 운영에선 미설정 → 정상 영업시간 검사 수행.
+_BYPASS_OFFHOURS = os.getenv("BYPASS_OFFHOURS", "false").lower() == "true"
+
 # TODO(agents.md 이관): tenant.settings JSONB 업종별 오버라이드 전까지 기본 멘트
 MSG_IMMEDIATE = "상담원에게 즉시 연결해 드리겠습니다."
 MSG_CALLBACK = "현재 모든 상담원이 통화 중이어서, 가능한 빠른 시간 내 콜백 드리겠습니다."
-MSG_OFFHOURS = "현재는 운영 시간이 아닙니다. 운영 시간에 다시 연락 주시기 바랍니다."
+MSG_OFFHOURS = "현재 상담원 연결이 어렵습니다. 운영 시간에 콜백 드리겠습니다."
 
 
 def _pick_stall_msg(state: CallState) -> str:
@@ -67,8 +72,10 @@ async def escalation_branch_node(state: CallState) -> dict:
     tenant_id = state["tenant_id"]
     call_id = state["call_id"]
 
-    # within_hours = await _session_service.is_within_business_hours(tenant_id)
-    within_hours = True  # 테스트용 임시 우회 — 운영 전 반드시 제거
+    if _BYPASS_OFFHOURS:
+        within_hours = True
+    else:
+        within_hours = await _session_service.is_within_business_hours(tenant_id)
     if not within_hours:
         logger.info("escalation sub_state=offhours call_id=%s", call_id)
         return {

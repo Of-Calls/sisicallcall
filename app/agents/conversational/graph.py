@@ -6,6 +6,7 @@ from app.agents.conversational.nodes.speaker_verify_node.speaker_verify_node imp
 from app.agents.conversational.nodes.stt_node.stt_node import stt_node
 from app.agents.conversational.nodes.norm_text_node.norm_text_node import norm_text_node
 from app.agents.conversational.nodes.cache_node.cache_node import cache_node
+from app.agents.conversational.nodes.cache_store_node.cache_store_node import cache_store_node
 from app.agents.conversational.nodes.knn_router_node.knn_router_node import knn_router_node
 from app.agents.conversational.nodes.intent_router_llm_node.intent_router_llm_node import intent_router_llm_node
 from app.agents.conversational.nodes.faq_branch_node.faq_branch_node import faq_branch_node
@@ -86,6 +87,7 @@ def build_call_graph():
     graph.add_node("auth_branch", auth_branch_node)
     graph.add_node("escalation_branch", escalation_branch_node)
     graph.add_node("reviewer", reviewer_node)
+    graph.add_node("cache_store", cache_store_node)
     graph.add_node("tts", tts_node)
 
     # 진입점
@@ -121,12 +123,13 @@ def build_call_graph():
         "escalation": "escalation_branch",
     })
 
-    # 브랜치 → (조건부 Reviewer) → TTS
+    # 브랜치 → (조건부 Reviewer) → cache_store → TTS
     for branch in ("faq_branch", "task_branch", "auth_branch", "escalation_branch"):
         graph.add_conditional_edges(branch, route_after_branch,
-            {"review": "reviewer", "skip_review": "tts"})
+            {"review": "reviewer", "skip_review": "cache_store"})
 
-    graph.add_edge("reviewer", "tts")
+    graph.add_edge("reviewer", "cache_store")
+    graph.add_edge("cache_store", "tts")
     graph.add_edge("tts", END)
 
     return graph.compile()

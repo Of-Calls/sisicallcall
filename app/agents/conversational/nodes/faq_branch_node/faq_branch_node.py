@@ -79,9 +79,13 @@ async def faq_branch_node(state: CallState) -> dict:
     if not response_text:
         response_text = FALLBACK_MESSAGE
 
+    # fallback 판정 — Semantic Cache 저장 차단 신호 (cache_store_node 가 검사)
+    is_fallback = (not rag_results) or (response_text == FALLBACK_MESSAGE)
+
     return {
         "rag_results": rag_results,
         "response_text": response_text,
         "response_path": "faq",
         "is_timeout": is_timeout,
+        "is_fallback": is_fallback,
     }

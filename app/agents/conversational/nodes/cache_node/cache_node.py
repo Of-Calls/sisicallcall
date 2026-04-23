@@ -23,6 +23,7 @@ async def cache_node(state: CallState) -> dict:
         result = await _cache_service.lookup(
             text=state["normalized_text"],
             tenant_id=state["tenant_id"],
+            embedding=query_embedding,
         )
     except Exception as e:
         logger.error("cache lookup failed call_id=%s: %s", state["call_id"], e)

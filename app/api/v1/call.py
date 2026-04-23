@@ -29,6 +29,14 @@ _SILENCE_CHUNKS_TO_END = 40    # 발화 종료 판단 묵음 청크 수 (~800ms,
 _MIN_UTTERANCE_BYTES = 16000   # 최소 발화 길이 (~500ms at 16kHz 16-bit)
 _MAX_UTTERANCE_BYTES = 320000  # 최대 발화 길이 (~10s)
 
+# 인사말 기본값 — tenants.settings JSONB 에 greeting/offhours_greeting 없을 때 사용
+_DEFAULT_GREETING = "안녕하세요, 고객센터입니다. 무엇을 도와드릴까요?"
+_DEFAULT_OFFHOURS_GREETING = (
+    "안녕하세요, 고객센터입니다. "
+    "현재 상담원 운영 시간이 아니지만 기본적인 문의는 도와드릴 수 있습니다. "
+    "말씀해 주세요."
+)
+
 
 async def _resolve_tenant_id(to_number: str) -> str:
     """Twilio To 필드(전화번호 또는 SIP URI)로 tenant UUID 조회.
@@ -61,6 +69,27 @@ async def _resolve_tenant_id(to_number: str) -> str:
 
     logger.warning(f"미등록 tenant to={to_number} — raw 값으로 진행 (DB에 번호 등록 필요)")
     return to_number
+
+
+async def _get_greeting(tenant_id: str, within_hours: bool) -> str:
+    """tenants.settings JSONB 에서 greeting 조회. 부재·오류 시 기본값 반환."""
+    field = "greeting" if within_hours else "offhours_greeting"
+    default = _DEFAULT_GREETING if within_hours else _DEFAULT_OFFHOURS_GREETING
+    try:
+        conn = await asyncpg.connect(settings.database_url)
+        try:
+            row = await conn.fetchrow(
+                "SELECT settings FROM tenants WHERE id = $1::uuid", tenant_id
+            )
+            if row and row["settings"]:
+                msg = row["settings"].get(field)
+                if msg:
+                    return msg
+        finally:
+            await conn.close()
+    except Exception as e:
+        logger.warning("greeting 조회 실패 tenant_id=%s err=%s", tenant_id, e)
+    return default
 
 
 @router.post("/incoming")
@@ -141,6 +170,14 @@ async def call_websocket(
                     await tts_channel.open(call_id=call_id, tenant_id=tenant_id)
                     channel_opened = True
                 stall_messages = await _session_service.get_stall_messages(tenant_id)
+
+                # 연결 즉시 인사말 발송 — 영업시간 내/외에 따라 다른 멘트
+                within_hours = await _session_service.is_within_business_hours(tenant_id)
+                greeting = await _get_greeting(tenant_id, within_hours)
+                await tts_channel.push_response(
+                    call_id=call_id, text=greeting, response_path="greeting"
+                )
+                logger.info("call_id=%s greeting 발송 within_hours=%s", call_id, within_hours)
 
             elif event == "media":
                 track = msg["media"].get("track", "inbound")
