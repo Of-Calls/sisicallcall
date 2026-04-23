@@ -1,6 +1,7 @@
 import audioop
 import base64
 import json
+import time
 
 import asyncpg
 
@@ -24,7 +25,7 @@ _graph = build_call_graph()
 _session_service = RedisSessionService()
 
 # 발화 감지 파라미터 — Silero VAD(주미) 구현 전 임시 에너지 기반 묵음 감지
-_SPEECH_RMS_THRESHOLD = 800    # RMS 임계값 (묵음 vs 발화)
+_SPEECH_RMS_THRESHOLD = 1200   # RMS 임계값 (묵음 vs 발화) — TTS 에코 필터링 목적으로 800→1200 상향
 _SILENCE_CHUNKS_TO_END = 40    # 발화 종료 판단 묵음 청크 수 (~800ms, 청크당 ~20ms)
 _MIN_UTTERANCE_BYTES = 16000   # 최소 발화 길이 (~500ms at 16kHz 16-bit)
 _MAX_UTTERANCE_BYTES = 320000  # 최대 발화 길이 (~10s)
@@ -36,6 +37,18 @@ _DEFAULT_OFFHOURS_GREETING = (
     "현재 상담원 운영 시간이 아니지만 기본적인 문의는 도와드릴 수 있습니다. "
     "말씀해 주세요."
 )
+
+# 침묵 감지 파라미터
+_SILENCE_FIRST_SEC = 10.0      # 첫 번째 침묵 알림 기준 (초)
+_SILENCE_SECOND_SEC = 10.0     # 첫 알림 후 추가 대기 → escalation (초)
+# TTS 재생 예상 속도 — 한국어 평균 발화 속도 ≈ 5자/초 (보수적)
+# ainvoke 완료 후 response_text 길이로 재생 시간 추정, 침묵 타이머 유예에 사용
+_KO_TTS_CHARS_PER_SEC = 5.0
+# greeting 재생 완료까지 타이머를 유예하는 버퍼 (greeting은 보통 8~12초 음성)
+# emit 시점 기준이라 재생 완료 전에 침묵 알림이 울리는 것을 방지
+_GREETING_PLAY_BUFFER_SEC = 13.0
+_MSG_SILENCE_CHECK = "통화 중이십니까? 불편한 점이 있으시면 말씀해 주세요."
+_MSG_SILENCE_ESCALATION = "전화 연결이 원활하지 않은 것 같습니다. 상담원에게 연결해 드리겠습니다."
 
 
 async def _resolve_tenant_id(to_number: str) -> str:
@@ -82,7 +95,11 @@ async def _get_greeting(tenant_id: str, within_hours: bool) -> str:
                 "SELECT settings FROM tenants WHERE id = $1::uuid", tenant_id
             )
             if row and row["settings"]:
-                msg = row["settings"].get(field)
+                settings_data = row["settings"]
+                if isinstance(settings_data, str):
+                    import json as _json
+                    settings_data = _json.loads(settings_data)
+                msg = settings_data.get(field)
                 if msg:
                     return msg
         finally:
@@ -138,6 +155,9 @@ async def call_websocket(
     in_speech = False
     stall_messages: dict = {}   # "start" 이벤트에서 로드
     channel_opened = False
+    empty_stt_count = 0         # 연속 빈 STT 횟수 — stt_node 에 주입, 결과에서 업데이트
+    last_activity_at = time.monotonic()  # 침묵 타이머 기준 시각
+    silence_alert_count = 0     # 침묵 알림 횟수 (0: 없음, 1: 확인 멘트, 2: escalation)
 
     try:
         while True:
@@ -178,6 +198,9 @@ async def call_websocket(
                     call_id=call_id, text=greeting, response_path="greeting"
                 )
                 logger.info("call_id=%s greeting 발송 within_hours=%s", call_id, within_hours)
+                # greeting 재생 완료 후부터 침묵 타이머 시작 — 재생 예상 시간만큼 유예
+                # emit 시점 기준이라 재생 완료 전 알림 방지 (greeting ≈ 11~13초 음성)
+                last_activity_at = time.monotonic() + _GREETING_PLAY_BUFFER_SEC
 
             elif event == "media":
                 track = msg["media"].get("track", "inbound")
@@ -235,9 +258,22 @@ async def call_websocket(
                                 "error": None,
                                 "stall_messages": stall_messages,
                                 "stall_delay_sec": 1.0,
+                                "empty_stt_count": empty_stt_count,
                             }
-                            await _graph.ainvoke(state)
+                            result = await _graph.ainvoke(state)
                             turn_index += 1
+                            # 빈 STT 카운터 + 침묵 타이머 업데이트
+                            _result = result if isinstance(result, dict) else {}
+                            if _result.get("raw_transcript"):
+                                empty_stt_count = 0
+                                silence_alert_count = 0
+                            else:
+                                empty_stt_count = _result.get("empty_stt_count", empty_stt_count)
+                            # TTS 응답 재생 완료 후부터 침묵 타이머 시작
+                            # response_text 길이로 예상 재생 시간 추정 (한국어 ≈ 5자/초)
+                            _resp_len = len(_result.get("response_text", "") or "")
+                            _play_buffer = _resp_len / _KO_TTS_CHARS_PER_SEC
+                            last_activity_at = time.monotonic() + _play_buffer
                         else:
                             logger.debug(
                                 f"call_id={call_id} | 발화 무시 "
@@ -247,6 +283,31 @@ async def call_websocket(
                         utterance_buffer.clear()
                         silence_chunk_count = 0
                         in_speech = False
+
+                else:
+                    # in_speech=False, rms<threshold → 발화 없는 진짜 침묵 구간
+                    # 5초 침묵: 확인 멘트 / 추가 10초 침묵: escalation 멘트
+                    if channel_opened and silence_alert_count < 2:
+                        now = time.monotonic()
+                        elapsed = now - last_activity_at
+                        if silence_alert_count == 1 and elapsed >= _SILENCE_SECOND_SEC:
+                            logger.info("call_id=%s 침묵 escalation (2차)", call_id)
+                            await tts_channel.push_response(
+                                call_id=call_id,
+                                text=_MSG_SILENCE_ESCALATION,
+                                response_path="escalation",
+                            )
+                            silence_alert_count = 2
+                            last_activity_at = now
+                        elif silence_alert_count == 0 and elapsed >= _SILENCE_FIRST_SEC:
+                            logger.info("call_id=%s 침묵 확인 멘트 (1차, %.1f초)", call_id, elapsed)
+                            await tts_channel.push_response(
+                                call_id=call_id,
+                                text=_MSG_SILENCE_CHECK,
+                                response_path="silence_check",
+                            )
+                            silence_alert_count = 1
+                            last_activity_at = now
 
             elif event == "stop":
                 logger.info(f"[{CALL_ENDED}] call_id={call_id}")

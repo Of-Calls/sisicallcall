@@ -44,6 +44,11 @@ class Settings(BaseSettings):
     # TTS Output Channel 모드 — "mock" (기본, 테스트/유닛) | "twilio" (프로덕션 WebSocket)
     tts_channel_mode: str = "mock"
 
+    # TTS 합성 엔진 — "google" (Cloud TTS) | "xtts" (Coqui XTTS v2 로컬, 팀원 목소리)
+    tts_provider: str = "google"
+    # XTTS reference audio 경로 (zero-shot voice cloning용 WAV 파일)
+    xtts_reference_path: str = "voice/speaker_reference.wav"
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 
 

@@ -58,3 +58,7 @@ class CallState(TypedDict):
     # 응답이 fallback 메시지인지 (Semantic Cache 저장 차단용).
     # 브랜치 노드가 명시적으로 설정. RAG miss / LLM 고정 fallback 텍스트 등.
     is_fallback: NotRequired[bool]
+
+    # 빈 STT 연속 횟수 — call.py 에서 주입, stt_node 에서 증가.
+    # N회 초과 시 escalation 처리 (안내 멘트 → 상담원 연결).
+    empty_stt_count: NotRequired[int]

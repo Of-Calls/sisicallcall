@@ -8,8 +8,9 @@ class GoogleTTSService(BaseTTSService):
     """한국어 Neural2 음성. Twilio Media Streams 호환 포맷(μ-law 8kHz mono) 직접 요청."""
 
     # TODO(tenant.settings 이관): 업종별 voice 다양화
-    VOICE_NAME = "ko-KR-Neural2-A"
+    VOICE_NAME = "ko-KR-Neural2-B"
     LANGUAGE_CODE = "ko-KR"
+    SPEAKING_RATE = 1.0
 
     def __init__(self):
         # 지연 초기화 — 자격증명은 실제 synthesize() 호출 시점에만 필요하도록.
@@ -35,6 +36,7 @@ class GoogleTTSService(BaseTTSService):
             audio_config=self._types.AudioConfig(
                 audio_encoding=self._types.AudioEncoding.MULAW,
                 sample_rate_hertz=8000,
+                speaking_rate=self.SPEAKING_RATE,
             ),
         )
         return response.audio_content

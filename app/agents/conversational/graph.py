@@ -31,7 +31,7 @@ def route_after_speaker_verify(state: CallState) -> str:
 
 
 def route_after_stt(state: CallState) -> str:
-    return "pass" if state["raw_transcript"] else "skip"
+    return "pass" if state.get("raw_transcript") else "skip"
 
 
 def route_after_cache(state: CallState) -> str:

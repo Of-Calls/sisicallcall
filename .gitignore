@@ -56,3 +56,10 @@ tests/*.md
 copy_*.py
 
 secrets/
+
+# 테스트 스크립트 (로컬 개발용, 커밋 불필요)
+scripts/
+
+# TTS 음성 파일 (팀원 개인 목소리 reference + 테스트 출력 wav)
+# 개인정보 포함 + 바이너리 대용량 파일 → 절대 커밋 금지
+voice/

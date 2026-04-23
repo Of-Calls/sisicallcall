@@ -13,11 +13,12 @@ class DeepgramSTTService(BaseSTTService):
         
         # 핵심 옵션 추가: 16kHz 16-bit PCM 포맷 명시
         self._prerecordedOptions = PrerecordedOptions(
-            model="nova-2",
+            model="nova-3",  # 최신 모델, 한국어 포함 다국어 지원 (nova-2-phonecall은 ko 미지원)
             language="ko",
             smart_format=True,
-            encoding="linear16", # 헤더 없는 16-bit PCM 명시
-            sample_rate=16000,   # 16kHz 샘플링 레이트 명시
+            punctuate=True,
+            encoding="linear16",
+            sample_rate=16000,
         )
 
     async def transcribe(self, audio_chunk: bytes) -> str:
