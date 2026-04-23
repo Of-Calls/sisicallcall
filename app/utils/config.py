@@ -40,19 +40,9 @@ class Settings(BaseSettings):
     # Speaker Enrollment (KDT-40 실험용 — 3.0 / 5.0 / 10.0 전환 가능)
     enrollment_target_sec: float = 5.0
 
-    # TitaNet (KDT-39 실험용 — threshold sweep: .env의 TITANET_SIMILARITY_THRESHOLD로 덮어쓰기 가능)
+    # TitaNet
     titanet_model_name: str = "titanet_large"
     titanet_similarity_threshold: float = 0.40
-
-    # ECAPA-TDNN
-    ecapa_model_source: str = "speechbrain/spkrec-ecapa-voxceleb"
-    ecapa_model_savedir: str = "C:/torch_cache/speechbrain/ecapa"
-    ecapa_similarity_threshold: float = 0.40
-
-    # Step 2 모델 threshold (KDT-71 실험용)
-    cam_similarity_threshold: float = 0.40
-    eres2net_base_similarity_threshold: float = 0.40
-    eres2net_v2_similarity_threshold: float = 0.40
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 

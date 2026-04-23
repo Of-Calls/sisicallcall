@@ -57,8 +57,3 @@ torchaudio
 
 # Speaker Verification
 nemo_toolkit[asr]
-modelscope  # CAM++, ERes2Net-base, ERes2NetV2 (Step 2)
-speechbrain  # ECAPA-TDNN
-soundfile
-simplejson
-addict
