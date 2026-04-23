@@ -1,3 +1,6 @@
+# ONNX 전환 완료 후 이 파일은 삭제 예정.
+# 대체: app/services/speaker_verify/titanet_onnx.py
+# export: scripts/export_titanet.py (NeMo 환경 1회 실행)
 import asyncio
 import os
 
