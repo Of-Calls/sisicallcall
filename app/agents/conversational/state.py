@@ -28,7 +28,9 @@ class CallState(TypedDict):
     # 라우팅
     knn_intent: Optional[str]
     knn_confidence: float
-    primary_intent: Optional[str]       # "intent_faq" | "intent_task" | "intent_auth" | "intent_escalation"
+    primary_intent: Optional[
+        str
+    ]  # "intent_faq" | "intent_task" | "intent_auth" | "intent_escalation"
     secondary_intents: list[str]
     routing_reason: Optional[str]
 
@@ -40,11 +42,11 @@ class CallState(TypedDict):
 
     # 최종 응답
     response_text: str
-    response_path: str                  # "cache" | "faq" | "task" | "auth" | "escalation"
+    response_path: str  # "cache" | "faq" | "task" | "auth" | "escalation"
 
     # Reviewer
     reviewer_applied: bool
-    reviewer_verdict: Optional[str]     # "pass" | "revise"
+    reviewer_verdict: Optional[str]  # "pass" | "revise"
 
     # 에러 / 타임아웃
     is_timeout: bool

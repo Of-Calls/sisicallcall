@@ -9,6 +9,7 @@ from statistics import median
 from fastapi import APIRouter, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response
 
+from app.agents.conversational.graph import build_call_graph
 from app.core.events import CALL_ENDED, CALL_STARTED
 from app.services.vad.benchmark import compare_vad_models
 from app.services.stt.deepgram import DeepgramSTTService
@@ -20,9 +21,25 @@ logger = get_logger(__name__)
 router = APIRouter()
 _RECORDINGS_DIR = Path("recordings")
 _ORIGIN_RECORDINGS_DIR = _RECORDINGS_DIR / "origin"
+_call_graph = build_call_graph()
 _stt_service: DeepgramSTTService | None = None
 _stt_unavailable_reason = ""
-STT_MIN_BUFFER_BYTES = 16000 * 2  # 약 1초(16kHz, 16-bit mono)
+# 실시간 파이프라인 기본 단위: 20ms PCM16 frame
+SAMPLE_RATE = 16000
+SAMPLE_WIDTH_BYTES = 2
+FRAME_MS = 20
+FRAME_BYTES = int(SAMPLE_RATE * SAMPLE_WIDTH_BYTES * (FRAME_MS / 1000))
+# interim은 짧은 슬라이딩 윈도우로 자주 갱신하고,
+# final은 무음 + commit delay가 충족될 때만 확정한다.
+STT_INTERIM_WINDOW_MS = 400
+STT_FINAL_SILENCE_MS = 600
+STT_FINAL_COMMIT_DELAY_MS = 300
+STT_INTERIM_MIN_BYTES = int(
+    SAMPLE_RATE * SAMPLE_WIDTH_BYTES * (STT_INTERIM_WINDOW_MS / 1000)
+)
+STT_FINAL_TRIGGER_FRAMES = int(STT_FINAL_SILENCE_MS / FRAME_MS)
+STT_FINAL_COMMIT_DELAY_FRAMES = int(STT_FINAL_COMMIT_DELAY_MS / FRAME_MS)
+STT_FINAL_FRAMES = STT_FINAL_TRIGGER_FRAMES + STT_FINAL_COMMIT_DELAY_FRAMES
 
 
 def _get_stt_service() -> DeepgramSTTService | None:
@@ -119,7 +136,7 @@ async def call_websocket(
 ):
     """
     Twilio Media Streams WebSocket 엔드포인트.
-    오디오 청크를 수신해 VAD 모델들을 직접 실행한다.
+    오디오 청크를 수신해 VAD/STT 모델들을 실행한다.
     """
     await websocket.accept()
     logger.info(f"WebSocket 연결 수락 call_id={call_id}")
@@ -131,35 +148,68 @@ async def call_websocket(
     vad_true_count_by_model: dict[str, int] = {}
     per_model_audio_16k: dict[str, bytearray] = {}
     stt_transcript_by_model: dict[str, list[str]] = {}
-    stt_audio_buffer_by_model: dict[str, bytearray] = {}
+    # interim: 짧은 주기 STT용 / speech: 최종 확정 STT용 누적 버퍼
+    stt_interim_buffer_by_model: dict[str, bytearray] = {}
+    stt_speech_buffer_by_model: dict[str, bytearray] = {}
+    # 모델별 연속 무음 frame 수(최종 확정 시점 계산에 사용)
+    stt_silence_frames_by_model: dict[str, int] = {}
     finalized = False
+    turn_index = 0
     scenario_name = _sanitize_path_name(tenant_id)
     recording_ext = "wav"
 
-    async def _transcribe_and_store(model_name: str, audio_bytes: bytes) -> None:
+    async def _transcribe(model_name: str, audio_bytes: bytes) -> str:
         stt_service = _get_stt_service()
         if not stt_service:
-            return
+            return ""
         transcript = await stt_service.transcribe(audio_bytes)
+        return transcript.strip() if transcript else ""
+
+    async def _run_interim_stt(model_name: str) -> None:
+        # 짧은 주기(예: 400ms)마다 임시 전사를 찍어 지연을 줄인다.
+        interim_buf = stt_interim_buffer_by_model.setdefault(model_name, bytearray())
+        if len(interim_buf) < STT_INTERIM_MIN_BYTES:
+            return
+        transcript = await _transcribe(model_name, bytes(interim_buf))
+        if transcript:
+            logger.info(
+                "STT interim call_id=%s model=%s text=%s",
+                call_id,
+                model_name,
+                transcript,
+            )
+        interim_buf.clear()
+
+    async def _run_final_stt(model_name: str, *, force: bool = False) -> None:
+        # 최종 전사는 "충분한 무음 + commit delay" 이후에만 확정(final commit)한다.
+        speech_buf = stt_speech_buffer_by_model.setdefault(model_name, bytearray())
+        if not speech_buf:
+            return
+        if (not force) and stt_silence_frames_by_model.get(
+            model_name, 0
+        ) < STT_FINAL_FRAMES:
+            return
+        transcript = await _transcribe(model_name, bytes(speech_buf))
         if transcript:
             stt_transcript_by_model.setdefault(model_name, []).append(transcript)
             logger.info(
-                "STT 전사 성공 call_id=%s model=%s 글자수=%s",
+                "STT final call_id=%s model=%s 글자수=%s",
                 call_id,
                 model_name,
                 len(transcript),
             )
-            return
-        logger.info("STT 전사 결과 없음 call_id=%s model=%s", call_id, model_name)
+        else:
+            logger.info("STT final 결과 없음 call_id=%s model=%s", call_id, model_name)
+        speech_buf.clear()
+        stt_interim_buffer_by_model.setdefault(model_name, bytearray()).clear()
+        stt_silence_frames_by_model[model_name] = 0
 
-    async def _flush_stt_buffers(force: bool = False) -> None:
-        for model_name, model_buf in stt_audio_buffer_by_model.items():
-            if not model_buf:
-                continue
-            if (not force) and len(model_buf) < STT_MIN_BUFFER_BYTES:
-                continue
-            await _transcribe_and_store(model_name, bytes(model_buf))
-            model_buf.clear()
+    async def _flush_final_stt(force: bool = False) -> None:
+        model_names = set(stt_speech_buffer_by_model.keys()) | set(
+            stt_interim_buffer_by_model.keys()
+        )
+        for model_name in model_names:
+            await _run_final_stt(model_name, force=force)
 
     def _finalize_call() -> None:
         nonlocal finalized, scenario_name, recording_ext
@@ -254,48 +304,77 @@ async def call_websocket(
                 audio_buffer.extend(pcm_bytes)
                 raw_audio_16k.extend(pcm_bytes)
 
-                # 320ms 분량(16kHz, 16-bit mono = 10240 bytes) 누적 시 VAD 실행
-                if len(audio_buffer) >= 10240:
-                    chunk = bytes(audio_buffer)
-                    audio_buffer.clear()
+                # 20ms 프레임 단위로 VAD/STT를 지속 처리
+                while len(audio_buffer) >= FRAME_BYTES:
+                    chunk = bytes(audio_buffer[:FRAME_BYTES])
+                    del audio_buffer[:FRAME_BYTES]
+                    turn_index += 1
+
+                    graph_state = await _call_graph.ainvoke(
+                        {
+                            "call_id": call_id,
+                            "tenant_id": tenant_id,
+                            "turn_index": turn_index,
+                            "audio_chunk": chunk,
+                        }
+                    )
+                    if not graph_state.get("is_speech", False):
+                        continue
 
                     results = await compare_vad_models(
                         chunk,
                         excluded_models={"deepgram_vad"},
                     )
-                    speech_model_names: list[str] = []
+                    active_models = {result.model for result in results}
                     for result in results:
                         vad_latency_ms_by_model.setdefault(result.model, []).append(
                             result.latency_ms
                         )
                         vad_is_speech_by_model[result.model] = result.is_speech
                         if not result.is_speech:
+                            # bridge-out: 무음이 누적되면 final commit 조건 도달 여부를 검사한다.
+                            stt_silence_frames_by_model[result.model] = (
+                                stt_silence_frames_by_model.get(result.model, 0) + 1
+                            )
+                            await _run_final_stt(result.model, force=False)
                             continue
-                        speech_model_names.append(result.model)
+
+                        # bridge-in: speech가 다시 들어오면 무음 카운터를 리셋하고 버퍼를 누적한다.
+                        stt_silence_frames_by_model[result.model] = 0
                         vad_true_count_by_model[result.model] = (
                             vad_true_count_by_model.get(result.model, 0) + 1
                         )
                         per_model_audio_16k.setdefault(
                             result.model, bytearray()
                         ).extend(chunk)
-                    if speech_model_names:
-                        for model_name in speech_model_names:
-                            stt_audio_buffer_by_model.setdefault(
-                                model_name, bytearray()
-                            ).extend(chunk)
-                        await _flush_stt_buffers(force=False)
+                        stt_interim_buffer_by_model.setdefault(
+                            result.model, bytearray()
+                        ).extend(chunk)
+                        stt_speech_buffer_by_model.setdefault(
+                            result.model, bytearray()
+                        ).extend(chunk)
+                        await _run_interim_stt(result.model)
+
+                    # 이번 프레임 결과에 없는 모델도 무음 누적으로 처리
+                    for model_name in (
+                        set(stt_speech_buffer_by_model.keys()) - active_models
+                    ):
+                        stt_silence_frames_by_model[model_name] = (
+                            stt_silence_frames_by_model.get(model_name, 0) + 1
+                        )
+                        await _run_final_stt(model_name, force=False)
 
             elif event == "stop":
                 logger.info(f"[{CALL_ENDED}] call_id={call_id}")
-                await _flush_stt_buffers(force=True)
+                await _flush_final_stt(force=True)
                 _finalize_call()
                 break
 
     except WebSocketDisconnect:
         logger.info(f"WebSocket 종료 call_id={call_id}")
-        await _flush_stt_buffers(force=True)
+        await _flush_final_stt(force=True)
         _finalize_call()
     except Exception as e:
         logger.error(f"call_id={call_id} WebSocket 오류: {e}")
-        await _flush_stt_buffers(force=True)
+        await _flush_final_stt(force=True)
         _finalize_call()

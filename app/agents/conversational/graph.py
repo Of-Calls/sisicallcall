@@ -2,16 +2,30 @@ from langgraph.graph import END, StateGraph
 
 from app.agents.conversational.state import CallState
 from app.agents.conversational.nodes.vad_node.vad_node import vad_node
-from app.agents.conversational.nodes.speaker_verify_node.speaker_verify_node import speaker_verify_node
+from app.agents.conversational.nodes.speaker_verify_node.speaker_verify_node import (
+    speaker_verify_node,
+)
 from app.agents.conversational.nodes.stt_node.stt_node import stt_node
 from app.agents.conversational.nodes.norm_text_node.norm_text_node import norm_text_node
 from app.agents.conversational.nodes.cache_node.cache_node import cache_node
-from app.agents.conversational.nodes.knn_router_node.knn_router_node import knn_router_node
-from app.agents.conversational.nodes.intent_router_llm_node.intent_router_llm_node import intent_router_llm_node
-from app.agents.conversational.nodes.faq_branch_node.faq_branch_node import faq_branch_node
-from app.agents.conversational.nodes.task_branch_node.task_branch_node import task_branch_node
-from app.agents.conversational.nodes.auth_branch_node.auth_branch_node import auth_branch_node
-from app.agents.conversational.nodes.escalation_branch_node.escalation_branch_node import escalation_branch_node
+from app.agents.conversational.nodes.knn_router_node.knn_router_node import (
+    knn_router_node,
+)
+from app.agents.conversational.nodes.intent_router_llm_node.intent_router_llm_node import (
+    intent_router_llm_node,
+)
+from app.agents.conversational.nodes.faq_branch_node.faq_branch_node import (
+    faq_branch_node,
+)
+from app.agents.conversational.nodes.task_branch_node.task_branch_node import (
+    task_branch_node,
+)
+from app.agents.conversational.nodes.auth_branch_node.auth_branch_node import (
+    auth_branch_node,
+)
+from app.agents.conversational.nodes.escalation_branch_node.escalation_branch_node import (
+    escalation_branch_node,
+)
 from app.agents.conversational.nodes.reviewer_node.reviewer_node import reviewer_node
 from app.agents.conversational.nodes.tts_node.tts_node import tts_node
 
@@ -20,6 +34,7 @@ KNN_CONFIDENCE_THRESHOLD = 0.85
 
 
 # ── 조건부 엣지 함수 ──────────────────────────────────────────
+
 
 def route_after_vad(state: CallState) -> str:
     return "pass" if state["is_speech"] else "skip"
@@ -66,13 +81,14 @@ def _is_high_risk(state: CallState) -> bool:
 
 # ── 그래프 빌더 ───────────────────────────────────────────────
 
+
 def build_call_graph():
     graph = StateGraph(CallState)
 
     # 노드 등록
     graph.add_node("vad", vad_node)
     # graph.add_node("speaker_verify", speaker_verify_node)
-    # graph.add_node("stt", stt_node)
+    graph.add_node("stt", stt_node)
     # graph.add_node("norm_text", norm_text_node)
     # graph.add_node("cache", cache_node)
     # graph.add_node("knn_router", knn_router_node)

@@ -1,21 +1,10 @@
 from app.agents.conversational.state import CallState
-from app.services.vad.benchmark import compare_vad_models
+from app.services.vad.webrtc_vad import WebRTCVADService
 
 
 async def vad_node(state: CallState) -> dict:
-    results = await compare_vad_models(state["audio_chunk"])
-    latency_by_model = dict(state.get("vad_latency_ms_by_model", {}))
-    is_speech_by_model = dict(state.get("vad_is_speech_by_model", {}))
-    true_count_by_model = dict(state.get("vad_true_count_by_model", {}))
-    for result in results:
-        latency_by_model.setdefault(result.model, []).append(result.latency_ms)
-        is_speech_by_model[result.model] = result.is_speech
-        if result.is_speech:
-            true_count_by_model[result.model] = true_count_by_model.get(result.model, 0) + 1
+    vad_service = WebRTCVADService()
+    is_speech = await vad_service.detect(state["audio_chunk"])
     return {
-        # 통합 판정은 다수결이 아닌 "모델 중 하나라도 True"로만 계산한다.
-        "is_speech": any(is_speech_by_model.values()),
-        "vad_latency_ms_by_model": latency_by_model,
-        "vad_is_speech_by_model": is_speech_by_model,
-        "vad_true_count_by_model": true_count_by_model,
+        "is_speech": is_speech,
     }
