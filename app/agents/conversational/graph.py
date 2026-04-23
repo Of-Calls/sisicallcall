@@ -87,8 +87,7 @@ def build_call_graph():
 
     # 노드 등록
     graph.add_node("vad", vad_node)
-    # graph.add_node("speaker_verify", speaker_verify_node)
-    # graph.add_node("stt", stt_node)
+    graph.add_node("stt", stt_node)
     # graph.add_node("norm_text", norm_text_node)
     # graph.add_node("cache", cache_node)
     # graph.add_node("knn_router", knn_router_node)
@@ -104,13 +103,8 @@ def build_call_graph():
     graph.set_entry_point("vad")
 
     # 전처리 단계
-    # VAD pass면 verify 노드로 진행, skip이면 종료
-    graph.add_conditional_edges(
-        "vad", route_after_vad, {"pass": "speaker_verify", "skip": END}
-    )
-    graph.add_conditional_edges(
-        "speaker_verify", route_after_speaker_verify, {"pass": "stt", "reject": END}
-    )
+    # VAD pass면 STT 노드로 진행, skip이면 종료
+    graph.add_conditional_edges("vad", route_after_vad, {"pass": "stt", "skip": END})
     graph.add_edge("stt", END)
     # graph.add_edge("stt", "norm_text")
     # graph.add_edge("norm_text", "cache")

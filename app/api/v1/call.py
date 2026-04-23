@@ -39,6 +39,13 @@ STT_FINAL_COMMIT_DELAY_FRAMES = int(STT_FINAL_COMMIT_DELAY_MS / FRAME_MS)
 STT_FINAL_FRAMES = STT_FINAL_TRIGGER_FRAMES + STT_FINAL_COMMIT_DELAY_FRAMES
 
 
+def _bytes_to_ms(audio_bytes_len: int) -> int:
+    if audio_bytes_len <= 0:
+        return 0
+    bytes_per_second = SAMPLE_RATE * SAMPLE_WIDTH_BYTES
+    return int((audio_bytes_len / bytes_per_second) * 1000)
+
+
 def _sanitize_path_name(name: str) -> str:
     cleaned = "".join(
         ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in name.strip()
@@ -132,6 +139,7 @@ async def call_websocket(
     stt_silence_frames_by_model: dict[str, int] = {}
     finalized = False
     turn_index = 0
+    event_counts = {"connected": 0, "start": 0, "media": 0, "stop": 0, "unknown": 0}
     scenario_name = _sanitize_path_name(tenant_id)
     recording_ext = "wav"
 
@@ -147,13 +155,28 @@ async def call_websocket(
         interim_buf = stt_interim_buffer_by_model.setdefault(model_name, bytearray())
         if len(interim_buf) < STT_INTERIM_MIN_BYTES:
             return
+        interim_ms = _bytes_to_ms(len(interim_buf))
+        logger.info(
+            "STT interim 호출 직전 call_id=%s model=%s buffer_ms=%s",
+            call_id,
+            model_name,
+            interim_ms,
+        )
         transcript = await _transcribe(model_name, bytes(interim_buf))
         if transcript:
+            print(f"transcript: {transcript}")
             logger.info(
                 "STT interim call_id=%s model=%s text=%s",
                 call_id,
                 model_name,
                 transcript,
+            )
+        else:
+            logger.info(
+                "STT interim 결과 없음 call_id=%s model=%s buffer_ms=%s",
+                call_id,
+                model_name,
+                interim_ms,
             )
         interim_buf.clear()
 
@@ -166,17 +189,32 @@ async def call_websocket(
             model_name, 0
         ) < STT_FINAL_FRAMES:
             return
+        final_ms = _bytes_to_ms(len(speech_buf))
+        logger.info(
+            "STT final 호출 직전 call_id=%s model=%s buffer_ms=%s force=%s",
+            call_id,
+            model_name,
+            final_ms,
+            force,
+        )
         transcript = await _transcribe(model_name, bytes(speech_buf))
         if transcript:
             stt_transcript_by_model.setdefault(model_name, []).append(transcript)
+            print(f"transcript: {transcript}")
             logger.info(
-                "STT final call_id=%s model=%s 글자수=%s",
+                "STT final call_id=%s model=%s text=%s 글자수=%s",
                 call_id,
                 model_name,
+                transcript,
                 len(transcript),
             )
         else:
-            logger.info("STT final 결과 없음 call_id=%s model=%s", call_id, model_name)
+            logger.info(
+                "STT final 결과 없음 call_id=%s model=%s buffer_ms=%s",
+                call_id,
+                model_name,
+                final_ms,
+            )
         speech_buf.clear()
         stt_interim_buffer_by_model.setdefault(model_name, bytearray()).clear()
         stt_silence_frames_by_model[model_name] = 0
@@ -225,10 +263,13 @@ async def call_websocket(
                 VAD_MODEL_NAME: {
                     "처리프레임수": vad_total_frames,
                     "is_speech_true횟수": vad_speech_frames,
-                    "is_speech_true비율": round(vad_speech_frames / vad_total_frames, 4),
+                    "is_speech_true비율": round(
+                        vad_speech_frames / vad_total_frames, 4
+                    ),
                 }
             }
             logger.info("통화 종료 VAD 요약 call_id=%s 상세=%s", call_id, summary)
+        logger.info("통화 이벤트 카운트 call_id=%s counts=%s", call_id, event_counts)
         reset_resample_state()
 
     try:
@@ -236,6 +277,10 @@ async def call_websocket(
             raw = await websocket.receive_text()
             msg = json.loads(raw)
             event = msg.get("event")
+            if event in event_counts:
+                event_counts[event] += 1
+            else:
+                event_counts["unknown"] += 1
 
             if event == "connected":
                 logger.info(f"call_id={call_id} Twilio Media Stream connected")
@@ -265,6 +310,13 @@ async def call_websocket(
                 )
 
             elif event == "media":
+                # media가 실제로 흘러오는지 추적하기 위해 주기적으로 카운트를 찍는다.
+                if event_counts["media"] % 50 == 0:
+                    logger.info(
+                        "media 이벤트 수신중 call_id=%s media_count=%s",
+                        call_id,
+                        event_counts["media"],
+                    )
                 track = msg["media"].get("track", "inbound")
                 if track != "inbound":
                     continue
@@ -298,13 +350,15 @@ async def call_websocket(
 
                     vad_speech_frames += 1
                     stt_silence_frames_by_model[VAD_MODEL_NAME] = 0
-                    per_model_audio_16k.setdefault(VAD_MODEL_NAME, bytearray()).extend(chunk)
-                    stt_interim_buffer_by_model.setdefault(VAD_MODEL_NAME, bytearray()).extend(
+                    per_model_audio_16k.setdefault(VAD_MODEL_NAME, bytearray()).extend(
                         chunk
                     )
-                    stt_speech_buffer_by_model.setdefault(VAD_MODEL_NAME, bytearray()).extend(
-                        chunk
-                    )
+                    stt_interim_buffer_by_model.setdefault(
+                        VAD_MODEL_NAME, bytearray()
+                    ).extend(chunk)
+                    stt_speech_buffer_by_model.setdefault(
+                        VAD_MODEL_NAME, bytearray()
+                    ).extend(chunk)
                     await _run_interim_stt(VAD_MODEL_NAME)
 
             elif event == "stop":

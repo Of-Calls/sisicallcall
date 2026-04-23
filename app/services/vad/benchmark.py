@@ -24,11 +24,7 @@ _VAD_SERVICES = [_WEBRTC_VAD_SERVICE]
 async def preload_vad_models() -> None:
     await asyncio.gather(*(service.initialize() for service in _VAD_SERVICES))
     logger.info(
-        "VAD 모델 프리로드 완료: %s",
-        [
-            {"모델": s.name, "사용가능": s.available, "비고": s.note}
-            for s in _VAD_SERVICES
-        ],
+        msg=f"VAD 모델 프리로드 완료: {_WEBRTC_VAD_SERVICE.name}, 사용 가능 여부: {_WEBRTC_VAD_SERVICE.available}, 비고: {_WEBRTC_VAD_SERVICE.note}",
     )
 
 
