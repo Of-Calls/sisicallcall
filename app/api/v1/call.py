@@ -45,12 +45,17 @@ def _get_stt_service() -> DeepgramSTTService | None:
 
 
 def _sanitize_path_name(name: str) -> str:
-    cleaned = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in name.strip())
+    cleaned = "".join(
+        ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in name.strip()
+    )
     return cleaned or "unknown"
 
 
 def _save_pcm16_audio(
-    file_path: Path, pcm16_audio: bytes, sample_rate: int = 16000, extension: str = "wav"
+    file_path: Path,
+    pcm16_audio: bytes,
+    sample_rate: int = 16000,
+    extension: str = "wav",
 ) -> None:
     file_path.parent.mkdir(parents=True, exist_ok=True)
     if extension == "wav":
@@ -200,7 +205,6 @@ async def call_websocket(
                     "is_speech_true비율": round(true_count / len(values), 4),
                     "평균ms": round(sum(values) / len(values), 3),
                     "중앙값ms": round(median(values), 3),
-                    "GT_TP_FP_FN": "N/A(라벨 미연결)",
                 }
             logger.info(
                 "통화 종료 VAD 모델별 지연 요약 call_id=%s 상세=%s", call_id, summary
@@ -221,10 +225,16 @@ async def call_websocket(
                 custom_params = msg.get("start", {}).get("customParameters", {})
                 tenant_id = custom_params.get("tenant_id", tenant_id)
                 scenario_name = _sanitize_path_name(
-                    custom_params.get("scenario_name", custom_params.get("scenario", tenant_id))
+                    custom_params.get(
+                        "scenario_name", custom_params.get("scenario", tenant_id)
+                    )
                 )
-                requested_ext = str(custom_params.get("recording_ext", "wav")).strip().lower()
-                recording_ext = requested_ext if requested_ext in {"wav", "pcm"} else "wav"
+                requested_ext = (
+                    str(custom_params.get("recording_ext", "wav")).strip().lower()
+                )
+                recording_ext = (
+                    requested_ext if requested_ext in {"wav", "pcm"} else "wav"
+                )
                 logger.info(
                     "call_id=%s stream_sid=%s tenant_id=%s scenario=%s ext=%s",
                     call_id,
@@ -270,7 +280,9 @@ async def call_websocket(
                         ).extend(chunk)
                     if speech_model_names:
                         for model_name in speech_model_names:
-                            stt_audio_buffer_by_model.setdefault(model_name, bytearray()).extend(chunk)
+                            stt_audio_buffer_by_model.setdefault(
+                                model_name, bytearray()
+                            ).extend(chunk)
                         await _flush_stt_buffers(force=False)
 
             elif event == "stop":

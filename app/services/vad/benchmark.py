@@ -19,8 +19,8 @@ ENERGY_FALLBACK_THRESHOLD = 0.5
 WEBRTC_MODE = 3  # 0(덜 공격적) ~ 3(더 공격적)
 WEBRTC_FRAME_MS = 30
 WEBRTC_SPEECH_RATIO_THRESHOLD = 0.5
-SILERO_V4_THRESHOLD = 0.5
-SILERO_V5_THRESHOLD = 0.5
+SILERO_V4_THRESHOLD = 0.35
+SILERO_V5_THRESHOLD = 0.35
 
 
 @dataclass
@@ -40,16 +40,23 @@ def _energy_fallback(
     return audioop.rms(pcm16_16k, 2) >= threshold
 
 
+# float32 스케일(-1.0 ~ 1.0 근처) 함수
 def _pcm16_to_float32_list(audio_chunk: bytes) -> list[float]:
     if not audio_chunk:
         return []
+    # PCM16은 샘플당 2바이트라서, 전체 바이트 길이를 2로 나누면 샘플 개수가 됩니다.
     count = len(audio_chunk) // 2
+
+    # 길이가 2바이트 미만이면 샘플이 없다고 보고 빈 리스트를 반환
     if count <= 0:
         return []
+
+    # 각 샘플을 2바이트씩 끊어서 정수로 변환
     values = [
         int.from_bytes(audio_chunk[i * 2 : i * 2 + 2], byteorder="little", signed=True)
         for i in range(count)
     ]
+    # 정수를 float32 스케일(-1.0 ~ 1.0 근처)로 변환
     return [v / 32768.0 for v in values]
 
 
