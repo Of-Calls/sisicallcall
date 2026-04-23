@@ -13,7 +13,6 @@ from app.agents.conversational.graph import build_call_graph
 from app.agents.conversational.state import CallState
 from app.core.events import CALL_ENDED, CALL_STARTED
 from app.services.speaker_verify.cam_plus_plus import CAMPlusPlusSpeakerVerifyService
-from app.services.speaker_verify.ecapa import ECAPASpeakerVerifyService
 from app.services.speaker_verify.eres2net import ERes2NetSpeakerVerifyService
 from app.services.speaker_verify.titanet import TitaNetSpeakerVerifyService
 from app.services.vad.silero import SileroVADService
@@ -30,7 +29,6 @@ _vad = SileroVADService()
 _SERVICES = {
     "titanet_large": TitaNetSpeakerVerifyService(model_name="titanet_large"),
     "titanet_small": TitaNetSpeakerVerifyService(model_name="titanet_small"),
-    "ecapa_tdnn":    ECAPASpeakerVerifyService(),
     "cam_plus_plus": CAMPlusPlusSpeakerVerifyService(),
     "eres2net_base": ERes2NetSpeakerVerifyService(variant="base"),
     "eres2net_v2":   ERes2NetSpeakerVerifyService(variant="v2"),
@@ -39,7 +37,6 @@ _SERVICES = {
 _THRESHOLDS: dict[str, float] = {
     "titanet_large": settings.titanet_similarity_threshold,
     "titanet_small": settings.titanet_similarity_threshold,
-    "ecapa_tdnn":    settings.ecapa_similarity_threshold,
     "cam_plus_plus": settings.cam_similarity_threshold,
     "eres2net_base": settings.eres2net_base_similarity_threshold,
     "eres2net_v2":   settings.eres2net_v2_similarity_threshold,
