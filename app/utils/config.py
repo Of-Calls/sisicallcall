@@ -44,6 +44,11 @@ class Settings(BaseSettings):
     # TTS Output Channel 모드 — "mock" (기본, 테스트/유닛) | "twilio" (프로덕션 WebSocket)
     tts_channel_mode: str = "mock"
 
+    # TitaNet 화자 검증 (대영 R-01 연구 결과 — titanet_large 채택)
+    titanet_model_name: str = "titanet_large"
+    titanet_similarity_threshold: float = 0.40
+    titanet_enrollment_sec: float = 5.0   # voiceprint 등록에 사용할 첫 발화 누적 시간
+
     # TTS 합성 엔진 — "google" (Cloud TTS) | "xtts" (Coqui XTTS v2 로컬, 팀원 목소리)
     tts_provider: str = "google"
     # XTTS reference audio 경로 (zero-shot voice cloning용 WAV 파일)

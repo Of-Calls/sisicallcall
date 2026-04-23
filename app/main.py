@@ -22,10 +22,11 @@ _logger = get_logger(__name__)
 async def lifespan(app: FastAPI):
     # XTTS 사용 시 모델을 미리 로드해 첫 통화의 greeting 지연(약 30초) 방지.
     # cache_node 의 BGE-M3 는 module-level 인스턴스화로 이미 자동 warm-up 됨.
+    # XTTS warm-up
     if (settings.tts_provider or "google").lower() == "xtts":
         from app.services.tts.channel import tts_channel
         try:
-            tts = tts_channel._get_tts()  # XTTSService 인스턴스 생성
+            tts = tts_channel._get_tts()
             if hasattr(tts, "_ensure_model"):
                 _logger.info("XTTS 모델 warm-up 시작 (서버 첫 통화 지연 방지)")
                 loop = asyncio.get_running_loop()
@@ -33,6 +34,17 @@ async def lifespan(app: FastAPI):
                 _logger.info("XTTS 모델 warm-up 완료 — 통화 응답 준비됨")
         except Exception as e:
             _logger.error("XTTS warm-up 실패 — 첫 통화 시 lazy load 됨: %s", e)
+
+    # TitaNet warm-up — speaker_verify_node 의 첫 발화 지연(~8초) 방지
+    try:
+        _logger.info("TitaNet 모델 warm-up 시작")
+        from app.agents.conversational.nodes.speaker_verify_node.speaker_verify_node import _get_service
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, _get_service)
+        _logger.info("TitaNet 모델 warm-up 완료 — 화자 검증 준비됨")
+    except Exception as e:
+        _logger.error("TitaNet warm-up 실패 — 첫 발화 시 lazy load 됨: %s", e)
+
     yield
 
 

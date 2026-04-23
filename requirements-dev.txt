@@ -6,8 +6,9 @@
 pytest==8.3.3
 pytest-asyncio==0.24.0
 
-# BGE-M3 로컬 임베딩 (희영 연구용 — 로컬 테스트 전용)
-# chromadb 0.5.23 requires tokenizers<=0.20.3, transformers 4.44.2 requires tokenizers<0.20
+# BGE-M3 로컬 임베딩 (희영 연구용 — GPU+fp16 활성화, 로컬 테스트 전용)
+# 2026-04-23: NeMo + coqui-tts 도입으로 의존성 버전 변경됨
+# chromadb 0.5.23 의 tokenizers 충돌 경고는 pip warning 수준이며 실동작 영향 없음
 FlagEmbedding
-tokenizers>=0.19,<0.20
-transformers==4.44.2
+tokenizers==0.22.2
+transformers==4.57.1

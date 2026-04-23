@@ -19,6 +19,13 @@ deepgram-sdk==3.7.0
 
 # TTS
 google-cloud-texttospeech==2.17.2
+# XTTS v2 (Coqui) — 팀원 목소리 zero-shot voice cloning
+# torch/torchaudio는 아래 PyTorch 섹션 참조
+coqui-tts==0.27.5
+
+# Speaker Verification
+# TitaNet (대영 R-01 채택) — NeMo ASR 포함
+nemo-toolkit[asr]==2.7.2
 
 # Embedding / Vector DB
 chromadb==0.5.23
@@ -35,7 +42,12 @@ pydantic-settings==2.5.2
 python-dotenv==1.0.1
 
 # Audio
-numpy==1.26.4
+numpy==2.4.4  # NeMo 2.7.2 설치로 1.26.4 → 2.4.4 업그레이드됨
+
+# PyTorch + CUDA — cu124 인덱스에서 설치 필요
+# pip install torch==2.6.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+torch==2.6.0
+torchaudio==2.6.0
 
 # OCR
 pytesseract==0.3.13
