@@ -13,7 +13,6 @@ from app.agents.conversational.graph import build_call_graph
 from app.agents.conversational.state import CallState
 from app.core.events import CALL_ENDED, CALL_STARTED
 from app.services.speaker_verify.titanet import TitaNetSpeakerVerifyService
-from app.services.vad.silero import SileroVADService
 from app.utils.audio import mulaw_to_pcm16, reset_resample_state
 from app.utils.config import settings
 from app.utils.logger import get_logger
@@ -22,7 +21,6 @@ logger = get_logger(__name__)
 router = APIRouter()
 
 _graph = build_call_graph()
-_vad = SileroVADService()
 
 _SERVICES = {
     "titanet_large": TitaNetSpeakerVerifyService(model_name="titanet_large"),
@@ -294,15 +292,7 @@ async def call_websocket(
                 chunk = bytes(audio_buffer)
                 audio_buffer.clear()
 
-                vad_result = await _vad.detect(chunk)
-                logger.debug(
-                    f"call_id={call_id} VAD is_speech={vad_result['is_speech']} "
-                    f"score={vad_result['score']} duration_ms={vad_result['duration_ms']}"
-                )
-                if not vad_result["is_speech"]:
-                    continue
-
-                # 4개 모델 enrollment 병렬 실행
+                # 모델 enrollment 병렬 실행
                 await asyncio.gather(
                     *[_try_enroll(mn, call_id, chunk) for mn in _SERVICES],
                     return_exceptions=True,

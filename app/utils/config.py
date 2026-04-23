@@ -34,9 +34,6 @@ class Settings(BaseSettings):
     # KNN Router (신용 연구 완료 후 확정)
     knn_confidence_threshold: float = 0.85
 
-    # VAD (KDT-30 threshold 연구 완료 후 확정)
-    vad_threshold: float = 0.5
-
     # Speaker Enrollment (KDT-40 실험용 — 3.0 / 5.0 / 10.0 전환 가능)
     enrollment_target_sec: float = 5.0
 
