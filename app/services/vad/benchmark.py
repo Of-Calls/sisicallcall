@@ -18,11 +18,10 @@ class VADResult:
 
 
 _WEBRTC_VAD_SERVICE = WebRTCVADService()
-_VAD_SERVICES = [_WEBRTC_VAD_SERVICE]
 
 
 async def preload_vad_models() -> None:
-    await asyncio.gather(*(service.initialize() for service in _VAD_SERVICES))
+    await _WEBRTC_VAD_SERVICE.initialize()
     logger.info(
         msg=f"VAD 모델 프리로드 완료: {_WEBRTC_VAD_SERVICE.name}, 사용 가능 여부: {_WEBRTC_VAD_SERVICE.available}, 비고: {_WEBRTC_VAD_SERVICE.note}",
     )
@@ -41,13 +40,5 @@ async def _timed_run(service: WebRTCVADService, audio: bytes) -> VADResult:
     )
 
 
-async def compare_vad_models(
-    pcm16_16k: bytes,
-    *,
-    excluded_models: set[str] | None = None,
-) -> list[VADResult]:
-    excluded = excluded_models or set()
-    services = [service for service in _VAD_SERVICES if service.name not in excluded]
-    jobs = [_timed_run(service, pcm16_16k) for service in services]
-    results = await asyncio.gather(*jobs)
-    return sorted(results, key=lambda r: r.latency_ms)
+async def run_webrtc_vad(pcm16_16k: bytes) -> VADResult:
+    return await _timed_run(_WEBRTC_VAD_SERVICE, pcm16_16k)

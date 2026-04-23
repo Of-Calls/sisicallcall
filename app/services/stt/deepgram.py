@@ -15,7 +15,7 @@ class DeepgramSTTService(BaseSTTService):
 
         self._client = DeepgramClient(settings.deepgram_api_key.strip())
         self._options = PrerecordedOptions(
-            model="nova-2", punctuate=True, language="ko"
+            model="nova-3", punctuate=True, language="ko"
         )
 
     async def transcribe(self, audio_chunk: bytes) -> str:
@@ -23,12 +23,17 @@ class DeepgramSTTService(BaseSTTService):
             return ""
 
         def _pcm16_to_wav_bytes(pcm16_audio: bytes, sample_rate: int = 16000) -> bytes:
+            # Deepgram prerecorded API에 전달하기 위해
+            # raw PCM16 바이트를 WAV 컨테이너(헤더 포함)로 감싼다.
             buf = BytesIO()
             with wave.open(buf, "wb") as wav_file:
+                # 현재 파이프라인 오디오는 mono/16-bit/16kHz 포맷을 사용한다.
                 wav_file.setnchannels(1)
                 wav_file.setsampwidth(2)
                 wav_file.setframerate(sample_rate)
+                # PCM payload를 그대로 WAV frame 영역에 기록한다.
                 wav_file.writeframes(pcm16_audio)
+            # 메모리 버퍼 전체를 bytes로 꺼내 바로 API payload로 사용한다.
             return buf.getvalue()
 
         def _run() -> str:
