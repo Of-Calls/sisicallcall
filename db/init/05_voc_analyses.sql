@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS voc_analyses (
     partial_success   BOOLEAN DEFAULT FALSE,             -- 일부 서브 실패 여부
     failed_subagents  JSONB DEFAULT '[]',                -- 실패한 서브 이름 배열
     cluster_label     INTEGER,                           -- K-means 배치 작업 결과 (intent_result 기반)
+    cluster_xy        JSONB,                             -- v3 (M2): UMAP 2D 투영 {"x": float, "y": float}, cluster_label 과 동시 UPDATE 필수
     created_at        TIMESTAMPTZ DEFAULT now(),
     updated_at        TIMESTAMPTZ DEFAULT now()          -- 재시도로 partial_success 해소 시 갱신
 );

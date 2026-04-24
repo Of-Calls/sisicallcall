@@ -3,7 +3,7 @@ import io
 
 import asyncpg
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps
 
 from app.services.auth.base import BaseAuthService
 from app.utils.config import settings
@@ -33,7 +33,7 @@ class ArcFaceAuthService(BaseAuthService):
         return self._face_app
 
     def _extract_embedding_sync(self, image_bytes: bytes) -> np.ndarray | None:
-        img = np.array(Image.open(io.BytesIO(image_bytes)).convert("RGB"))
+        img = np.array(ImageOps.exif_transpose(Image.open(io.BytesIO(image_bytes))).convert("RGB"))
         faces = self._get_face_app().get(img)
         if not faces:
             return None

@@ -18,6 +18,8 @@ CREATE TABLE IF NOT EXISTS calls (
     started_at      TIMESTAMPTZ DEFAULT now(),
     ended_at        TIMESTAMPTZ,
     duration_sec    INTEGER,                           -- 통화 시간 (초)
+    audio_url       VARCHAR(255),                      -- v3 (M2): 객체 스토리지 mp3 URL, 미저장 시 NULL
+    audio_expires_at TIMESTAMPTZ,                      -- v3 (M2): 자동 삭제 예정 시각 (보관 7일 TTL)
     latency_log     JSONB DEFAULT '{}',                -- 구간별 레이턴시 측정값
     branch_stats    JSONB DEFAULT '{}',                -- Cache/브랜치/Reviewer/Router 호출 카운터
     created_at      TIMESTAMPTZ DEFAULT now()
@@ -25,3 +27,7 @@ CREATE TABLE IF NOT EXISTS calls (
 
 CREATE INDEX IF NOT EXISTS idx_calls_tenant_id ON calls(tenant_id);
 CREATE INDEX IF NOT EXISTS idx_calls_started_at ON calls(started_at DESC);
+-- v3 (M2): audio_expires_at 도래 후 배치 정리(객체 삭제 + DB NULL 처리) 대상 조회용
+CREATE INDEX IF NOT EXISTS idx_calls_audio_expires_at
+    ON calls(audio_expires_at)
+    WHERE audio_expires_at IS NOT NULL;

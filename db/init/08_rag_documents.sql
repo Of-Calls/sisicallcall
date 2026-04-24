@@ -18,10 +18,15 @@ CREATE TABLE IF NOT EXISTS rag_documents (
     chroma_collection VARCHAR(100),                    -- 연결된 ChromaDB 컬렉션명
     uploaded_at       TIMESTAMPTZ DEFAULT now(),
     indexed_at        TIMESTAMPTZ,                     -- ChromaDB 인덱싱 완료 시각
-    deleted_at        TIMESTAMPTZ DEFAULT NULL         -- 소프트 삭제 — NULL이면 정상
+    deleted_at        TIMESTAMPTZ DEFAULT NULL,        -- 소프트 삭제 — NULL이면 정상
+    hit_count         INTEGER DEFAULT 0,               -- v3 (M2): RAG 검색 응답에 포함된 누적 횟수
+    last_hit_at       TIMESTAMPTZ                      -- v3 (M2): 가장 최근에 참조된 시각
 );
 
 CREATE INDEX IF NOT EXISTS idx_rag_documents_tenant_id ON rag_documents(tenant_id);
 -- partial index: 정상 문서만 빠르게 조회
 CREATE INDEX IF NOT EXISTS idx_rag_documents_deleted_at ON rag_documents(deleted_at)
+    WHERE deleted_at IS NULL;
+-- v3 (M2): 자주 참조되는 문서 우선 정렬 — soft delete 미적용 문서만 대상
+CREATE INDEX IF NOT EXISTS idx_rag_documents_hit_count ON rag_documents(hit_count DESC)
     WHERE deleted_at IS NULL;
