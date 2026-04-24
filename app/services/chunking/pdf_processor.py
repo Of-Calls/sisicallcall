@@ -23,9 +23,9 @@ from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-_SECTION_SPLIT_RE = re.compile(r'(?=\n## (?:\d+\.|▶))')
+_SECTION_SPLIT_RE = re.compile(r'(?=\n## )')   # 모든 ## 헤더를 섹션 경계로
 _BOLD_RE = re.compile(r'\*\*([^*]+)\*\*')
-_HEADER_META_RE = re.compile(r'^##\s+(?:\d+\.\s*)?(▶\s*)?(.+?)$')
+_HEADER_META_RE = re.compile(r'^##\s+(?:\d+\.\s*)?(▶\s*|■\s*)?(.+?)$')
 
 MAX_SECTION_CHARS = 1000
 
@@ -45,15 +45,19 @@ def _extract_text(pdf_path: str) -> str:
 def _clean(text: str) -> str:
     """pymupdf4llm 마크다운 아티팩트 정리.
 
-    볼드 문장이 ## 로 오인식되는 케이스를 필터링하고
-    ** 마크업을 제거해 임베딩 노이즈를 줄인다.
-    진짜 헤더 패턴: ## N. Title 또는 ## ▶ Title
+    진짜 헤더 vs 가짜 헤더(볼드 문장) 구분 기준:
+        ** 마크업 포함 → 볼드 문장이 ## 로 오인식된 것 → ## 제거
+        ** 마크업 없음  → 실제 섹션 헤더 → 유지
+    예:
+        ## 찾아오시는 길           (** 없음) → 유지 ✅
+        ## 강남구청은 ... **.** ` (** 있음) → ## 제거 ✅
     """
     lines = []
     for line in text.split('\n'):
         s = line.strip()
-        if s.startswith('## ') and not re.match(r'^##\s+(\d+\.|▶)', s):
-            lines.append(s[3:])  # ## 제거 → 일반 텍스트
+        if s.startswith('## ') and '**' in s:
+            # 볼드 문장 오인식 → ## 제거 후 ** 도 제거해 일반 텍스트로
+            lines.append(_BOLD_RE.sub(r'\1', s[3:]))
         else:
             lines.append(line)
     cleaned = '\n'.join(lines)
