@@ -168,7 +168,6 @@ class IntentRegistryBuilder:
             candidates=canonical_candidates,
         )
 
-        # intent_registry.py
     def apply_registry_to_candidates(
         self,
         candidates: list[ChunkIntentCandidates],
@@ -203,17 +202,11 @@ class IntentRegistryBuilder:
                     )
                 )
 
-            # 핵심 수정: primary / 기존 candidate / normalized_units leaf를 모두 합쳐 재구성
-            canonical_candidate_leaf_intents = self._dedupe_preserve_order(
-                [
-                    canonical_primary,
-                    *[
-                        self.canonicalize_leaf_intent(leaf_intent, registry)
-                        for leaf_intent in candidate.candidate_leaf_intents
-                        if leaf_intent.strip()
-                    ],
-                    *[unit.leaf_intent for unit in canonical_units],
-                ]
+            canonical_candidate_leaf_intents = self._rebuild_candidate_leaf_intents(
+                primary_leaf_intent=canonical_primary,
+                candidate_leaf_intents=candidate.candidate_leaf_intents,
+                units=canonical_units,
+                registry=registry,
             )
 
             updated_candidates.append(
@@ -614,6 +607,40 @@ class IntentRegistryBuilder:
             if any(last_two in aliases for aliases in DETAIL_ALIAS_MAP.values()):
                 return remainder[-2:]
         return [remainder[-1]]
+
+    def _rebuild_candidate_leaf_intents(
+        self,
+        primary_leaf_intent: str,
+        candidate_leaf_intents: list[str],
+        units: list[NormalizedAskableUnit],
+        registry: IntentRegistry,
+    ) -> list[str]:
+        canonicalized_old_candidates = self._canonicalize_leaf_intents(
+            candidate_leaf_intents,
+            registry,
+        )
+        canonicalized_unit_leaf_intents = self._canonicalize_leaf_intents(
+            [unit.leaf_intent for unit in units],
+            registry,
+        )
+        return self._dedupe_preserve_order(
+            [
+                primary_leaf_intent,
+                *canonicalized_old_candidates,
+                *canonicalized_unit_leaf_intents,
+            ]
+        )
+
+    def _canonicalize_leaf_intents(
+        self,
+        leaf_intents: list[str],
+        registry: IntentRegistry,
+    ) -> list[str]:
+        return [
+            self.canonicalize_leaf_intent(leaf_intent, registry)
+            for leaf_intent in leaf_intents
+            if leaf_intent.strip()
+        ]
 
     def _dedupe_preserve_order(self, items: list[str]) -> list[str]:
         seen: set[str] = set()

@@ -15,10 +15,10 @@ def _unit(
     answerability: float = 0.9,
 ) -> NormalizedAskableUnit:
     return NormalizedAskableUnit(
-        attribute="운영 시간",
-        entity="외래 진료",
-        value_hint="평일 09:00~18:00",
-        evidence="평일 09:00~18:00",
+        attribute="business hours",
+        entity="outpatient clinic",
+        value_hint="09:00-18:00",
+        evidence="Mon-Fri 09:00-18:00",
         salience=salience,
         answerability=answerability,
         topic_slug=topic_slug,
@@ -37,8 +37,8 @@ def _candidate(
         chunk_id=chunk_id,
         chunk_text="sample chunk text",
         category="faq",
-        product_name="외래 진료",
-        raw_keywords=["운영 시간"],
+        product_name="outpatient clinic",
+        raw_keywords=["business hours"],
         primary_leaf_intent=primary_leaf_intent,
         candidate_leaf_intents=candidate_leaf_intents,
         normalized_units=normalized_units,
@@ -199,3 +199,77 @@ async def test_apply_registry_rewrites_primary_candidates_and_units():
     }
     assert {unit.topic_slug for unit in candidate.normalized_units} == {"business_hours"}
     assert {unit.detail_slug for unit in candidate.normalized_units} == {"outpatient"}
+
+
+@pytest.mark.asyncio
+async def test_apply_registry_recovers_candidate_list_from_primary_when_candidates_empty():
+    builder = IntentRegistryBuilder()
+    source_candidates = [
+        _candidate(
+            "chunk-1",
+            "intent_faq_opening_time_outpatient",
+            [],
+            [_unit("intent_faq_opening_time_outpatient", "opening_time", "outpatient")],
+        ),
+        _candidate(
+            "chunk-2",
+            "intent_faq_business_hours_outpatient",
+            ["intent_faq_business_hours_outpatient"],
+            [_unit("intent_faq_business_hours_outpatient", "business_hours", "outpatient")],
+        ),
+    ]
+
+    result = await builder.build_registry(source_candidates)
+    applied = builder.apply_registry_to_candidates(source_candidates, result.registry)
+
+    candidate = applied[0]
+    assert candidate.primary_leaf_intent == "intent_faq_business_hours_outpatient"
+    assert candidate.candidate_leaf_intents == ["intent_faq_business_hours_outpatient"]
+
+
+@pytest.mark.asyncio
+async def test_build_registry_uses_fallback_when_normalized_units_are_empty():
+    result = await _build_result(
+        [
+            _candidate(
+                "chunk-1",
+                "intent_faq_business_hours_outpatient",
+                [],
+                [],
+            )
+        ]
+    )
+
+    item = _canonical_inventory_item(result, "intent_faq_business_hours_outpatient")
+    assert item.branch_intent == "intent_faq"
+    assert item.topic_slug == "business_hours"
+    assert item.detail_slug == "outpatient"
+
+    candidate = result.candidates[0]
+    assert candidate.primary_leaf_intent == "intent_faq_business_hours_outpatient"
+    assert candidate.candidate_leaf_intents == ["intent_faq_business_hours_outpatient"]
+    assert candidate.normalized_units == []
+
+
+@pytest.mark.asyncio
+async def test_build_registry_preserves_safe_fallback_for_malformed_leaf_intent():
+    result = await _build_result(
+        [
+            _candidate(
+                "chunk-1",
+                "invalid_leaf",
+                [],
+                [],
+            )
+        ]
+    )
+
+    item = _canonical_inventory_item(result, "invalid_leaf")
+    assert item.branch_intent == "intent_faq"
+    assert item.topic_slug == "general"
+    assert item.detail_slug == "general"
+
+    candidate = result.candidates[0]
+    assert candidate.primary_leaf_intent == "invalid_leaf"
+    assert candidate.candidate_leaf_intents == ["invalid_leaf"]
+    assert candidate.normalized_units == []

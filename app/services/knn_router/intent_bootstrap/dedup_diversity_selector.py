@@ -63,7 +63,7 @@ class DedupDiversitySelector:
     def normalize_question_text(self, text: str) -> str:
         lowered = text.strip().casefold()
         lowered = re.sub(r"\s+", " ", lowered)
-        lowered = re.sub(r"[^\w\s가-힣]", "", lowered)
+        lowered = re.sub(r"[^\w\s\uac00-\ud7a3]", "", lowered)
         lowered = lowered.replace(" ", "")
         return lowered
 
@@ -112,30 +112,12 @@ class DedupDiversitySelector:
             return []
 
         embeddings = await self._embedder.embed_batch([example.text for example in examples])
-        ranked_indices = sorted(
-            range(len(examples)),
-            key=lambda index: (
-                self._example_priority(examples[index]),
-                examples[index].text,
-            ),
-            reverse=True,
+        deduped_examples, _ = self._dedup_by_similarity_with_embeddings(
+            examples,
+            embeddings,
+            threshold=threshold,
         )
-
-        kept_indices: list[int] = []
-        kept_embeddings: list[list[float]] = []
-
-        for index in ranked_indices:
-            embedding = self._normalize_embedding(embeddings[index])
-            if any(
-                self._cosine_similarity(embedding, kept_embedding) >= threshold
-                for kept_embedding in kept_embeddings
-            ):
-                continue
-            kept_indices.append(index)
-            kept_embeddings.append(embedding)
-
-        kept_indices.sort()
-        return [examples[index] for index in kept_indices]
+        return deduped_examples
 
     async def select_diverse_examples(
         self,
@@ -146,59 +128,12 @@ class DedupDiversitySelector:
             return []
 
         embeddings = await self._embedder.embed_batch([example.text for example in examples])
-        normalized_embeddings = [self._normalize_embedding(embedding) for embedding in embeddings]
-
-        seeds = [index for index, example in enumerate(examples) if example.source == "seed"]
-        paraphrases = [index for index, example in enumerate(examples) if example.source != "seed"]
-
-        desired_seed_count = 0
-        if seeds:
-            desired_seed_count = min(len(seeds), target_k, max(2, min(4, target_k // 3 or 1)))
-
-        selected_indices: list[int] = []
-        selected_indices.extend(
-            self._mmr_select_indices(
-                candidate_indices=seeds,
-                examples=examples,
-                embeddings=normalized_embeddings,
-                quota=desired_seed_count,
-                already_selected=[],
-            )
+        return self._select_diverse_examples_with_embeddings(
+            examples,
+            embeddings,
+            target_k=target_k,
         )
 
-        remaining_quota = max(target_k - len(selected_indices), 0)
-        if remaining_quota > 0:
-            remaining_indices = [index for index in range(len(examples)) if index not in selected_indices]
-            selected_indices.extend(
-                self._mmr_select_indices(
-                    candidate_indices=remaining_indices,
-                    examples=examples,
-                    embeddings=normalized_embeddings,
-                    quota=remaining_quota,
-                    already_selected=selected_indices,
-                )
-            )
-
-        final_examples: list[FinalExampleSentence] = []
-        for index in selected_indices[:target_k]:
-            example = examples[index]
-            final_examples.append(
-                FinalExampleSentence(
-                    text=example.text,
-                    normalized_text=self.normalize_question_text(example.text),
-                    source=example.source,
-                    leaf_intent=example.leaf_intent,
-                    topic_slug=example.topic_slug,
-                    detail_slug=example.detail_slug,
-                    chunk_id=example.chunk_id,
-                    score_hint=example.score_hint,
-                    selection_score=self._selection_base_score(example),
-                )
-            )
-
-        return final_examples
-
-    # dedup_diversity_selector.py
     async def build_final_example_sets(
         self,
         leaf_intent_sets: list[LeafIntentExampleSet],
@@ -229,13 +164,11 @@ class DedupDiversitySelector:
             embeddings = await self._embedder.embed_batch(
                 [example.text for example in normalized_deduped]
             )
-
             semantic_deduped, semantic_embeddings = self._dedup_by_similarity_with_embeddings(
                 normalized_deduped,
                 embeddings,
                 threshold=similarity_threshold,
             )
-
             selected_examples = self._select_diverse_examples_with_embeddings(
                 semantic_deduped,
                 semantic_embeddings,
@@ -252,6 +185,130 @@ class DedupDiversitySelector:
             )
 
         return DedupSelectionResult(final_sets=final_sets)
+
+    def _dedup_by_similarity_with_embeddings(
+        self,
+        examples: list[ExampleSentence],
+        embeddings: list[list[float]],
+        threshold: float = 0.94,
+    ) -> tuple[list[ExampleSentence], list[list[float]]]:
+        if not examples or not embeddings:
+            return [], []
+
+        limit = min(len(examples), len(embeddings))
+        if limit <= 0:
+            return [], []
+
+        normalized_embeddings = [
+            self._normalize_embedding(embedding)
+            for embedding in embeddings[:limit]
+        ]
+        ranked_indices = sorted(
+            range(limit),
+            key=lambda index: (
+                self._example_priority(examples[index]),
+                examples[index].text,
+            ),
+            reverse=True,
+        )
+
+        kept_indices: list[int] = []
+        kept_embeddings: list[list[float]] = []
+
+        for index in ranked_indices:
+            embedding = normalized_embeddings[index]
+            if any(
+                self._cosine_similarity(embedding, kept_embedding) >= threshold
+                for kept_embedding in kept_embeddings
+            ):
+                continue
+            kept_indices.append(index)
+            kept_embeddings.append(embedding)
+
+        kept_indices.sort()
+        return (
+            [examples[index] for index in kept_indices],
+            [normalized_embeddings[index] for index in kept_indices],
+        )
+
+    def _select_diverse_examples_with_embeddings(
+        self,
+        examples: list[ExampleSentence],
+        embeddings: list[list[float]],
+        target_k: int = 12,
+    ) -> list[FinalExampleSentence]:
+        if not examples or not embeddings or target_k <= 0:
+            return []
+
+        limit = min(len(examples), len(embeddings))
+        if limit <= 0:
+            return []
+
+        normalized_embeddings = [
+            self._normalize_embedding(embedding)
+            for embedding in embeddings[:limit]
+        ]
+        seeds = [
+            index
+            for index, example in enumerate(examples[:limit])
+            if example.source == "seed"
+        ]
+
+        desired_seed_count = 0
+        if seeds:
+            desired_seed_count = min(
+                len(seeds),
+                target_k,
+                max(2, min(4, target_k // 3 or 1)),
+            )
+
+        selected_indices: list[int] = []
+        selected_indices.extend(
+            self._mmr_select_indices(
+                candidate_indices=seeds,
+                examples=examples[:limit],
+                embeddings=normalized_embeddings,
+                quota=desired_seed_count,
+                already_selected=[],
+            )
+        )
+
+        remaining_quota = max(target_k - len(selected_indices), 0)
+        if remaining_quota > 0:
+            selected_index_set = set(selected_indices)
+            remaining_indices = [
+                index
+                for index in range(limit)
+                if index not in selected_index_set
+            ]
+            selected_indices.extend(
+                self._mmr_select_indices(
+                    candidate_indices=remaining_indices,
+                    examples=examples[:limit],
+                    embeddings=normalized_embeddings,
+                    quota=remaining_quota,
+                    already_selected=selected_indices,
+                )
+            )
+
+        final_examples: list[FinalExampleSentence] = []
+        for index in selected_indices[:target_k]:
+            example = examples[index]
+            final_examples.append(
+                FinalExampleSentence(
+                    text=example.text,
+                    normalized_text=self.normalize_question_text(example.text),
+                    source=example.source,
+                    leaf_intent=example.leaf_intent,
+                    topic_slug=example.topic_slug,
+                    detail_slug=example.detail_slug,
+                    chunk_id=example.chunk_id,
+                    score_hint=example.score_hint,
+                    selection_score=self._selection_base_score(example),
+                )
+            )
+
+        return final_examples
 
     def _mmr_select_indices(
         self,
