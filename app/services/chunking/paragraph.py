@@ -14,7 +14,9 @@ class ParagraphChunkingService(BaseChunkingService):
         return self._apply_overlap(merged)
 
     def _split_paragraphs(self, text: str) -> list[str]:
-        parts = re.split(r"\n{2,}", text)
+        # \n{2,} (빈 줄) + \n▶ (섹션 헤더) 두 기준으로 1차 분할.
+        # 한국어 FAQ/매뉴얼 문서에서 ▶ 가 의미 단위 경계이므로 섹션별 독립 청크 생성.
+        parts = re.split(r"\n{2,}|\n(?=▶)", text)
         result = []
         for part in parts:
             part = part.strip()

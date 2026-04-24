@@ -14,9 +14,6 @@ class Settings(BaseSettings):
     # Deepgram
     deepgram_api_key: str = ""
 
-    # Google Cloud TTS
-    google_application_credentials: str = ""
-
     # PostgreSQL
     postgres_user: str = "sisicallcall"
     postgres_password: str = "changeme"
@@ -49,10 +46,12 @@ class Settings(BaseSettings):
     titanet_similarity_threshold: float = 0.40
     titanet_enrollment_sec: float = 3.0   # voiceprint 등록에 사용할 첫 발화 누적 시간
 
-    # TTS 합성 엔진 — "google" (Cloud TTS) | "xtts" (Coqui XTTS v2 로컬, 팀원 목소리)
-    tts_provider: str = "google"
-    # XTTS reference audio 경로 (zero-shot voice cloning용 WAV 파일)
-    xtts_reference_path: str = "voice/speaker_reference.wav"
+    # TTS 합성 엔진 — "azure" (Azure Speech SDK, μ-law 8kHz 네이티브 출력) 단일화
+    tts_provider: str = "azure"
+    # Azure Speech (TTS) — Korean Neural Voice
+    azure_speech_key: str = ""
+    azure_speech_region: str = ""  # e.g. "koreacentral", "eastus"
+    azure_tts_voice: str = "ko-KR-SunHiNeural"
 
     # SMS Provider — "solapi" (기본) | "twilio"
     sms_provider: str = "solapi"
@@ -70,7 +69,9 @@ class Settings(BaseSettings):
     auth_enable_test_register: bool = False
     auth_web_base_url: str = "http://localhost:3000"
 
-    model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
+    # extra="ignore" — .env 에 코드에서 제거된 잔여 키(예: 과거 GOOGLE_APPLICATION_CREDENTIALS)
+    # 가 있어도 ValidationError 로 죽지 않게. 신규 키는 위 클래스 필드로 명시 정의 필요.
+    model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 
 
 settings = Settings()

@@ -16,7 +16,7 @@ logger = get_logger(__name__)
 # 저장 금지 조건은 cache_store_node 에서 검사 (CLAUDE.md):
 # - 타임아웃 폴백 / Escalation 응답 / Reviewer revise 응답 / cache 경로 응답
 
-SIMILARITY_THRESHOLD = 0.95     # cosine similarity 임계값 (보수적 — false hit 방지)
+SIMILARITY_THRESHOLD = 0.90     # cosine similarity 기본 임계값
 TTL_SECONDS = 60 * 60 * 24      # 24시간
 
 

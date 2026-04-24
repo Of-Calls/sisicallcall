@@ -16,7 +16,6 @@ from typing import Optional
 from fastapi import WebSocket
 
 from app.services.tts.base import BaseTTSOutputChannel, BaseTTSService
-from app.services.tts.google import GoogleTTSService
 from app.utils.config import settings
 from app.utils.logger import get_logger
 
@@ -44,14 +43,9 @@ class TwilioTTSOutputChannel(BaseTTSOutputChannel):
 
     def _get_tts(self) -> BaseTTSService:
         if self._tts is None:
-            provider = (settings.tts_provider or "google").lower()
-            if provider == "xtts":
-                from app.services.tts.xtts import XTTSService
-                logger.info("TTS provider=xtts (Coqui XTTS v2 로컬, 팀원 목소리)")
-                self._tts = XTTSService()
-            else:
-                logger.info("TTS provider=google (Cloud TTS Neural2)")
-                self._tts = GoogleTTSService()
+            from app.services.tts.azure import AzureTTSService
+            logger.info("TTS provider=azure (Speech SDK, Korean Neural Voice)")
+            self._tts = AzureTTSService()
         return self._tts
 
     # ── lifecycle ─────────────────────────────────────────────

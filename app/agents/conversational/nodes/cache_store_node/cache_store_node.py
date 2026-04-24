@@ -10,12 +10,13 @@ from app.utils.logger import get_logger
 # - is_fallback=True (RAG miss / LLM 고정 fallback — 브랜치 노드가 명시)
 # - response_path == "escalation" (에스컬레이션 응답)
 # - response_path == "cache" (이미 캐시에서 온 응답 재저장 방지)
+# - response_path == "clarify" (역질문은 답변이 아니므로 캐시 대상 아님)
 # - reviewer_verdict == "revise" (Reviewer 가 수정한 응답)
 
 logger = get_logger(__name__)
 _cache_service = SemanticCacheService()
 
-_BLOCKED_RESPONSE_PATHS = {"escalation", "cache"}
+_BLOCKED_RESPONSE_PATHS = {"escalation", "cache", "clarify"}
 
 
 def _should_store(state: CallState) -> bool:

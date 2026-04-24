@@ -17,11 +17,8 @@ openai==1.57.0  # 1.52+ : httpx 0.28 proxies 호환 수정
 # STT
 deepgram-sdk==3.7.0
 
-# TTS
-google-cloud-texttospeech==2.17.2
-# XTTS v2 (Coqui) — 팀원 목소리 zero-shot voice cloning
-# torch/torchaudio는 아래 PyTorch 섹션 참조
-coqui-tts==0.27.5
+# TTS — Azure Speech SDK (μ-law 8kHz 네이티브 출력, Twilio 호환)
+azure-cognitiveservices-speech==1.40.0
 
 # Speaker Verification
 # TitaNet (대영 R-01 채택) — NeMo ASR 포함
@@ -74,5 +71,5 @@ httpx==0.27.2
 # Utils
 python-multipart==0.0.12
 
-# PDF Processing
-pdfplumber==0.11.4
+# PDF Processing — pymupdf4llm: PDF → 마크다운 추출 (헤더/표 구조 보존)
+pymupdf4llm

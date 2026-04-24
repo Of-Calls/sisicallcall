@@ -25,7 +25,7 @@ class CallState(TypedDict):
     # 라우팅
     knn_intent: Optional[str]
     knn_confidence: float
-    primary_intent: Optional[str]       # "intent_faq" | "intent_task" | "intent_auth" | "intent_escalation"
+    primary_intent: Optional[str]       # "intent_faq" | "intent_task" | "intent_auth" | "intent_clarify" | "intent_escalation"
     secondary_intents: list[str]
     routing_reason: Optional[str]
 
@@ -37,7 +37,7 @@ class CallState(TypedDict):
 
     # 최종 응답
     response_text: str
-    response_path: str                  # "cache" | "faq" | "task" | "auth" | "escalation"
+    response_path: str                  # "cache" | "faq" | "task" | "auth" | "clarify" | "escalation"
 
     # Reviewer
     reviewer_applied: bool
@@ -65,3 +65,7 @@ class CallState(TypedDict):
 
     # voiceprint 등록 완료 여부 — enrollment_node 에서 관리 (관측용)
     enrollment_done: NotRequired[bool]
+
+    # Intent Router LLM 이 모호한 발화에 대해 생성한 역질문 (intent_clarify 시만 채워짐).
+    # clarify_branch_node 가 그대로 response_text 로 사용. 다른 intent 일 때는 키 자체가 없음.
+    clarify_question: NotRequired[str]

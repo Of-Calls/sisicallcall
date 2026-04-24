@@ -1,3 +1,6 @@
+import functools
+import time
+
 from langgraph.graph import END, StateGraph
 
 from app.agents.conversational.state import CallState
@@ -13,12 +16,38 @@ from app.agents.conversational.nodes.intent_router_llm_node.intent_router_llm_no
 from app.agents.conversational.nodes.faq_branch_node.faq_branch_node import faq_branch_node
 from app.agents.conversational.nodes.task_branch_node.task_branch_node import task_branch_node
 from app.agents.conversational.nodes.auth_branch_node.auth_branch_node import auth_branch_node
+from app.agents.conversational.nodes.clarify_branch_node.clarify_branch_node import clarify_branch_node
 from app.agents.conversational.nodes.escalation_branch_node.escalation_branch_node import escalation_branch_node
 from app.agents.conversational.nodes.reviewer_node.reviewer_node import reviewer_node
 from app.agents.conversational.nodes.tts_node.tts_node import tts_node
+from app.utils.logger import get_logger
+
+logger = get_logger(__name__)
 
 # 신용 연구 완료 후 app/utils/config.py 이관
 KNN_CONFIDENCE_THRESHOLD = 0.85
+
+
+def _timed(name: str):
+    """노드 실행 시간 측정 데코레이터 — 5초 응답 제약 디버깅용.
+
+    각 노드 진입~완료 시간을 [node:name] elapsed=NNNms 형식으로 INFO 로그.
+    예외 발생 시에도 finally 로 elapsed 측정해 부분 진행 시간 노출.
+    """
+    def decorator(node_func):
+        @functools.wraps(node_func)
+        async def wrapped(state):
+            t0 = time.monotonic()
+            try:
+                return await node_func(state)
+            finally:
+                dt = (time.monotonic() - t0) * 1000
+                logger.info(
+                    "[node:%s] elapsed=%.0fms call_id=%s",
+                    name, dt, state.get("call_id", "?"),
+                )
+        return wrapped
+    return decorator
 
 
 # ── 조건부 엣지 함수 ──────────────────────────────────────────
@@ -60,6 +89,7 @@ def _intent_to_branch(intent: str | None) -> str:
         "intent_faq": "faq",
         "intent_task": "task",
         "intent_auth": "auth",
+        "intent_clarify": "clarify",
         "intent_escalation": "escalation",
     }
     return mapping.get(intent or "", "escalation")
@@ -75,22 +105,23 @@ def _is_high_risk(state: CallState) -> bool:
 def build_call_graph():
     graph = StateGraph(CallState)
 
-    # 노드 등록
-    graph.add_node("vad", vad_node)
-    graph.add_node("speaker_verify", speaker_verify_node)
-    graph.add_node("stt", stt_node)
-    graph.add_node("enrollment", enrollment_node)
-    graph.add_node("norm_text", norm_text_node)
-    graph.add_node("cache", cache_node)
-    graph.add_node("knn_router", knn_router_node)
-    graph.add_node("intent_router_llm", intent_router_llm_node)
-    graph.add_node("faq_branch", faq_branch_node)
-    graph.add_node("task_branch", task_branch_node)
-    graph.add_node("auth_branch", auth_branch_node)
-    graph.add_node("escalation_branch", escalation_branch_node)
-    graph.add_node("reviewer", reviewer_node)
-    graph.add_node("cache_store", cache_store_node)
-    graph.add_node("tts", tts_node)
+    # 노드 등록 — 모두 _timed 로 감싸 실행 시간 자동 로깅
+    graph.add_node("vad",               _timed("vad")(vad_node))
+    graph.add_node("speaker_verify",    _timed("speaker_verify")(speaker_verify_node))
+    graph.add_node("stt",               _timed("stt")(stt_node))
+    graph.add_node("enrollment",        _timed("enrollment")(enrollment_node))
+    graph.add_node("norm_text",         _timed("norm_text")(norm_text_node))
+    graph.add_node("cache",             _timed("cache")(cache_node))
+    graph.add_node("knn_router",        _timed("knn_router")(knn_router_node))
+    graph.add_node("intent_router_llm", _timed("intent_router_llm")(intent_router_llm_node))
+    graph.add_node("faq_branch",        _timed("faq_branch")(faq_branch_node))
+    graph.add_node("task_branch",       _timed("task_branch")(task_branch_node))
+    graph.add_node("auth_branch",       _timed("auth_branch")(auth_branch_node))
+    graph.add_node("clarify_branch",    _timed("clarify_branch")(clarify_branch_node))
+    graph.add_node("escalation_branch", _timed("escalation_branch")(escalation_branch_node))
+    graph.add_node("reviewer",          _timed("reviewer")(reviewer_node))
+    graph.add_node("cache_store",       _timed("cache_store")(cache_store_node))
+    graph.add_node("tts",               _timed("tts")(tts_node))
 
     # 진입점
     graph.set_entry_point("vad")
@@ -110,24 +141,29 @@ def build_call_graph():
         {"hit": "tts", "miss": "knn_router"})
 
     # KNN → 브랜치 직행 또는 IntentRouterLLM fallback
+    # NOTE: KNN 자체는 stub 이라 현재 항상 fallback_llm 으로 가지만, 향후 KNN 활성화 대비
+    # clarify 브랜치도 미리 매핑해 둔다.
     graph.add_conditional_edges("knn_router", route_after_knn, {
         "faq": "faq_branch",
         "task": "task_branch",
         "auth": "auth_branch",
+        "clarify": "clarify_branch",
         "escalation": "escalation_branch",
         "fallback_llm": "intent_router_llm",
     })
 
-    # IntentRouterLLM → 브랜치
+    # IntentRouterLLM → 브랜치 (clarify 포함 5개)
     graph.add_conditional_edges("intent_router_llm", route_to_branch, {
         "faq": "faq_branch",
         "task": "task_branch",
         "auth": "auth_branch",
+        "clarify": "clarify_branch",
         "escalation": "escalation_branch",
     })
 
     # 브랜치 → (조건부 Reviewer) → cache_store → TTS
-    for branch in ("faq_branch", "task_branch", "auth_branch", "escalation_branch"):
+    # clarify_branch 도 동일하게 reviewer/cache_store 분기 통과 (cache_store 가 clarify path 차단)
+    for branch in ("faq_branch", "task_branch", "auth_branch", "clarify_branch", "escalation_branch"):
         graph.add_conditional_edges(branch, route_after_branch,
             {"review": "reviewer", "skip_review": "cache_store"})
 
