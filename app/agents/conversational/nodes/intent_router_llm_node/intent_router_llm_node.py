@@ -32,7 +32,7 @@ logger = get_logger(__name__)
 
 _llm: BaseLLMService = GPT4OMiniService()
 
-INTENT_ROUTER_TIMEOUT_SEC = 3.0
+INTENT_ROUTER_TIMEOUT_SEC = 5.0  # 콜드 스타트(첫 OpenAI 호출 ~3초) 여유 포함
 VALID_INTENTS = {
     "intent_faq",
     "intent_task",
@@ -209,6 +209,12 @@ def _parse_intent_response(raw: str) -> dict | None:
 
 
 def _fallback(knn_intent: str | None, reason: str) -> dict:
+    """LLM timeout/parse 실패 시 폴백 분류.
+
+    KNN 후보가 있으면 그쪽으로, 없으면 clarify 로 (escalation 아님).
+    이유: 의도 파악 자체 실패 = "다시 한 번 물어보는" 게 자연스러움.
+    escalation 은 "AI 로 정말 못 풀 때" 만 (clarify 한도 도달, 명시 요청 등).
+    """
     if knn_intent in VALID_INTENTS:
         return {
             "primary_intent": knn_intent,
@@ -216,9 +222,10 @@ def _fallback(knn_intent: str | None, reason: str) -> dict:
             "routing_reason": reason,
         }
     return {
-        "primary_intent": "intent_escalation",
+        "primary_intent": "intent_clarify",
         "secondary_intents": [],
-        "routing_reason": f"{reason}_no_knn",
+        "routing_reason": f"{reason}_clarify_fallback",
+        "clarify_question": "죄송합니다, 다시 한 번 말씀해 주시겠어요?",
     }
 
 

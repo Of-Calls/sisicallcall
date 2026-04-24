@@ -18,12 +18,15 @@ FAQ_LLM_TIMEOUT_SEC = 3.0
 RAG_TOP_K = 3
 
 # TODO(agents.md 이관): 담당자 배정 후 프롬프트를 agents.md 로 이관
-FAQ_SYSTEM_PROMPT = """당신은 고객센터 FAQ 응답 AI입니다.
+FAQ_SYSTEM_PROMPT = """당신은 전화 고객센터의 FAQ 응답 AI입니다. 사용자는 음성으로 답변을 듣습니다.
 반드시 아래 규칙을 지키세요.
 1) 제공된 '참고 자료' 범위 안에서만 답변합니다.
 2) 참고 자료에 답이 없으면 정확히 다음 문장으로 답합니다: "확인이 어려워 담당자에게 연결해 드리겠습니다."
-3) 한국어 존댓말로 2~3문장 이내로 간결하게 답합니다.
-4) 참고 자료에 없는 정보를 추측하거나 생성하지 마세요."""
+3) **★최우선: 응답은 반드시 100자 이내, 1~2문장으로 끝낸다. 100자가 넘으면 안 된다.**
+4) 표/목록을 풀어서 길게 나열하지 말고, 핵심만 한 문장으로 요약한다.
+   (예: "평일 09:00~17:30, 토요일 09:00~12:00 운영됩니다." — 점심시간/예외사항은 묻지 않으면 생략)
+5) 한국어 존댓말로 자연스럽게 답한다.
+6) 참고 자료에 없는 정보를 추측하거나 생성하지 않는다."""
 
 
 def _compose_user_message(normalized_text: str, rag_results: list[str]) -> str:
@@ -59,12 +62,14 @@ async def faq_branch_node(state: CallState) -> dict:
     user_message = _compose_user_message(state["normalized_text"], rag_results)
 
     # LLM 호출 + stall trigger race — RFC 001 v0.2 §6.5
+    # max_tokens=150 — 100자 응답 + 안전 마진 (한국어 1자 ≈ 1~2 토큰)
+    # 실측: 300 → bytes 137~191KB (17~24초 음성). 150 으로 축소해 7~10초 응답.
     response_text, is_timeout = await _run_with_stall(
         coro=_llm.generate(
             system_prompt=FAQ_SYSTEM_PROMPT,
             user_message=user_message,
             temperature=0.1,
-            max_tokens=300,
+            max_tokens=150,
         ),
         call_id=call_id,
         stall_msg=_pick_stall_msg(state),
