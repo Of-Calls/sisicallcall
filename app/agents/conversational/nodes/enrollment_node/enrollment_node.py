@@ -20,11 +20,8 @@ _enrollment_done: dict[str, bool] = {}
 
 
 def _get_service():
-    from app.services.speaker_verify.titanet import TitaNetSpeakerVerifyService
-    global _service
-    if "_service" not in globals():
-        globals()["_service"] = TitaNetSpeakerVerifyService()
-    return globals()["_service"]
+    from app.services.speaker_verify.titanet import get_titanet_service
+    return get_titanet_service()
 
 
 async def enrollment_node(state: CallState) -> dict:
@@ -35,7 +32,7 @@ async def enrollment_node(state: CallState) -> dict:
 
     # STT 실패 or voiceprint 이미 등록 완료 → 즉시 반환
     if not transcript or _enrollment_done.get(call_id, False):
-        return {}
+        return {"enrollment_done": _enrollment_done.get(call_id, False)}
 
     enrollment_target = int(settings.titanet_enrollment_sec * _PCM_BYTES_PER_SEC)
     _enrollment_buffers.setdefault(call_id, bytearray()).extend(audio_chunk)
@@ -54,4 +51,4 @@ async def enrollment_node(state: CallState) -> dict:
             logger.error("enrollment 실패 call_id=%s: %s", call_id, e)
             _enrollment_done[call_id] = False
 
-    return {}
+    return {"enrollment_done": _enrollment_done.get(call_id, False)}

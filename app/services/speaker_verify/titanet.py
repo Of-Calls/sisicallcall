@@ -105,3 +105,14 @@ class TitaNetSpeakerVerifyService(BaseSpeakerVerifyService):
         """통화 종료 시 voiceprint 메모리 해제."""
         if self._voiceprints.pop(call_id, None) is not None:
             logger.info("voiceprint 삭제 call_id=%s", call_id)
+
+
+_singleton: "TitaNetSpeakerVerifyService | None" = None
+
+
+def get_titanet_service() -> TitaNetSpeakerVerifyService:
+    """enrollment_node · speaker_verify_node 가 공유하는 모듈 레벨 싱글톤."""
+    global _singleton
+    if _singleton is None:
+        _singleton = TitaNetSpeakerVerifyService()
+    return _singleton

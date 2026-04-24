@@ -10,11 +10,8 @@ logger = get_logger(__name__)
 
 
 def _get_service():
-    from app.services.speaker_verify.titanet import TitaNetSpeakerVerifyService
-    global _service
-    if "_service" not in globals():
-        globals()["_service"] = TitaNetSpeakerVerifyService()
-    return globals()["_service"]
+    from app.services.speaker_verify.titanet import get_titanet_service
+    return get_titanet_service()
 
 
 async def speaker_verify_node(state: CallState) -> dict:

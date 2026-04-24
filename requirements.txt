@@ -12,7 +12,7 @@ langchain==0.3.1
 langchain-openai==0.2.1
 
 # LLM
-openai==1.51.0
+openai==1.57.0  # 1.52+ : httpx 0.28 proxies 호환 수정
 
 # STT
 deepgram-sdk==3.7.0
@@ -53,8 +53,20 @@ torchaudio==2.6.0
 pytesseract==0.3.13
 Pillow==10.4.0
 
+# Face Auth (M3+) — ArcFace via insightface + ONNX Runtime (CPU)
+insightface==0.7.3
+onnxruntime==1.19.2
+opencv-python-headless==4.10.0.84
+
 # Async Worker (TBD: Celery or Redis Stream)
 celery==5.4.0
+
+# SMS
+solapi==5.0.3
+
+# tokenizers: chromadb<=0.20.3 요구 vs transformers>=0.22.0 요구 충돌
+# → transformers(BGE-M3) 우선, chromadb는 런타임 정상 동작 확인
+tokenizers==0.22.2
 
 # HTTP Client
 httpx==0.27.2
