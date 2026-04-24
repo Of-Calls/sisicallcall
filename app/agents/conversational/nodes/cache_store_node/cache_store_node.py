@@ -16,7 +16,7 @@ from app.utils.logger import get_logger
 logger = get_logger(__name__)
 _cache_service = SemanticCacheService()
 
-_BLOCKED_RESPONSE_PATHS = {"escalation", "cache", "clarify"}
+_BLOCKED_RESPONSE_PATHS = {"escalation", "cache", "clarify", "repeat"}
 
 
 def _should_store(state: CallState) -> bool:

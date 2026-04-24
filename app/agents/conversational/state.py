@@ -37,7 +37,7 @@ class CallState(TypedDict):
 
     # 최종 응답
     response_text: str
-    response_path: str                  # "cache" | "faq" | "task" | "auth" | "clarify" | "escalation"
+    response_path: str                  # "cache" | "faq" | "task" | "auth" | "clarify" | "escalation" | "repeat"
 
     # Reviewer
     reviewer_applied: bool

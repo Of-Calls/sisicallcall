@@ -17,6 +17,7 @@ from app.agents.conversational.nodes.faq_branch_node.faq_branch_node import faq_
 from app.agents.conversational.nodes.task_branch_node.task_branch_node import task_branch_node
 from app.agents.conversational.nodes.auth_branch_node.auth_branch_node import auth_branch_node
 from app.agents.conversational.nodes.clarify_branch_node.clarify_branch_node import clarify_branch_node
+from app.agents.conversational.nodes.repeat_branch_node.repeat_branch_node import repeat_branch_node
 from app.agents.conversational.nodes.escalation_branch_node.escalation_branch_node import escalation_branch_node
 from app.agents.conversational.nodes.reviewer_node.reviewer_node import reviewer_node
 from app.agents.conversational.nodes.tts_node.tts_node import tts_node
@@ -90,6 +91,7 @@ def _intent_to_branch(intent: str | None) -> str:
         "intent_task": "task",
         "intent_auth": "auth",
         "intent_clarify": "clarify",
+        "intent_repeat": "repeat",
         "intent_escalation": "escalation",
     }
     return mapping.get(intent or "", "escalation")
@@ -118,6 +120,7 @@ def build_call_graph():
     graph.add_node("task_branch",       _timed("task_branch")(task_branch_node))
     graph.add_node("auth_branch",       _timed("auth_branch")(auth_branch_node))
     graph.add_node("clarify_branch",    _timed("clarify_branch")(clarify_branch_node))
+    graph.add_node("repeat_branch",     _timed("repeat_branch")(repeat_branch_node))
     graph.add_node("escalation_branch", _timed("escalation_branch")(escalation_branch_node))
     graph.add_node("reviewer",          _timed("reviewer")(reviewer_node))
     graph.add_node("cache_store",       _timed("cache_store")(cache_store_node))
@@ -148,6 +151,7 @@ def build_call_graph():
         "task": "task_branch",
         "auth": "auth_branch",
         "clarify": "clarify_branch",
+        "repeat": "repeat_branch",
         "escalation": "escalation_branch",
         "fallback_llm": "intent_router_llm",
     })
@@ -158,12 +162,13 @@ def build_call_graph():
         "task": "task_branch",
         "auth": "auth_branch",
         "clarify": "clarify_branch",
+        "repeat": "repeat_branch",
         "escalation": "escalation_branch",
     })
 
     # 브랜치 → (조건부 Reviewer) → cache_store → TTS
     # clarify_branch 도 동일하게 reviewer/cache_store 분기 통과 (cache_store 가 clarify path 차단)
-    for branch in ("faq_branch", "task_branch", "auth_branch", "clarify_branch", "escalation_branch"):
+    for branch in ("faq_branch", "task_branch", "auth_branch", "clarify_branch", "repeat_branch", "escalation_branch"):
         graph.add_conditional_edges(branch, route_after_branch,
             {"review": "reviewer", "skip_review": "cache_store"})
 

@@ -38,9 +38,10 @@ _MAX_UTTERANCE_BYTES = 320000  # 최대 발화 길이 (~10s)
 # 침묵 감지 파라미터
 _SILENCE_FIRST_SEC = 10.0      # 첫 번째 침묵 알림 기준 (초)
 _SILENCE_SECOND_SEC = 10.0     # 첫 알림 후 추가 대기 → escalation (초)
-# TTS 재생 예상 속도 — 한국어 평균 발화 속도 ≈ 5자/초 (보수적)
+# TTS 재생 예상 속도 — Azure Korean TTS(YuJin 기본 속도) 실측 ≈ 3자/초
+# 실통화 로그 기준: 60자 → 19.6초 오디오 = 3.06자/초
 # ainvoke 완료 후 response_text 길이로 재생 시간 추정, 침묵 타이머 유예에 사용
-_KO_TTS_CHARS_PER_SEC = 5.0
+_KO_TTS_CHARS_PER_SEC = 3.0
 # greeting 재생 완료까지 타이머를 유예하는 버퍼 (greeting은 보통 8~12초 음성)
 # emit 시점 기준이라 재생 완료 전에 침묵 알림이 울리는 것을 방지
 _GREETING_PLAY_BUFFER_SEC = 13.0
@@ -239,22 +240,23 @@ async def call_websocket(
                             else:
                                 empty_stt_count = _result.get("empty_stt_count", empty_stt_count)
                             # TTS 응답 재생 완료 후부터 침묵 타이머 시작
-                            # response_text 길이로 예상 재생 시간 추정 (한국어 ≈ 5자/초)
-                            _resp_len = len(_result.get("response_text", "") or "")
-                            _play_buffer = _resp_len / _KO_TTS_CHARS_PER_SEC
+                            # response_text 길이로 예상 재생 시간 추정 (Azure KR TTS ≈ 3자/초)
+                            _resp_text = _result.get("response_text") or ""
+                            _play_buffer = len(_resp_text) / _KO_TTS_CHARS_PER_SEC
                             last_activity_at = time.monotonic() + _play_buffer
 
                             # Phase 2 — 다음 턴의 Intent Router 가 사용할 맥락 누적.
                             # last_assistant_text 는 길면 잘라서 프롬프트 부담을 줄인다.
+                            # response_text 가 없는 턴(STT empty 등)에는 덮어쓰지 않아
+                            # 이전 응답을 유지 → intent_repeat 가 올바르게 작동.
                             _new_intent = _result.get("primary_intent")
                             session_view["turn_count"] += 1
                             session_view["last_intent"] = _new_intent
                             session_view["last_question"] = (
                                 _result.get("normalized_text") or streaming_transcript
                             )
-                            session_view["last_assistant_text"] = (
-                                (_result.get("response_text") or "")[:200]
-                            )
+                            if _resp_text:
+                                session_view["last_assistant_text"] = _resp_text[:200]
                             # clarify 가 연속될 때만 카운터 누적, 다른 intent 가 한 번이라도 끼면 리셋
                             if _new_intent == "intent_clarify":
                                 session_view["clarify_count"] += 1
