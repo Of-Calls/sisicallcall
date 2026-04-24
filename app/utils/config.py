@@ -46,6 +46,12 @@ class Settings(BaseSettings):
     titanet_similarity_threshold: float = 0.40
     titanet_enrollment_sec: float = 3.0   # voiceprint 등록에 사용할 첫 발화 누적 시간
 
+    # WebRTC VAD (주미 연구 결과 — webrtc_vad 채택)
+    webrtc_mode: int = 3                        # aggressiveness 0~3 (3: 최대 잡음 제거)
+    webrtc_frame_ms: int = 30                   # 프레임 크기 ms (10/20/30 중 택일)
+    webrtc_speech_ratio_threshold: float = 0.5  # 프레임 중 발화 비율 임계값
+    webrtc_energy_fallback_threshold: int = 1200 # webrtcvad 미설치 시 energy fallback RMS 임계값
+
     # TTS 합성 엔진 — "azure" (Azure Speech SDK, μ-law 8kHz 네이티브 출력) 단일화
     tts_provider: str = "azure"
     # Azure Speech (TTS) — Korean Neural Voice
