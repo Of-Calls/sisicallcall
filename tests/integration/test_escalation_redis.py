@@ -128,7 +128,7 @@ async def test_immediate_via_real_redis(redis_client, tenant_id):
 
     assert result["response_text"] == escalation_mod.MSG_IMMEDIATE
     assert result["response_path"] == "escalation"
-    # SyncSummaryAgent 는 현재 stub ({"summary_short": ""}) — 정상 반환되므로 is_timeout=False
+    # 2026-04-24 SyncSummaryAgent 호출 임시 제거 — immediate 분기는 메시지만 즉시 반환
     assert result["is_timeout"] is False
 
 
