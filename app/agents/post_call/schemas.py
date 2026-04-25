@@ -106,6 +106,27 @@ class VOCResult(BaseModel):
     priority_result: VOCPriorityResult
 
 
+# ── Action Planner 노드 전용 출력 스키마 (priority 필드 + action_required 추가) ──
+
+class PlannedAction(BaseModel):
+    """Action Planner 노드가 생성하는 액션.
+    ActionItem 과 executor 호환을 유지하면서 priority 필드를 추가한다."""
+    action_type: ActionType
+    tool: Tool
+    priority: PriorityLevel = PriorityLevel.low
+    params: dict[str, Any] = Field(default_factory=dict)
+    status: ActionStatus = ActionStatus.pending
+    result: Optional[dict] = None
+    error: Optional[str] = None
+
+
+class ActionPlanResult(BaseModel):
+    """Action Planner 노드 출력. ActionPlan 에 action_required 필드를 추가한다."""
+    action_required: bool = False
+    actions: list[PlannedAction] = Field(default_factory=list)
+    rationale: str = ""
+
+
 # ── Priority Node 출력 스키마 ─────────────────────────────────────────────────
 
 class PriorityNodeResult(BaseModel):
