@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 from app.agents.post_call.state import PostCallAgentState
 from app.repositories.call_summary_repo import CallSummaryRepository
 from app.repositories.voc_analysis_repo import VOCAnalysisRepository
@@ -15,6 +16,7 @@ _dashboard_repo = DashboardRepository()
 
 async def save_result_node(state: PostCallAgentState) -> dict:
     call_id = state["call_id"]
+    # 이전 노드들이 누적한 errors 를 수집
     errors: list[dict] = list(state.get("errors", []))  # type: ignore[call-overload]
 
     for label, coro in [
@@ -27,6 +29,11 @@ async def save_result_node(state: PostCallAgentState) -> dict:
         except Exception as exc:
             errors.append({"node": f"save_result:{label}", "error": str(exc)})
 
+    # errors 유무로 partial_success 최종 결정.
+    # action_router_node 등 이전 노드가 partial_success 를 False 로 덮어썼을 수 있으므로
+    # 이 노드가 authoritative setter 역할을 한다.
+    final_partial_success = len(errors) > 0
+
     payload = {
         "call_id": call_id,
         "tenant_id": state["tenant_id"],
@@ -37,16 +44,24 @@ async def save_result_node(state: PostCallAgentState) -> dict:
         "action_plan": state.get("action_plan"),  # type: ignore[call-overload]
         "executed_actions": state.get("executed_actions", []),  # type: ignore[call-overload]
         "errors": errors,
-        "partial_success": state.get("partial_success", False),  # type: ignore[call-overload]
+        "partial_success": final_partial_success,
     }
 
     try:
         await _dashboard_repo.upsert_dashboard(call_id, payload)
     except Exception as exc:
         errors.append({"node": "save_result:dashboard", "error": str(exc)})
+        final_partial_success = True
+        payload["errors"] = errors
+        payload["partial_success"] = final_partial_success
 
-    logger.info("save_result 완료 call_id=%s errors=%d", call_id, len(errors))
-    return {"dashboard_payload": payload, "errors": errors}
+    logger.info("save_result 완료 call_id=%s errors=%d partial_success=%s",
+                call_id, len(errors), final_partial_success)
+    return {
+        "dashboard_payload": payload,
+        "errors": errors,
+        "partial_success": final_partial_success,
+    }
 
 
 async def _maybe_save_summary(call_id: str, state: PostCallAgentState) -> None:

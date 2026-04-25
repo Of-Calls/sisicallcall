@@ -1,8 +1,12 @@
 from __future__ import annotations
+
 from enum import Enum
 from typing import Any, Optional
+
 from pydantic import BaseModel, Field
 
+
+# ── Action 관련 ──────────────────────────────────────────────────────────────
 
 class ActionType(str, Enum):
     create_voc_issue = "create_voc_issue"
@@ -40,7 +44,83 @@ class ActionPlan(BaseModel):
     rationale: str = ""
 
 
+# ── LLM 출력 열거형 ───────────────────────────────────────────────────────────
+
+class CustomerEmotion(str, Enum):
+    positive = "positive"
+    neutral = "neutral"
+    negative = "negative"
+    angry = "angry"
+
+
+class ResolutionStatus(str, Enum):
+    resolved = "resolved"
+    escalated = "escalated"
+    abandoned = "abandoned"
+
+
+class PriorityLevel(str, Enum):
+    low = "low"
+    medium = "medium"
+    high = "high"
+    critical = "critical"
+
+
+# ── Summary 출력 스키마 ───────────────────────────────────────────────────────
+
+class SummaryResult(BaseModel):
+    summary_short: str
+    summary_detailed: str
+    customer_intent: str
+    customer_emotion: CustomerEmotion = CustomerEmotion.neutral
+    resolution_status: ResolutionStatus = ResolutionStatus.resolved
+    keywords: list[str] = Field(default_factory=list)
+    handoff_notes: Optional[str] = None
+
+
+# ── VOC 출력 스키마 ───────────────────────────────────────────────────────────
+
+class SentimentResult(BaseModel):
+    sentiment: CustomerEmotion = CustomerEmotion.neutral
+    intensity: float = 0.0       # 0.0 ~ 1.0
+    reason: str = ""
+
+
+class IntentResult(BaseModel):
+    primary_category: str
+    sub_categories: list[str] = Field(default_factory=list)
+    is_repeat_topic: bool = False
+    faq_candidate: bool = False
+
+
+class VOCPriorityResult(BaseModel):
+    priority: PriorityLevel = PriorityLevel.low
+    action_required: bool = False
+    suggested_action: Optional[str] = None
+    reason: str = ""
+
+
+class VOCResult(BaseModel):
+    sentiment_result: SentimentResult
+    intent_result: IntentResult
+    priority_result: VOCPriorityResult
+
+
+# ── Priority Node 출력 스키마 ─────────────────────────────────────────────────
+
+class PriorityNodeResult(BaseModel):
+    priority: PriorityLevel = PriorityLevel.low
+    # action_planner_node 가 priority.get("tier") 를 참조하므로 tier 를 유지
+    tier: str = PriorityLevel.low.value
+    action_required: bool = False
+    suggested_action: Optional[str] = None
+    reason: str = ""
+
+
+# ── 하위 호환 alias (기존 코드가 VOCAnalysis / PriorityResult 를 import 하는 경우 대비) ──
+
 class VOCAnalysis(BaseModel):
+    """Deprecated — VOCResult 로 교체. 하위 호환용."""
     sentiment: str
     issues: list[str]
     keywords: list[str]
@@ -49,6 +129,7 @@ class VOCAnalysis(BaseModel):
 
 
 class PriorityResult(BaseModel):
+    """Deprecated — PriorityNodeResult 로 교체. 하위 호환용."""
     score: int
     tier: str
     reason: str

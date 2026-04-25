@@ -1,23 +1,74 @@
 from __future__ import annotations
+
+import json
+
+from app.agents.post_call.llm_caller import PostCallLLMCaller, make_summary_caller
+from app.agents.post_call.prompts import SUMMARY_SYSTEM, SUMMARY_USER
+from app.agents.post_call.schemas import CustomerEmotion, ResolutionStatus, SummaryResult
 from app.agents.post_call.state import PostCallAgentState
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+# lazy singleton — 테스트에서 monkeypatch.setattr 으로 교체
+_caller: PostCallLLMCaller | None = None
+
+
+def _get_caller() -> PostCallLLMCaller:
+    global _caller
+    if _caller is None:
+        _caller = make_summary_caller()
+    return _caller
+
+
+def _format_transcripts(transcripts: list[dict]) -> str:
+    if not transcripts:
+        return "(녹취 없음)"
+    lines = []
+    for t in transcripts:
+        role = t.get("role", "unknown")
+        text = t.get("text", "")
+        lines.append(f"[{role}] {text}")
+    return "\n".join(lines)
+
+
+def _validate(raw: dict) -> dict:
+    """Pydantic 으로 스키마 검증 후 직렬화 가능한 dict 반환."""
+    # 허용 enum 값 외 값이 오면 기본값으로 fallback
+    emotion = raw.get("customer_emotion", "neutral")
+    if emotion not in CustomerEmotion._value2member_map_:
+        logger.warning("summary: unknown customer_emotion=%r — neutral 로 대체", emotion)
+        raw["customer_emotion"] = "neutral"
+
+    status = raw.get("resolution_status", "resolved")
+    if status not in ResolutionStatus._value2member_map_:
+        logger.warning("summary: unknown resolution_status=%r — resolved 로 대체", status)
+        raw["resolution_status"] = "resolved"
+
+    result = SummaryResult(**raw)
+    return result.model_dump()
+
 
 async def summary_node(state: PostCallAgentState) -> dict:
     call_id = state["call_id"]
     try:
-        # TODO: 실제 LLM 호출로 교체 (prompts.SUMMARY_PROMPT 사용)
-        dummy = {
-            "summary_text": f"[dummy] call_id={call_id} 상담 내용 요약",
-            "call_duration_sec": 180,
-            "customer_intent": "요금 문의",
-            "resolution_status": "resolved",
-            "key_topics": ["요금 문의", "해지 안내"],
-        }
-        logger.info("summary 완료 call_id=%s status=%s", call_id, dummy["resolution_status"])
-        return {"summary": dummy}
+        transcripts_text = _format_transcripts(state.get("transcripts", []))  # type: ignore[call-overload]
+        user_msg = SUMMARY_USER.format(transcripts=transcripts_text)
+
+        raw = await _get_caller().call_json(
+            system_prompt=SUMMARY_SYSTEM,
+            user_message=user_msg,
+            max_tokens=800,
+        )
+        summary = _validate(raw)
+        logger.info(
+            "summary 완료 call_id=%s emotion=%s status=%s",
+            call_id,
+            summary.get("customer_emotion"),
+            summary.get("resolution_status"),
+        )
+        return {"summary": summary}
+
     except Exception as exc:
         logger.error("summary 실패 call_id=%s err=%s", call_id, exc)
         errors = list(state.get("errors", []))  # type: ignore[call-overload]
