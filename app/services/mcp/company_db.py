@@ -1,11 +1,16 @@
-from app.utils.logger import get_logger
+from __future__ import annotations
 
-# M2 기능 — Task 브랜치 MCP 도구
+from app.services.mcp.base import BaseMCPService
+from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
 
-class CompanyDBMCPService:
+class CompanyDBMCPService(BaseMCPService):
+    service_name: str = "company_db"
+
     async def query(self, sql: str, params: dict) -> list[dict]:
-        # TODO(M2): 임시 회사 DB MCP 연동 구현
-        raise NotImplementedError
+        if self._use_real_mode():
+            raise NotImplementedError("CompanyDB MCP 실제 연동 미구현")
+        logger.info("CompanyDBMCPService(mock) query sql=%s", sql)
+        return []

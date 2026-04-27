@@ -1,11 +1,16 @@
-from app.utils.logger import get_logger
+from __future__ import annotations
 
-# M2 기능 — Task 브랜치 MCP 도구
+from app.services.mcp.base import BaseMCPService
+from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
 
-class CalendarMCPService:
+class CalendarMCPService(BaseMCPService):
+    service_name: str = "calendar"
+
     async def create_event(self, title: str, start: str, end: str) -> dict:
-        # TODO(M2): Google Calendar MCP 연동 구현
-        raise NotImplementedError
+        if self._use_real_mode():
+            raise NotImplementedError("Calendar MCP 실제 연동 미구현")
+        logger.info("CalendarMCPService(mock) create_event title=%s", title)
+        return {"event_id": "mock-event", "title": title, "mock": True}
