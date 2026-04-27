@@ -13,6 +13,17 @@ logger = get_logger(__name__)
 # lazy singleton — 테스트에서 monkeypatch.setattr 으로 교체
 _caller: PostCallLLMCaller | None = None
 
+# 녹취 없을 때 반환하는 안전한 fallback 요약 구조
+_EMPTY_TRANSCRIPT_SUMMARY: dict = {
+    "summary_short": "통화 내용 없음",
+    "summary_detailed": "녹취 데이터가 없어 요약을 생성할 수 없습니다.",
+    "customer_intent": "알 수 없음",
+    "customer_emotion": "neutral",
+    "resolution_status": "resolved",
+    "keywords": [],
+    "handoff_notes": None,
+}
+
 
 def _get_caller() -> PostCallLLMCaller:
     global _caller
@@ -51,8 +62,21 @@ def _validate(raw: dict) -> dict:
 
 async def summary_node(state: PostCallAgentState) -> dict:
     call_id = state["call_id"]
+    transcripts: list = state.get("transcripts") or []  # type: ignore[call-overload]
+
+    # 녹취 없음 — LLM 호출 없이 fallback 요약 반환
+    if not transcripts:
+        logger.warning("summary: 녹취 없음 call_id=%s — fallback 요약 사용", call_id)
+        errors = list(state.get("errors", []))  # type: ignore[call-overload]
+        errors.append({
+            "node": "summary",
+            "warning": "empty_transcript",
+            "error": "transcripts 없음 — fallback 요약 사용",
+        })
+        return {"summary": dict(_EMPTY_TRANSCRIPT_SUMMARY), "errors": errors, "partial_success": True}
+
     try:
-        transcripts_text = _format_transcripts(state.get("transcripts", []))  # type: ignore[call-overload]
+        transcripts_text = _format_transcripts(transcripts)
         user_msg = SUMMARY_USER.format(transcripts=transcripts_text)
 
         raw = await _get_caller().call_json(
@@ -73,4 +97,4 @@ async def summary_node(state: PostCallAgentState) -> dict:
         logger.error("summary 실패 call_id=%s err=%s", call_id, exc)
         errors = list(state.get("errors", []))  # type: ignore[call-overload]
         errors.append({"node": "summary", "error": str(exc)})
-        return {"summary": None, "errors": errors}
+        return {"summary": None, "errors": errors, "partial_success": True}
