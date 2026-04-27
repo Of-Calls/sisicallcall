@@ -22,6 +22,10 @@ class MockTTSOutputChannel(BaseTTSOutputChannel):
         self._stall_emitted: dict[str, bool] = {}       # call_id -> 이중 방출 방지
         self._emissions: dict[str, list[EmittedEvent]] = {}  # call_id -> emit 로그
         self._cancelled: dict[str, bool] = {}           # call_id -> cancel 플래그
+        # barge-in 인터페이스 일치 — 송신 시뮬레이션은 없지만
+        # current_text 는 직전 push_response 텍스트를 보존해 끊긴 응답 컨텍스트 추적 가능.
+        self._is_speaking: dict[str, bool] = {}
+        self._current_text: dict[str, str] = {}
 
     # ── lifecycle ─────────────────────────────────────────────
 
@@ -30,6 +34,8 @@ class MockTTSOutputChannel(BaseTTSOutputChannel):
         self._stall_emitted[call_id] = False
         self._emissions[call_id] = []
         self._cancelled[call_id] = False
+        self._is_speaking[call_id] = False
+        self._current_text[call_id] = ""
 
     async def flush(self, call_id: str) -> None:
         # 턴 종료 — 모든 per-call 상태 cleanup
@@ -37,6 +43,8 @@ class MockTTSOutputChannel(BaseTTSOutputChannel):
         self._stall_emitted.pop(call_id, None)
         # _emissions 는 테스트 후 검증용이라 남김 — assert 용도
         self._cancelled.pop(call_id, None)
+        self._is_speaking.pop(call_id, None)
+        self._current_text.pop(call_id, None)
 
     # ── emit ──────────────────────────────────────────────────
 
@@ -59,6 +67,8 @@ class MockTTSOutputChannel(BaseTTSOutputChannel):
         if call_id not in self._open_calls:
             logger.warning("push_response on un-opened call_id=%s — ignored", call_id)
             return
+        # 송신 시뮬레이션 없음 — current_text 만 갱신해 barge-in 컨텍스트 노출.
+        self._current_text[call_id] = text
         self._emissions[call_id].append({
             "type": "response",
             "call_id": call_id,
@@ -71,9 +81,19 @@ class MockTTSOutputChannel(BaseTTSOutputChannel):
             logger.warning("cancel on un-opened call_id=%s — ignored", call_id)
             return
         self._cancelled[call_id] = True
+        self._is_speaking[call_id] = False
+        self._current_text[call_id] = ""
         # RFC 규약: current stream 중단 + 큐 클리어.
         # stall_emitted 플래그는 reset 하지 않음.
         self._emissions[call_id].clear()
+
+    # ── 상태 조회 (barge-in 지원) ─────────────────────────────
+
+    def is_speaking(self, call_id: str) -> bool:
+        return self._is_speaking.get(call_id, False)
+
+    def current_text(self, call_id: str) -> str:
+        return self._current_text.get(call_id, "")
 
     # ── 테스트 검증용 헬퍼 ────────────────────────────────────
 
