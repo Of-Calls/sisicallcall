@@ -8,7 +8,6 @@ from app.agents.conversational.nodes.vad_node.vad_node import vad_node
 from app.agents.conversational.nodes.speaker_verify_node.speaker_verify_node import speaker_verify_node
 from app.agents.conversational.nodes.stt_node.stt_node import stt_node
 from app.agents.conversational.nodes.enrollment_node.enrollment_node import enrollment_node
-from app.agents.conversational.nodes.norm_text_node.norm_text_node import norm_text_node
 from app.agents.conversational.nodes.cache_node.cache_node import cache_node
 from app.agents.conversational.nodes.cache_store_node.cache_store_node import cache_store_node
 from app.agents.conversational.nodes.intent_router_llm_node.intent_router_llm_node import intent_router_llm_node
@@ -101,7 +100,6 @@ def build_call_graph():
     graph.add_node("speaker_verify",    _timed("speaker_verify")(speaker_verify_node))
     graph.add_node("stt",               _timed("stt")(stt_node))
     graph.add_node("enrollment",        _timed("enrollment")(enrollment_node))
-    graph.add_node("norm_text",         _timed("norm_text")(norm_text_node))
     graph.add_node("cache",             _timed("cache")(cache_node))
     graph.add_node("intent_router_llm", _timed("intent_router_llm")(intent_router_llm_node))
     graph.add_node("faq_branch",        _timed("faq_branch")(faq_branch_node))
@@ -124,8 +122,9 @@ def build_call_graph():
         {"pass": "stt", "reject": END})
     graph.add_conditional_edges("stt", route_after_stt,
         {"pass": "enrollment", "skip": END})
-    graph.add_edge("enrollment", "norm_text")
-    graph.add_edge("norm_text", "cache")
+    # norm_text_node 폐지 (2026-04-27) — Deepgram 출력이 이미 trim/공백 정규화 완료라
+    # 별도 노드는 no-op. stt_node 가 normalized_text 도 동시 set 하도록 통합.
+    graph.add_edge("enrollment", "cache")
 
     # Gate 1 분기 — cache miss 는 IntentRouterLLM 으로 직결
     # (이전 KNN Router 단계는 stub 이라 영구 보류 결정 후 2026-04-27 제거 — CLAUDE.md 참조)

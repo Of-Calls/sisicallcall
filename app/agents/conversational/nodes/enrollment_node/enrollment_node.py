@@ -1,6 +1,6 @@
 """화자 voiceprint 등록 노드 — STT 성공 발화만 enrollment에 사용.
 
-위치: stt_node 이후 → norm_text_node 이전
+위치: stt_node 이후 → cache_node 이전
 역할: raw_transcript 있는 오디오만 누적해 voiceprint 등록.
       빈 STT(잡음) 오디오는 enrollment에서 완전 차단.
 

@@ -1,3 +1,5 @@
+import re
+
 from app.agents.conversational.state import CallState
 from app.services.stt.base import BaseSTTService
 from app.services.stt.deepgram import DeepgramSTTService
@@ -11,6 +13,12 @@ _stt_service: BaseSTTService = DeepgramSTTService()
 _EMPTY_STT_ESCALATION_THRESHOLD = 3
 
 
+def _normalize(text: str) -> str:
+    """STT 결과 공백 정규화. Deepgram 은 이미 trim/단일 공백이라 대부분 idempotent —
+    미래 STT 교체 / batch 모드 대비 안전망. 별도 norm_text_node 폐지로 통합 (2026-04-27)."""
+    return re.sub(r"\s+", " ", text.strip())
+
+
 async def stt_node(state: CallState) -> dict:
     call_id = state.get("call_id", "unknown")
 
@@ -18,7 +26,11 @@ async def stt_node(state: CallState) -> dict:
     pre_filled = (state.get("raw_transcript") or "").strip()
     if pre_filled:
         logger.info("STT 패스스루 (streaming) call_id=%s transcript='%s'", call_id, pre_filled)
-        return {"raw_transcript": pre_filled, "empty_stt_count": 0}
+        return {
+            "raw_transcript": pre_filled,
+            "normalized_text": _normalize(pre_filled),
+            "empty_stt_count": 0,
+        }
 
     # Fallback: prerecorded (streaming 결과 없거나 연결 실패 시)
     audio_data = state.get("audio_chunk", b"")
@@ -37,7 +49,11 @@ async def stt_node(state: CallState) -> dict:
         if not transcript:
             return _handle_empty_transcript(state, call_id)
 
-        return {"raw_transcript": transcript, "empty_stt_count": 0}
+        return {
+            "raw_transcript": transcript,
+            "normalized_text": _normalize(transcript),
+            "empty_stt_count": 0,
+        }
 
     except Exception as e:
         logger.error("STT 실패 call_id=%s | 에러: %s", call_id, e)
@@ -52,4 +68,4 @@ def _handle_empty_transcript(state: CallState, call_id: str) -> dict:
     """
     count = state.get("empty_stt_count", 0) + 1
     logger.debug("빈 STT %d회 → skip call_id=%s", count, call_id)
-    return {"raw_transcript": "", "empty_stt_count": count}
+    return {"raw_transcript": "", "normalized_text": "", "empty_stt_count": count}
