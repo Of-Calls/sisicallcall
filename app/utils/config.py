@@ -42,8 +42,10 @@ class Settings(BaseSettings):
     tts_channel_mode: str = "mock"
 
     # TitaNet 화자 검증 (대영 R-01 연구 결과 — titanet_large 채택)
+    # threshold: barge-in 0.8s 청크에서 false negative 줄이려 0.40 → 0.30 하향
+    # (실통화 echo sim 분포 -0.10~0.05 vs 진짜 발화 0.29~0.81, margin +0.20 유지)
     titanet_model_name: str = "titanet_large"
-    titanet_similarity_threshold: float = 0.40
+    titanet_similarity_threshold: float = 0.30
     titanet_enrollment_sec: float = 3.0   # voiceprint 등록에 사용할 첫 발화 누적 시간
 
     # WebRTC VAD (주미 연구 결과 — webrtc_vad 채택)

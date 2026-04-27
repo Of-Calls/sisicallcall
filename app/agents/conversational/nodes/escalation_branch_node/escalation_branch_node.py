@@ -14,9 +14,9 @@ logger = get_logger(__name__)
 
 _session_service = RedisSessionService()
 
-# 영업시간 외 테스트 우회 토글 — .env 또는 셸에서 BYPASS_OFFHOURS=true 설정 시 항상 영업중 처리.
-# 운영에선 미설정 → 정상 영업시간 검사 수행.
-_BYPASS_OFFHOURS = os.getenv("BYPASS_OFFHOURS", "false").lower() == "true"
+# 영업시간 외 시뮬레이션 토글 — .env 또는 셸에서 FORCE_OFFHOURS=true 설정 시 항상 영업시간 외 처리.
+# 미설정 (default) → 정상 영업시간 검사 수행 (Redis 데이터 부재 시 영업중 가정 — redis_session.py).
+_FORCE_OFFHOURS = os.getenv("FORCE_OFFHOURS", "false").lower() == "true"
 
 # TODO(agents.md 이관): tenant.settings JSONB 업종별 오버라이드 전까지 기본 멘트
 MSG_IMMEDIATE = "상담원에게 즉시 연결해 드리겠습니다."
@@ -28,8 +28,8 @@ async def escalation_branch_node(state: CallState) -> dict:
     tenant_id = state["tenant_id"]
     call_id = state["call_id"]
 
-    if _BYPASS_OFFHOURS:
-        within_hours = True
+    if _FORCE_OFFHOURS:
+        within_hours = False
     else:
         within_hours = await _session_service.is_within_business_hours(tenant_id)
     if not within_hours:

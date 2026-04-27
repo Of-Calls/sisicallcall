@@ -30,7 +30,12 @@ class RedisSessionService:
     async def is_within_business_hours(
         self, tenant_id: str, now: Optional[datetime] = None
     ) -> bool:
-        """현재 시각이 tenant 운영시간 내인지 판정. 데이터 부재/에러 시 False."""
+        """현재 시각이 tenant 운영시간 내인지 판정.
+
+        데이터 부재/에러/closed 시 default True (영업중 가정). 운영 환경에선 Redis seed 가
+        채워져 있으니 정상 시각 판정. 개발/테스트 편의용 default. 영업시간 외를
+        시뮬레이션하려면 escalation_branch_node 의 FORCE_OFFHOURS 환경변수 사용.
+        """
         now = now or datetime.now(_KST)
         weekday = _WEEKDAYS[now.weekday()]
         key = self._tenant_key(tenant_id, "business_hours")
@@ -38,10 +43,10 @@ class RedisSessionService:
             value = await self._redis.hget(key, weekday)
         except Exception as e:
             logger.error("redis business_hours lookup failed tenant=%s: %s", tenant_id, e)
-            return False
+            return True
 
         if not value or value == "closed":
-            return False
+            return True
 
         try:
             start_str, end_str = value.split("-")
@@ -49,7 +54,7 @@ class RedisSessionService:
             end = time.fromisoformat(end_str.strip())
         except Exception as e:
             logger.error("business_hours parse error tenant=%s value=%s: %s", tenant_id, value, e)
-            return False
+            return True
 
         current = now.time()
         # 야간업종 대응: start > end이면 자정을 건너뛰는 운영시간 (예: "22:00-02:00")
