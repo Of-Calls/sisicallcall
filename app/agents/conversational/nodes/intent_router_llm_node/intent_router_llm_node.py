@@ -43,8 +43,9 @@ VALID_INTENTS = {
 }
 
 # clarify 누적 한도 — 이 횟수에 도달하면 강제 escalation.
-# Phase 1.5 에서 2 → 4 로 상향. 시도마다 더 좁은 선택지로 묻는 progressive 전략과 함께 사용.
-MAX_CLARIFY_TURNS = 4
+# Phase 1.5: 2 → 4. Phase B+: 4 → 6 (최대한 대화로 해결, escalation 도피 차단).
+# Progressive 전략 (라인 81~89) 4단계 + 5/6 단계는 LLM 자유 판단 (단답 키워드 반복 등).
+MAX_CLARIFY_TURNS = 6
 
 
 def _build_system_prompt(tenant_name: str) -> str:
