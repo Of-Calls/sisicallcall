@@ -1,4 +1,5 @@
 import asyncio
+import time
 
 from app.services.embedding.base import BaseEmbeddingService
 from app.utils.logger import get_logger
@@ -23,7 +24,8 @@ class BGEM3LocalEmbeddingService(BaseEmbeddingService):
         # GPU 와 fp16 으로 강제 이동시킴.
         device = "cuda:0" if torch.cuda.is_available() else "cpu"
         use_fp16 = device.startswith("cuda")
-        logger.info("BGE-M3 로컬 모델 로딩 중 device=%s use_fp16=%s ...", device, use_fp16)
+        t0 = time.monotonic()
+        logger.info("BGE-M3 로컬 모델 로딩 시작 device=%s use_fp16=%s ...", device, use_fp16)
         self._model = BGEM3FlagModel(
             "BAAI/bge-m3",
             use_fp16=use_fp16,
@@ -35,7 +37,8 @@ class BGEM3LocalEmbeddingService(BaseEmbeddingService):
             if use_fp16:
                 self._model.model.half()
             logger.info("BGE-M3 모델을 GPU+fp16 으로 강제 이동 완료")
-        logger.info("BGE-M3 로컬 모델 로딩 완료")
+        elapsed = time.monotonic() - t0
+        logger.info("BGE-M3 로컬 모델 로딩 완료 elapsed=%.2fs", elapsed)
 
     def _encode_sync(self, texts: list[str]) -> list[list[float]]:
         output = self._model.encode(texts, batch_size=12, max_length=512)

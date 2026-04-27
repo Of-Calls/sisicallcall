@@ -1,4 +1,5 @@
 import asyncio
+import time
 from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
@@ -17,20 +18,33 @@ from app.utils.logger import get_logger
 _logger = get_logger(__name__)
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Azure TTS 는 클라우드 SDK 호출 (200~400ms) — 모델 로딩/사전 합성 캐시 불필요.
-    # cache_node 의 BGE-M3 는 module-level 인스턴스화로 이미 자동 warm-up 됨.
+async def _warmup_titanet() -> None:
+    """TitaNet 모델 백그라운드 warm-up — startup 차단 안 함.
 
-    # TitaNet warm-up — enrollment_node · speaker_verify_node 공유 싱글톤 초기화
+    첫 통화 시점까지 보통 끝남. 만약 warm-up 끝나기 전 첫 통화가 들어오면
+    enrollment_node 가 lazy load (~5~10초) 로 fallback. 통화 진행 자체는 가능.
+    """
+    t0 = time.monotonic()
     try:
-        _logger.info("TitaNet 모델 warm-up 시작")
+        _logger.info("TitaNet 모델 warm-up 시작 (background)")
         from app.services.speaker_verify.titanet import get_titanet_service
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, get_titanet_service)
-        _logger.info("TitaNet 모델 warm-up 완료 — 화자 검증 준비됨")
+        elapsed = time.monotonic() - t0
+        _logger.info("TitaNet 모델 warm-up 완료 elapsed=%.2fs — 화자 검증 준비됨", elapsed)
     except Exception as e:
-        _logger.error("TitaNet warm-up 실패 — 첫 발화 시 lazy load 됨: %s", e)
+        elapsed = time.monotonic() - t0
+        _logger.error("TitaNet warm-up 실패 elapsed=%.2fs — 첫 발화 시 lazy load 됨: %s", elapsed, e)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Azure TTS 는 클라우드 SDK 호출 (200~400ms) — 모델 로딩/사전 합성 캐시 불필요.
+    # cache_node 의 BGE-M3 는 module-level 인스턴스화로 이미 자동 warm-up 됨 (elapsed 로그 참조).
+
+    # TitaNet warm-up 을 background task 로 띄워 startup 즉시 yield → uvicorn 가
+    # health check 받을 준비. await 하지 않음 — 첫 통화 시점까지 백그라운드 진행.
+    asyncio.create_task(_warmup_titanet())
 
     yield
 
