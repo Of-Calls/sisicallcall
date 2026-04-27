@@ -68,6 +68,16 @@ class Settings(BaseSettings):
     tts_chunk_interval_sec: float = 0.020   # 청크 사이 throttle (160B / 8kHz = 20ms)
     tts_play_tail_margin_sec: float = 0.15  # 송신 후 jitter buffer 잔여 재생 마진
 
+    # Barge-in verify (Phase B — VAD + 화자검증 게이트)
+    # TTS 송신 중 사용자 발화로 보이는 신호가 들어오면 첫 0.8초를 추출해
+    # WebRTC VAD (음성 vs 잡음) + TitaNet (등록 화자 vs 타인/echo) 통과한 경우에만
+    # BARGE-IN 트리거. enrollment 미완료 시 TitaNet 가 자동 bypass(True) 반환 →
+    # RMS-only 동작으로 자연스럽게 fallback. 문제 시 enabled=false 로 즉시 PR1~3 동작.
+    bargein_verify_enabled: bool = True
+    bargein_rms_pre_threshold: int = 1500   # verify 게이트 진입 RMS (echo 임계값 2400 보다 낮음)
+    bargein_verify_chunk_bytes: int = 25600 # 0.8s × 16kHz × 2byte (PCM16 mono)
+    bargein_verify_chunk_sec: float = 0.8   # 디버그/로그용
+
     # SMS Provider — "solapi" (기본) | "twilio"
     sms_provider: str = "solapi"
     solapi_api_key: str = ""

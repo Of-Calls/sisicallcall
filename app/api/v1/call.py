@@ -17,8 +17,10 @@ from app.api.v1._tenant_helpers import (
 )
 from app.core.events import CALL_ENDED, CALL_STARTED
 from app.services.session.redis_session import RedisSessionService
+from app.services.speaker_verify.titanet import get_titanet_service
 from app.services.stt.deepgram_streaming import DeepgramStreamingSTTService
 from app.services.tts.channel import tts_channel
+from app.services.vad.webrtc_vad import WebRTCVADService
 from app.utils.audio import mulaw_to_pcm16, reset_resample_state
 from app.utils.config import settings
 from app.utils.logger import get_logger
@@ -30,6 +32,8 @@ router = APIRouter()
 _graph = build_call_graph()
 _session_service = RedisSessionService()
 _streaming_stt = DeepgramStreamingSTTService()
+# barge-in verify 게이트용 — VAD 1차, TitaNet 2차. 둘 다 모듈 싱글톤.
+_bargein_vad = WebRTCVADService()
 
 # 발화 감지 파라미터 — Silero VAD(주미) 구현 전 임시 에너지 기반 묵음 감지
 _SPEECH_RMS_THRESHOLD = 1200   # 일반 발화 임계값 (TTS 에코 필터링 포함)
@@ -128,6 +132,8 @@ async def call_websocket(
     # Barge-in 상태 — 메인 루프 + _run_turn 공유
     turn_task: Optional[asyncio.Task] = None
     interrupted_response_text: str = ""
+    # 한 발화당 verify 1회 가드 — utterance_buffer 0.8초 도달 시 verify, 발화 종료 시 reset
+    bargein_verify_attempted: bool = False
 
     async def _run_turn(state: CallState, streaming_transcript: str) -> None:
         """그래프 실행 + 결과 후처리. 백그라운드 task 로 메인 루프와 분리.
@@ -182,6 +188,60 @@ async def call_websocket(
             except (asyncio.CancelledError, Exception):
                 pass
         turn_task = None
+
+    async def _attempt_bargein_verify() -> None:
+        """utterance_buffer 가 0.8초 채웠을 때 VAD + TitaNet 으로 BARGE-IN 검증.
+
+        통과 시: 끊긴 응답 보존, TTS cancel, turn cancel, grace 적용. utterance_buffer 와
+        STT 누적은 보존 (현재 발화가 다음 turn 의 입력이 됨).
+        미통과 시: 무시. 일반 발화 처리는 그대로 진행 (echo / 타인이면 STT 결과로도 자연 차단).
+        한 발화당 1회 시도 — bargein_verify_attempted 플래그로 가드.
+        """
+        nonlocal interrupted_response_text, last_activity_at, silence_alert_count
+        nonlocal bargein_verify_attempted
+        if not settings.bargein_verify_enabled:
+            bargein_verify_attempted = True
+            return
+
+        bargein_verify_attempted = True
+        chunk = bytes(utterance_buffer[: settings.bargein_verify_chunk_bytes])
+
+        # VAD 1차 — 음성 청크 여부 (잡음/정적 차단, GPU 호출 절약)
+        try:
+            is_speech = await _bargein_vad.detect(chunk)
+        except Exception as exc:
+            logger.warning("call_id=%s bargein VAD 실패: %s — skip", call_id, exc)
+            return
+        if not is_speech:
+            logger.debug("call_id=%s bargein verify skip — VAD non-speech", call_id)
+            return
+
+        # TitaNet 2차 — 등록 화자 vs echo / 타인. 미등록 시 bypass(True, 1.0)
+        try:
+            is_verified, similarity = await get_titanet_service().verify(chunk, call_id)
+        except Exception as exc:
+            logger.error("call_id=%s bargein verify 실패: %s — skip", call_id, exc)
+            return
+
+        channel_speaking = channel_opened and tts_channel.is_speaking(call_id)
+        turn_running = turn_task is not None and not turn_task.done()
+        logger.info(
+            "call_id=%s BARGE-IN verify sim=%.3f verified=%s speaking=%s turn_running=%s",
+            call_id, similarity, is_verified, channel_speaking, turn_running,
+        )
+        if not is_verified:
+            return
+
+        # ── 통과 → BARGE-IN trigger ─────────────────────────
+        logger.info("call_id=%s BARGE-IN 감지 (verified)", call_id)
+        if channel_opened:
+            interrupted_response_text = tts_channel.current_text(call_id) or ""
+            await tts_channel.cancel(call_id)
+        await _cancel_turn_task()
+        last_activity_at = time.monotonic() + _BARGEIN_GRACE_SEC
+        silence_alert_count = 0
+        # utterance_buffer / STT 누적은 보존 — 발화 종료 (800ms 묵음) 시 정상 turn invoke 가
+        # 현재 발화 PCM + STT transcript 로 다음 응답 생성
 
     try:
         while True:
@@ -252,39 +312,10 @@ async def call_websocket(
                 pcm_bytes = mulaw_to_pcm16(mulaw_bytes)
                 rms = audioop.rms(pcm_bytes, 2)
 
-                # ── BARGE-IN 감지 ─────────────────────────────
-                # TTS 송신 중(또는 turn task 진행 중) 사용자 발화 감지 시
-                # 현재 응답 중단 + 진행 중 turn cancel + 새 발화로 전환.
-                # 임계값을 일반(1200) 보다 높이는 이유: TTS echo false positive 차단.
-                channel_speaking = channel_opened and tts_channel.is_speaking(call_id)
-                turn_running = turn_task is not None and not turn_task.done()
-                if (channel_speaking or turn_running) and rms >= _BARGEIN_RMS_THRESHOLD:
-                    logger.info(
-                        "call_id=%s BARGE-IN 감지 rms=%d speaking=%s turn_running=%s",
-                        call_id, rms, channel_speaking, turn_running,
-                    )
-                    if channel_opened:
-                        # 끊긴 응답 원문 보존 → 다음 turn 의 intent_router_llm 컨텍스트로 사용
-                        interrupted_response_text = tts_channel.current_text(call_id) or ""
-                        await tts_channel.cancel(call_id)
-                    await _cancel_turn_task()
-                    # silence_check grace — 인터럽트 후 사용자가 잠시 침묵해도 즉시 멘트 X
-                    last_activity_at = time.monotonic() + _BARGEIN_GRACE_SEC
-                    silence_alert_count = 0
-                    # Deepgram 잔여 transcript 비우기 — 이전 turn 과 새 발화 분리
-                    try:
-                        await _streaming_stt.flush_transcript(call_id)
-                    except Exception as exc:
-                        logger.warning("STT flush(barge-in) 실패 call_id=%s: %s", call_id, exc)
-                    # 새 발화 누적 시작
-                    utterance_buffer.clear()
-                    utterance_buffer.extend(pcm_bytes)
-                    silence_chunk_count = 0
-                    in_speech = True
-                    await _streaming_stt.send(call_id, pcm_bytes)
-                    continue
-
                 # ── 일반 발화 처리 ────────────────────────────
+                # Phase B: BARGE-IN 검증은 utterance_buffer 가 0.8초 채운 시점에
+                # _attempt_bargein_verify() 가 VAD + TitaNet 게이트로 판단 (이 분기 끝).
+                # 즉시 cancel 분기는 제거 — echo / 타인 목소리에 false-positive 차단.
                 await _streaming_stt.send(call_id, pcm_bytes)
 
                 if rms >= _SPEECH_RMS_THRESHOLD:
@@ -358,6 +389,7 @@ async def call_websocket(
                         utterance_buffer.clear()
                         silence_chunk_count = 0
                         in_speech = False
+                        bargein_verify_attempted = False  # 다음 발화부터 verify 1회 다시 가능
 
                 else:
                     # in_speech=False, rms<threshold → 발화 없는 진짜 침묵 구간
@@ -396,6 +428,19 @@ async def call_websocket(
                             )
                             silence_alert_count = 1
                             last_activity_at = now
+
+                # ── BARGE-IN verify trigger (per utterance, 1회) ──
+                # TTS 재생 중(또는 turn 진행 중) + utterance_buffer 가 0.8초 채워졌을 때
+                # _attempt_bargein_verify() 가 VAD + TitaNet 게이트로 cancel 여부 결정.
+                # 결과(통과/미통과) 와 무관하게 발화 종료까지 utterance_buffer 는 누적 계속.
+                channel_speaking = channel_opened and tts_channel.is_speaking(call_id)
+                turn_running = turn_task is not None and not turn_task.done()
+                if (
+                    (channel_speaking or turn_running)
+                    and not bargein_verify_attempted
+                    and len(utterance_buffer) >= settings.bargein_verify_chunk_bytes
+                ):
+                    await _attempt_bargein_verify()
 
             elif event == "stop":
                 logger.info(f"[{CALL_ENDED}] call_id={call_id}")
