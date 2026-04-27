@@ -10,6 +10,7 @@ lifecycle binding:
 import asyncio
 import base64
 import json
+import time
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -24,6 +25,11 @@ logger = get_logger(__name__)
 # Twilio Media Stream chunk 권장 크기: 160 bytes per 20ms at μ-law 8kHz
 _TWILIO_CHUNK_BYTES = 160
 
+# 송신 종료 후 Twilio jitter buffer 가 마지막 ~100ms 를 마저 재생하는 동안에도
+# is_speaking()=True 를 유지해 barge-in 게이트를 활성화. 너무 짧으면 막바지 echo 가
+# barge-in false-positive, 너무 길면 진짜 사용자 발화가 차단됨.
+_PLAY_TAIL_MARGIN_SEC = 0.15
+
 
 @dataclass
 class _CallBinding:
@@ -32,8 +38,12 @@ class _CallBinding:
     tenant_id: str
     lock: asyncio.Lock                                              # 동일 call_id 로 동시 send 방지 (순서 보장)
     cancel_event: asyncio.Event = field(default_factory=asyncio.Event)  # barge-in 즉시 중단 신호
-    is_speaking: bool = False                                       # 현재 응답 송신 중 여부 (barge-in 감지용)
+    is_speaking: bool = False                                       # 송신 루프 active 여부 (Python 측 송신 중)
     current_text: str = ""                                          # 현재 송신 중 응답 원문 (barge-in 컨텍스트용)
+    # Twilio jitter buffer 의 재생 시간 추정 — 송신은 1초 안에 끝나지만 실제 재생은
+    # 11~14초 진행되므로, is_speaking() 이 송신 후에도 이 값으로 재생 진행 중인지 판단.
+    play_started_at: float = 0.0                                    # 송신 시작 monotonic 시각
+    play_duration_sec: float = 0.0                                  # 전체 재생 예상 시간 = len(audio) / 8000
 
 
 class TwilioTTSOutputChannel(BaseTTSOutputChannel):
@@ -113,6 +123,10 @@ class TwilioTTSOutputChannel(BaseTTSOutputChannel):
             logger.warning("cancel on un-opened call_id=%s — ignored", call_id)
             return
         binding.cancel_event.set()
+        # play_until 즉시 reset — currently-playing 청크의 echo 가 is_speaking 으로
+        # barge-in 재트리거되는 무한 루프 방지. cancel = "지금 끝낸다" 의미.
+        binding.play_started_at = 0.0
+        binding.play_duration_sec = 0.0
         clear_msg = json.dumps({
             "event": "clear",
             "streamSid": binding.stream_sid,
@@ -126,8 +140,20 @@ class TwilioTTSOutputChannel(BaseTTSOutputChannel):
     # ── 상태 조회 (barge-in 지원) ─────────────────────────────
 
     def is_speaking(self, call_id: str) -> bool:
+        """송신 active OR Twilio jitter buffer 가 재생 진행 중이면 True.
+
+        송신 루프는 빠르게 끝나지만 (~1초) Twilio 가 음성을 11~14초 재생하므로,
+        play_started_at + play_duration_sec + tail margin 안에 있는 동안 True 유지.
+        """
         binding = self._bindings.get(call_id)
-        return bool(binding and binding.is_speaking)
+        if binding is None:
+            return False
+        if binding.is_speaking:
+            return True
+        if binding.play_started_at == 0.0:
+            return False
+        elapsed = time.monotonic() - binding.play_started_at
+        return elapsed < (binding.play_duration_sec + _PLAY_TAIL_MARGIN_SEC)
 
     def current_text(self, call_id: str) -> str:
         binding = self._bindings.get(call_id)
@@ -164,6 +190,12 @@ class TwilioTTSOutputChannel(BaseTTSOutputChannel):
             logger.info(
                 "tts_channel emit call_id=%s tag=%s bytes=%d", call_id, tag, len(audio)
             )
+
+            # play_until 추정 — 송신 시작 시각 + 전체 재생 예상 시간 (μ-law 8kHz mono)
+            # finally 블록에서 is_speaking=False 로 토글된 후에도 is_speaking() 메서드가
+            # tail margin 동안 True 를 유지하도록 두 필드는 reset 하지 않는다.
+            binding.play_started_at = time.monotonic()
+            binding.play_duration_sec = len(audio) / 8000
 
             # 160 byte (20ms) 청크로 쪼개 순차 송신 — 매 청크마다 cancel 체크
             total_chunks = max(len(audio) // _TWILIO_CHUNK_BYTES, 1)
