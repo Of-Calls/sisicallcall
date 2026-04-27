@@ -59,6 +59,15 @@ class Settings(BaseSettings):
     azure_speech_region: str = ""  # e.g. "koreacentral", "eastus"
     azure_tts_voice: str = "ko-KR-SunHiNeural"
 
+    # TTS Throttle (barge-in 정확도용)
+    # Twilio jitter buffer 가 11~14초간 음성 재생하므로 송신 속도 ≈ 재생 속도 로 맞춰
+    # cancel 즉시 효과 + is_speaking 정확도 자연 확보. 음성 끊김 발생 시 enabled=False
+    # 로 즉시 끄고 재시작 가능. Linux 운영 정상, Windows 개발은 chunk_interval 0.015 보정.
+    tts_throttle_enabled: bool = True
+    tts_preroll_chunks: int = 20            # 처음 N 청크는 즉시 송신 (시작 latency + 지터 흡수)
+    tts_chunk_interval_sec: float = 0.020   # 청크 사이 throttle (160B / 8kHz = 20ms)
+    tts_play_tail_margin_sec: float = 0.15  # 송신 후 jitter buffer 잔여 재생 마진
+
     # SMS Provider — "solapi" (기본) | "twilio"
     sms_provider: str = "solapi"
     solapi_api_key: str = ""
