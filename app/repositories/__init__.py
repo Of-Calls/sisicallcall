@@ -4,6 +4,7 @@ from app.repositories.call_summary_repo import (
     get_summary_by_call_id,
     seed_call_context,
     get_call_context,
+    get_seeded_call_context,
 )
 from app.repositories.voc_analysis_repo import (
     VOCAnalysisRepository,
@@ -37,6 +38,7 @@ __all__ = [
     "get_summary_by_call_id",
     "seed_call_context",
     "get_call_context",
+    "get_seeded_call_context",
     # voc_analysis
     "save_voc_analysis",
     "get_voc_by_call_id",

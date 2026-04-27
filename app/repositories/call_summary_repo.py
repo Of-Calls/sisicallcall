@@ -92,6 +92,16 @@ async def get_call_context(call_id: str) -> dict | None:
     return ctx
 
 
+async def get_seeded_call_context(call_id: str) -> dict | None:
+    """명시적으로 seed된 컨텍스트만 반환한다 — sample fallback 없음.
+
+    context_provider가 '실제로 주입된 데이터가 있는지' 판별할 때 사용한다.
+    주입된 데이터가 없으면 None을 반환한다.
+    """
+    record = _context_store.get(call_id)
+    return copy.deepcopy(record) if record is not None else None
+
+
 # ── Backward-compatible class interface (used by load_context_node / save_result_node) ──
 
 class CallSummaryRepository:
