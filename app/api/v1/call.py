@@ -357,7 +357,15 @@ async def call_websocket(
                     # in_speech=False, rms<threshold → 발화 없는 진짜 침묵 구간
                     # 5초 침묵: 확인 멘트 / 추가 10초 침묵: escalation 멘트
                     # push_response 는 백그라운드 task — 메인 루프 블록 방지
-                    if channel_opened and silence_alert_count < 2:
+                    #
+                    # 응답 생성·송신 중 가드: ainvoke 백그라운드 task 진행 중이거나
+                    # TTS 송신 중이면 침묵 알림 skip + last_activity_at 계속 reset.
+                    # 사용자는 응답 기다리는 중인데 "통화 중이십니까" 끼어들면 어색.
+                    turn_running_now = turn_task is not None and not turn_task.done()
+                    channel_speaking_now = channel_opened and tts_channel.is_speaking(call_id)
+                    if turn_running_now or channel_speaking_now:
+                        last_activity_at = time.monotonic()
+                    elif channel_opened and silence_alert_count < 2:
                         now = time.monotonic()
                         elapsed = now - last_activity_at
                         if silence_alert_count == 1 and elapsed >= _SILENCE_SECOND_SEC:
