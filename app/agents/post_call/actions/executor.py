@@ -1,46 +1,112 @@
 from __future__ import annotations
-from app.agents.post_call.schemas import Tool
-from app.agents.post_call.actions.gmail_action import GmailAction
-from app.agents.post_call.actions.company_db_action import CompanyDBAction
-from app.agents.post_call.actions.calendar_action import CalendarAction
+
+from app.agents.post_call.actions.registry import get_handler
+from app.agents.post_call.actions.result import action_failed, action_skipped, action_success
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-_TOOL_HANDLERS: dict[Tool, object] = {
-    Tool.gmail: GmailAction(),
-    Tool.company_db: CompanyDBAction(),
-    Tool.calendar: CalendarAction(),
-}
-
 
 class ActionExecutor:
-    async def execute_all(self, actions: list[dict], *, call_id: str) -> list[dict]:
-        results = []
+    """action_plan.actions 를 registry 에서 찾은 handler 로 라우팅하고
+    표준 6-key 결과 list 를 반환한다.
+
+    새 tool 추가 시 executor.py 는 수정하지 않는다.
+    registry.py 에 handler 만 등록하면 된다.
+    """
+
+    async def execute_actions(
+        self,
+        call_id: str,
+        tenant_id: str,
+        actions: list[dict] | None,
+    ) -> list[dict]:
+        """표준 인터페이스.
+
+        - actions 가 None 이거나 빈 list 면 [] 반환.
+        - 하나의 action 이 실패해도 나머지 action 은 계속 실행한다.
+        - 반환 순서는 입력 actions 순서와 동일하다.
+        """
+        if not actions:
+            return []
+        results: list[dict] = []
         for action in actions:
-            results.append(await self._execute_one(action, call_id=call_id))
+            results.append(
+                await self._execute_one(action, call_id=call_id, tenant_id=tenant_id)
+            )
         return results
 
-    async def _execute_one(self, action: dict, *, call_id: str) -> dict:
-        tool_key = action.get("tool")
-        try:
-            tool_enum = Tool(tool_key)
-        except ValueError:
-            return {**action, "status": "skipped", "error": f"unknown tool: {tool_key}"}
+    async def execute_all(self, actions: list[dict], *, call_id: str) -> list[dict]:
+        """후방 호환 인터페이스 — action_router_node 가 호출한다."""
+        return await self.execute_actions(
+            call_id=call_id,
+            tenant_id="",
+            actions=actions,
+        )
 
-        if tool_enum == Tool.internal_dashboard:
-            return {**action, "status": "success", "result": {"note": "internal_dashboard 직접 처리"}}
+    async def _execute_one(
+        self,
+        action: dict,
+        *,
+        call_id: str,
+        tenant_id: str = "",
+    ) -> dict:
+        tool_key = action.get("tool", "")
+        action_type = action.get("action_type", "")
 
-        handler = _TOOL_HANDLERS.get(tool_enum)
+        handler = get_handler(tool_key)
         if handler is None:
-            return {**action, "status": "skipped", "error": f"no handler for {tool_key}"}
+            logger.warning(
+                "알 수 없는 tool call_id=%s tool=%r action_type=%s",
+                call_id, tool_key, action_type,
+            )
+            return action_failed(action, error=f"unknown tool: {tool_key!r}")
 
         try:
-            result = await handler.execute(action, call_id=call_id)  # type: ignore[attr-defined]
-            return {**action, "status": "success", "result": result}
+            raw: dict = await handler.execute(
+                action,
+                call_id=call_id,
+                tenant_id=tenant_id,
+            )
+            status = raw.get("status", "success")
+            if status == "failed":
+                return action_failed(
+                    action,
+                    error=raw.get("error") or "handler returned failed",
+                    result=raw.get("result"),
+                )
+            if status == "skipped":
+                return action_skipped(
+                    action,
+                    reason=raw.get("error") or "handler returned skipped",
+                    result=raw.get("result"),
+                )
+            return action_success(
+                action,
+                external_id=raw.get("external_id"),
+                result=raw.get("result"),
+            )
         except Exception as exc:
             logger.error(
                 "action 실패 call_id=%s tool=%s action_type=%s err=%s",
-                call_id, tool_key, action.get("action_type"), exc,
+                call_id, tool_key, action_type, exc,
             )
-            return {**action, "status": "failed", "error": str(exc)}
+            return action_failed(action, error=str(exc))
+
+
+# ── 모듈 레벨 편의 함수 ───────────────────────────────────────────────────────
+
+_default_executor = ActionExecutor()
+
+
+async def execute_actions(
+    call_id: str,
+    tenant_id: str,
+    actions: list[dict] | None,
+) -> list[dict]:
+    """모듈 레벨 편의 함수 — ActionExecutor().execute_actions() 와 동일."""
+    return await _default_executor.execute_actions(
+        call_id=call_id,
+        tenant_id=tenant_id,
+        actions=actions,
+    )
