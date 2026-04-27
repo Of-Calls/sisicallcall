@@ -69,3 +69,9 @@ class CallState(TypedDict):
     # Intent Router LLM 이 모호한 발화에 대해 생성한 역질문 (intent_clarify 시만 채워짐).
     # clarify_branch_node 가 그대로 response_text 로 사용. 다른 intent 일 때는 키 자체가 없음.
     clarify_question: NotRequired[str]
+
+    # Barge-in (TTS 재생 중 사용자 발화로 직전 응답이 끊긴 경우).
+    # call.py 가 turn 시작 시 채워 넣고, intent_router_llm 이 컨텍스트로 활용한다.
+    # is_bargein=True 면 interrupted_response_text 에 끊긴 응답 원문이 보존됨.
+    is_bargein: NotRequired[bool]
+    interrupted_response_text: NotRequired[str]

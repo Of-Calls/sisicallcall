@@ -160,10 +160,15 @@ _JSON_BLOCK_RE = re.compile(r"\{.*\}", re.DOTALL)
 
 
 def _build_user_message(state: CallState) -> str:
-    """Phase 2 — session_view 의 맥락 정보를 모두 LLM 입력으로 풍부화."""
+    """Phase 2 — session_view 의 맥락 정보를 모두 LLM 입력으로 풍부화.
+
+    barge-in turn (직전 AI 응답이 사용자 발화로 끊긴 경우) 에는 끊긴 응답 원문을
+    추가 라인으로 끼워 넣어, 새 발화가 끊긴 응답에 대한 후속/거부/재요청인지
+    완전히 새로운 의도인지 LLM 이 판단하도록 한다.
+    """
     sv = state.get("session_view") or {}
     knn_intent = state.get("knn_intent")
-    return (
+    base = (
         f"입력 발화: {state['normalized_text']}\n"
         f"tenant_name: {sv.get('tenant_name', '고객센터')}\n"
         f"is_within_hours: {sv.get('is_within_hours', True)}\n"
@@ -174,6 +179,15 @@ def _build_user_message(state: CallState) -> str:
         f"clarify_count: {sv.get('clarify_count', 0)}\n"
         f"KNN 후보 intent: {knn_intent or '없음'}"
     )
+    interrupted = (state.get("interrupted_response_text") or "").strip()
+    if state.get("is_bargein") and interrupted:
+        base += (
+            f"\nbarge-in: 직전 AI 응답이 사용자 발화로 중단됨. "
+            f"끊긴 응답 원문='{interrupted[:200]}'. "
+            f"새 발화가 (a) 끊긴 응답에 대한 후속/거부/재요청 인지, "
+            f"(b) 완전히 새로운 의도인지 판단해 분류하라."
+        )
+    return base
 
 
 def _parse_intent_response(raw: str) -> dict | None:

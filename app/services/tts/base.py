@@ -59,3 +59,18 @@ class BaseTTSOutputChannel(ABC):
     @abstractmethod
     async def flush(self, call_id: str) -> None:
         """턴 종료. 내부 상태 (큐 + stall_emitted 플래그 + tenant mapping) 정리."""
+
+    # ── 상태 조회 (barge-in 지원) ─────────────────────────────
+    # 기본 구현은 송신 상태를 추적하지 않는 채널(예: 합성/스트림 분리 안 된 mock)
+    # 호환을 위해 항상 False/"" 반환. 실 구현체가 override.
+
+    def is_speaking(self, call_id: str) -> bool:
+        """현재 call_id 의 응답이 TTS 송신 중이면 True. barge-in 감지에 사용."""
+        return False
+
+    def current_text(self, call_id: str) -> str:
+        """현재 송신 중(또는 직전에 송신 중이었던) 응답 원문. 없으면 빈 문자열.
+
+        barge-in 시 끊긴 응답 컨텍스트 보존용 — intent_router_llm 이 활용.
+        """
+        return ""
