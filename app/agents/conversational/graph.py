@@ -11,7 +11,6 @@ from app.agents.conversational.nodes.enrollment_node.enrollment_node import enro
 from app.agents.conversational.nodes.norm_text_node.norm_text_node import norm_text_node
 from app.agents.conversational.nodes.cache_node.cache_node import cache_node
 from app.agents.conversational.nodes.cache_store_node.cache_store_node import cache_store_node
-from app.agents.conversational.nodes.knn_router_node.knn_router_node import knn_router_node
 from app.agents.conversational.nodes.intent_router_llm_node.intent_router_llm_node import intent_router_llm_node
 from app.agents.conversational.nodes.faq_branch_node.faq_branch_node import faq_branch_node
 from app.agents.conversational.nodes.task_branch_node.task_branch_node import task_branch_node
@@ -24,9 +23,6 @@ from app.agents.conversational.nodes.tts_node.tts_node import tts_node
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
-
-# 신용 연구 완료 후 app/utils/config.py 이관
-KNN_CONFIDENCE_THRESHOLD = 0.85
 
 
 def _timed(name: str):
@@ -69,13 +65,6 @@ def route_after_cache(state: CallState) -> str:
     return "hit" if state["cache_hit"] else "miss"
 
 
-def route_after_knn(state: CallState) -> str:
-    """KNN confidence 임계값 이상이면 primary_intent 확정 후 브랜치 직행."""
-    if state["knn_confidence"] >= KNN_CONFIDENCE_THRESHOLD and state["knn_intent"]:
-        return _intent_to_branch(state["primary_intent"])
-    return "fallback_llm"
-
-
 def route_to_branch(state: CallState) -> str:
     """IntentRouterLLM 확정 후 primary_intent → 브랜치."""
     return _intent_to_branch(state["primary_intent"])
@@ -114,7 +103,6 @@ def build_call_graph():
     graph.add_node("enrollment",        _timed("enrollment")(enrollment_node))
     graph.add_node("norm_text",         _timed("norm_text")(norm_text_node))
     graph.add_node("cache",             _timed("cache")(cache_node))
-    graph.add_node("knn_router",        _timed("knn_router")(knn_router_node))
     graph.add_node("intent_router_llm", _timed("intent_router_llm")(intent_router_llm_node))
     graph.add_node("faq_branch",        _timed("faq_branch")(faq_branch_node))
     graph.add_node("task_branch",       _timed("task_branch")(task_branch_node))
@@ -139,22 +127,10 @@ def build_call_graph():
     graph.add_edge("enrollment", "norm_text")
     graph.add_edge("norm_text", "cache")
 
-    # Gate 1 분기
+    # Gate 1 분기 — cache miss 는 IntentRouterLLM 으로 직결
+    # (이전 KNN Router 단계는 stub 이라 영구 보류 결정 후 2026-04-27 제거 — CLAUDE.md 참조)
     graph.add_conditional_edges("cache", route_after_cache,
-        {"hit": "tts", "miss": "knn_router"})
-
-    # KNN → 브랜치 직행 또는 IntentRouterLLM fallback
-    # NOTE: KNN 자체는 stub 이라 현재 항상 fallback_llm 으로 가지만, 향후 KNN 활성화 대비
-    # clarify 브랜치도 미리 매핑해 둔다.
-    graph.add_conditional_edges("knn_router", route_after_knn, {
-        "faq": "faq_branch",
-        "task": "task_branch",
-        "auth": "auth_branch",
-        "clarify": "clarify_branch",
-        "repeat": "repeat_branch",
-        "escalation": "escalation_branch",
-        "fallback_llm": "intent_router_llm",
-    })
+        {"hit": "tts", "miss": "intent_router_llm"})
 
     # IntentRouterLLM → 브랜치 (clarify 포함 5개)
     graph.add_conditional_edges("intent_router_llm", route_to_branch, {

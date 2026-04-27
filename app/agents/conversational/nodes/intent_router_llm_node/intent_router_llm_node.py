@@ -1,4 +1,4 @@
-"""Intent Router LLM Fallback — KNN 미달 / stub 시 GPT-4o-mini 로 의도 분류.
+"""Intent Router LLM — Cache miss 후 GPT-4o-mini 로 의도 분류.
 
 분류 결과:
     intent_faq        FAQ/매뉴얼 정보 조회
@@ -168,7 +168,6 @@ def _build_user_message(state: CallState) -> str:
     완전히 새로운 의도인지 LLM 이 판단하도록 한다.
     """
     sv = state.get("session_view") or {}
-    knn_intent = state.get("knn_intent")
     base = (
         f"입력 발화: {state['normalized_text']}\n"
         f"tenant_name: {sv.get('tenant_name', '고객센터')}\n"
@@ -177,8 +176,7 @@ def _build_user_message(state: CallState) -> str:
         f"last_intent: {sv.get('last_intent')}\n"
         f"last_question: {sv.get('last_question')}\n"
         f"last_assistant_text: {sv.get('last_assistant_text')}\n"
-        f"clarify_count: {sv.get('clarify_count', 0)}\n"
-        f"KNN 후보 intent: {knn_intent or '없음'}"
+        f"clarify_count: {sv.get('clarify_count', 0)}"
     )
     interrupted = (state.get("interrupted_response_text") or "").strip()
     if state.get("is_bargein") and interrupted:
@@ -223,19 +221,12 @@ def _parse_intent_response(raw: str) -> dict | None:
     return out
 
 
-def _fallback(knn_intent: str | None, reason: str) -> dict:
-    """LLM timeout/parse 실패 시 폴백 분류.
+def _fallback(reason: str) -> dict:
+    """LLM timeout/parse 실패 시 폴백 분류 — 항상 clarify 로 회귀.
 
-    KNN 후보가 있으면 그쪽으로, 없으면 clarify 로 (escalation 아님).
-    이유: 의도 파악 자체 실패 = "다시 한 번 물어보는" 게 자연스러움.
+    의도 파악 자체 실패 = "다시 한 번 물어보는" 게 자연스러움.
     escalation 은 "AI 로 정말 못 풀 때" 만 (clarify 한도 도달, 명시 요청 등).
     """
-    if knn_intent in VALID_INTENTS:
-        return {
-            "primary_intent": knn_intent,
-            "secondary_intents": [],
-            "routing_reason": reason,
-        }
     return {
         "primary_intent": "intent_clarify",
         "secondary_intents": [],
@@ -271,7 +262,6 @@ async def intent_router_llm_node(state: CallState) -> dict:
 
     sv = state.get("session_view") or {}
     tenant_name = sv.get("tenant_name", "고객센터")
-    knn_intent = state.get("knn_intent")
     user_message = _build_user_message(state)
 
     try:
@@ -286,10 +276,10 @@ async def intent_router_llm_node(state: CallState) -> dict:
         )
     except asyncio.TimeoutError:
         logger.warning("intent_router timeout call_id=%s", state["call_id"])
-        return _fallback(knn_intent, "knn_fallback_timeout")
+        return _fallback("llm_timeout")
     except Exception as e:
         logger.error("intent_router error call_id=%s: %s", state["call_id"], e)
-        return _fallback(knn_intent, "knn_fallback_error")
+        return _fallback("llm_error")
 
     parsed = _parse_intent_response(raw)
     if parsed is None:
@@ -297,7 +287,7 @@ async def intent_router_llm_node(state: CallState) -> dict:
             "intent_router parse failed call_id=%s raw=%r",
             state["call_id"], raw[:200],
         )
-        return _fallback(knn_intent, "knn_fallback_parse_error")
+        return _fallback("llm_parse_error")
 
     logger.info(
         "intent_router 결과 call_id=%s intent=%s reason=%s clarify=%s",

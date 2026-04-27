@@ -23,8 +23,6 @@ class CallState(TypedDict):
     cache_hit: bool
 
     # 라우팅
-    knn_intent: Optional[str]
-    knn_confidence: float
     primary_intent: Optional[str]       # "intent_faq" | "intent_task" | "intent_auth" | "intent_clarify" | "intent_escalation"
     secondary_intents: list[str]
     routing_reason: Optional[str]

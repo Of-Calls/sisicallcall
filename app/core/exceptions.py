@@ -30,9 +30,5 @@ class CacheError(SisicollcollError):
     pass
 
 
-class KNNRouterError(SisicollcollError):
-    pass
-
-
 class SpeakerVerifyError(SisicollcollError):
     pass

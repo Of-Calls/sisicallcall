@@ -35,9 +35,6 @@ class Settings(BaseSettings):
     env: str = "development"
     log_level: str = "INFO"
 
-    # KNN Router (신용 연구 완료 후 확정)
-    knn_confidence_threshold: float = 0.85
-
     # TTS Output Channel 모드 — "mock" (기본, 테스트/유닛) | "twilio" (프로덕션 WebSocket)
     tts_channel_mode: str = "mock"
 

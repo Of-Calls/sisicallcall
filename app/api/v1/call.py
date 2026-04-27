@@ -360,8 +360,6 @@ async def call_websocket(
                                 "normalized_text": "",
                                 "query_embedding": [],
                                 "cache_hit": False,
-                                "knn_intent": None,
-                                "knn_confidence": 0.0,
                                 "primary_intent": None,
                                 "secondary_intents": [],
                                 "routing_reason": None,
