@@ -6,6 +6,7 @@ Action Planner 는 rule-based 이므로 state 를 직접 구성하여 단위 테
 """
 from __future__ import annotations
 
+import sys
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
@@ -264,6 +265,7 @@ async def test_summary_llm_failure_partial_success(agent, monkeypatch):
     result = await agent.run("call-020", trigger="call_ended")
     assert result is not None
     assert result["summary"] is None
+    assert result["partial_success"] is True
     assert any("summary" in e.get("node", "") for e in result["errors"])
 
 
@@ -699,3 +701,192 @@ async def test_planner_tool_mapping_is_valid():
     for action in result["action_plan"]["actions"]:
         assert action["tool"] in allowed_tools, f"허용되지 않은 tool: {action['tool']}"
         assert action["status"] == "pending"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 요구사항 2: empty transcript 처리
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.asyncio
+async def test_empty_transcript_completes(agent, monkeypatch):
+    """transcripts 가 비어 있어도 agent.run() 이 끝까지 완료된다."""
+    import app.agents.post_call.nodes.load_context_node as lcn
+
+    mock_repo = MagicMock()
+    mock_repo.get_call_context = AsyncMock(return_value={
+        "metadata": {"call_id": "empty-001"},
+        "transcripts": [],
+        "branch_stats": {},
+    })
+    monkeypatch.setattr(lcn, "_repo", mock_repo)
+
+    result = await agent.run("empty-001", trigger="call_ended")
+
+    assert result is not None
+    assert result["partial_success"] is True
+    assert any(
+        e.get("warning") == "empty_transcript" or "empty" in e.get("error", "").lower()
+        for e in result["errors"]
+    ), f"empty_transcript 에러 없음: {result['errors']}"
+
+
+@pytest.mark.asyncio
+async def test_empty_transcript_escalation_completes(agent, monkeypatch):
+    """escalation_immediate + 빈 녹취도 끝까지 완료된다."""
+    import app.agents.post_call.nodes.load_context_node as lcn
+
+    mock_repo = MagicMock()
+    mock_repo.get_call_context = AsyncMock(return_value={
+        "metadata": {"call_id": "empty-002"},
+        "transcripts": [],
+        "branch_stats": {},
+    })
+    monkeypatch.setattr(lcn, "_repo", mock_repo)
+
+    result = await agent.run("empty-002", trigger="escalation_immediate")
+
+    assert result is not None
+    assert result["partial_success"] is True
+    assert result["voc_analysis"] is None
+    assert result["action_plan"] is None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 요구사항 3: LLM 실패 처리
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.asyncio
+async def test_priority_llm_failure_partial_success(agent, monkeypatch):
+    """priority_node LLM 실패 시 save_result 까지 도달하고 partial_success=True."""
+    import app.agents.post_call.nodes.priority_node as pm
+    failing = MagicMock()
+    failing.call_json = AsyncMock(side_effect=RuntimeError("Priority LLM 오류"))
+    monkeypatch.setattr(pm, "_caller", failing)
+
+    result = await agent.run("call-022", trigger="call_ended")
+
+    assert result is not None
+    assert result["priority_result"] is None
+    assert result["partial_success"] is True
+    assert any("priority" in e.get("node", "") for e in result["errors"])
+    assert result["dashboard_payload"] is not None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 요구사항 5: action_router 안전 처리
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.asyncio
+async def test_action_router_none_plan_safe():
+    """action_plan=None 이어도 action_router 는 executed_actions=[] 를 반환하고 예외를 던지지 않는다."""
+    from app.agents.post_call.nodes.action_router_node import action_router_node
+
+    state = _make_planner_state(call_id="router-001")
+    state["action_plan"] = None
+    state["errors"] = [{"node": "action_planner", "error": "플래너 실패 시뮬레이션"}]
+
+    result = await action_router_node(state)
+
+    assert isinstance(result, dict)
+    assert result.get("executed_actions") == []
+    # partial_success 를 강제로 True 로 바꾸지 않는다 (save_result 가 권위 있는 setter)
+    assert "partial_success" not in result
+
+
+@pytest.mark.asyncio
+async def test_action_router_empty_actions_safe():
+    """action_plan.actions=[] 이어도 action_router 는 정상 동작한다."""
+    from app.agents.post_call.nodes.action_router_node import action_router_node
+
+    state = _make_planner_state(call_id="router-002")
+    state["action_plan"] = {"action_required": False, "actions": [], "rationale": "no action"}
+
+    result = await action_router_node(state)
+
+    assert result.get("executed_actions") == []
+    assert "partial_success" not in result
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 요구사항 4: dashboard_payload.partial_success 일관성
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.asyncio
+async def test_dashboard_partial_success_consistent_clean(agent):
+    """정상 실행 시 dashboard_payload.partial_success 와 result.partial_success 가 일치한다."""
+    result = await agent.run("consist-001", trigger="call_ended")
+
+    assert result["dashboard_payload"] is not None
+    assert result["dashboard_payload"]["partial_success"] == result["partial_success"]
+
+
+@pytest.mark.asyncio
+async def test_dashboard_partial_success_consistent_failure(agent, monkeypatch):
+    """LLM 실패 시에도 dashboard_payload.partial_success 와 result.partial_success 가 일치한다."""
+    import app.agents.post_call.nodes.voc_analysis_node as vm
+    failing = MagicMock()
+    failing.call_json = AsyncMock(side_effect=RuntimeError("일관성 테스트용 VOC 오류"))
+    monkeypatch.setattr(vm, "_caller", failing)
+
+    result = await agent.run("consist-002", trigger="call_ended")
+
+    assert result["dashboard_payload"]["partial_success"] == result["partial_success"]
+    assert result["partial_success"] is True
+
+
+@pytest.mark.asyncio
+async def test_dashboard_payload_contains_all_keys(agent):
+    """dashboard_payload 에 summary, voc_analysis, priority_result, action_plan,
+    executed_actions, errors 가 모두 포함되어야 한다."""
+    result = await agent.run("payload-001", trigger="call_ended")
+    payload = result["dashboard_payload"]
+    assert payload is not None
+    for key in ("summary", "voc_analysis", "priority_result", "action_plan",
+                "executed_actions", "errors", "partial_success"):
+        assert key in payload, f"dashboard_payload 에 {key!r} 없음"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 요구사항 6: scripts/run_post_call_agent.py Mock 실행
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def test_run_post_call_script_mock():
+    """scripts/run_post_call_agent.py 가 Mock LLM 으로 정상 종료된다 (returncode=0)."""
+    import subprocess
+    import os
+    from pathlib import Path
+
+    project_root = Path(__file__).parent.parent
+    env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+    result = subprocess.run(
+        [sys.executable, "scripts/run_post_call_agent.py", "--trigger", "call_ended"],
+        capture_output=True,
+        timeout=30,
+        cwd=str(project_root),
+        env=env,
+    )
+    assert result.returncode == 0, (
+        f"스크립트 실행 실패 (returncode={result.returncode})\n"
+        f"stderr: {result.stderr.decode('utf-8', errors='replace')}"
+    )
+
+
+def test_run_post_call_script_escalation_mock():
+    """--trigger escalation_immediate 도 정상 종료된다."""
+    import subprocess
+    import os
+    from pathlib import Path
+
+    project_root = Path(__file__).parent.parent
+    env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+    result = subprocess.run(
+        [sys.executable, "scripts/run_post_call_agent.py", "--trigger", "escalation_immediate"],
+        capture_output=True,
+        timeout=30,
+        cwd=str(project_root),
+        env=env,
+    )
+    assert result.returncode == 0, (
+        f"escalation_immediate 스크립트 실패\n"
+        f"stderr: {result.stderr.decode('utf-8', errors='replace')}"
+    )

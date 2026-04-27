@@ -10,12 +10,20 @@ _executor = ActionExecutor()
 async def action_router_node(state: PostCallAgentState) -> dict:
     call_id = state["call_id"]
     plan = state.get("action_plan")  # type: ignore[call-overload]
+
+    # action_plan 없음 — action_planner 실패 등 upstream 오류 상황. errors는 이미 기록됨.
     if not plan:
-        logger.warning("action_router: action_plan 없음 call_id=%s — 건너뜀", call_id)
-        return {"executed_actions": [], "partial_success": True}
+        logger.info("action_router: action_plan 없음 call_id=%s — 건너뜀", call_id)
+        return {"executed_actions": []}
+
+    # actions 빈 목록 — Rule 1 early exit 등 정상 경로
+    actions: list = (plan.get("actions") or []) if isinstance(plan, dict) else []
+    if not actions:
+        logger.info("action_router: actions 빈 목록 call_id=%s — 건너뜀", call_id)
+        return {"executed_actions": []}
 
     try:
-        executed = await _executor.execute_all(plan["actions"], call_id=call_id)
+        executed = await _executor.execute_all(actions, call_id=call_id)
         failed = [a for a in executed if a.get("status") == "failed"]
         logger.info(
             "action_router 완료 call_id=%s executed=%d failed=%d",

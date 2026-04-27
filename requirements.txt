@@ -1,4 +1,4 @@
-# Web Framework
+﻿# Web Framework
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
 websockets==13.1
@@ -77,3 +77,6 @@ python-multipart==0.0.12
 
 # PDF Processing — pymupdf4llm: PDF → 마크다운 추출 (헤더/표 구조 보존)
 pymupdf4llm
+
+# post-call Agent
+typing_extensions

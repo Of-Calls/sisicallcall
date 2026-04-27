@@ -45,6 +45,10 @@ ngrok.yml
 .code-review-graph/
 .claude/
 CLAUDE.md
+.cursorrules
+.windsurfrules
+AGENTS.md
+GEMINI.md
 
 # docs
 docs/
@@ -63,3 +67,4 @@ scripts/
 # TTS 음성 파일 (팀원 개인 목소리 reference + 테스트 출력 wav)
 # 개인정보 포함 + 바이너리 대용량 파일 → 절대 커밋 금지
 voice/
+
