@@ -80,3 +80,8 @@ class CallState(TypedDict):
     # faq_branch_node 가 LLM 분기 (1회: 모른다+재질문, 2+회: 카테고리 안내) 에 사용.
     # response_path != "faq" 인 turn 은 0 으로 reset.
     rag_miss_count: NotRequired[int]
+
+    # tenant 가용 RAG 카테고리 (자연어, LLM 정제) — call.py 가 start 이벤트에서 Redis 조회 후
+    # 매 turn state 에 주입. faq_branch_node 의 LLM 이 rag_miss_count >= 2 일 때 안내 멘트 생성.
+    # 빈 list 면 LLM 이 일반 옵션 ("위치, 진료시간, 예약 등") 으로 fallback.
+    available_categories: NotRequired[list[str]]

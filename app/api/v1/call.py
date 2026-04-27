@@ -296,6 +296,8 @@ async def call_websocket(
                 tenant_name = await get_tenant_name(tenant_id)
                 session_view["tenant_name"] = tenant_name
                 session_view["is_within_hours"] = within_hours
+                # tenant 가용 RAG 카테고리 1회 fetch — faq_branch_node 가 rag_miss>=2 시 안내 사용
+                session_view["rag_categories"] = await _session_service.get_rag_categories(tenant_id)
 
                 # Greeting 송신은 백그라운드 task — 메인 루프가 즉시 inbound 처리 시작 (greeting barge-in 가능)
                 asyncio.create_task(
@@ -381,6 +383,8 @@ async def call_websocket(
                                 interrupted_response_text = ""
                             # FAQ RAG miss 누적 카운터 주입 (faq_branch_node 가 LLM 분기에 사용)
                             state["rag_miss_count"] = session_view.get("rag_miss_count", 0)
+                            # tenant 가용 카테고리 주입 — Redis 에서 미리 fetch (start 이벤트)
+                            state["available_categories"] = session_view.get("rag_categories", [])
 
                             # 이전 turn task 가 아직 살아있으면 정리 (정상 흐름에선 거의 없음)
                             await _cancel_turn_task()

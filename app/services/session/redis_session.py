@@ -76,6 +76,32 @@ class RedisSessionService:
         except (ValueError, TypeError):
             return 0
 
+    async def get_rag_categories(self, tenant_id: str) -> list[str]:
+        """tenant 가용 RAG 카테고리 자연어 list 반환.
+
+        Redis 키: tenant:{tenant_id_no_hyphens}:rag_categories — JSON array str.
+        pdf_processor 가 PDF 처리 후 LLM 정제 결과를 write. 부재/에러 시 빈 list.
+        faq_branch_node 가 rag_miss_count >= 2 일 때 안내 멘트 생성에 사용.
+        """
+        import json
+        key = self._tenant_key(tenant_id, "rag_categories")
+        try:
+            value = await self._redis.get(key)
+        except Exception as e:
+            logger.error("redis rag_categories lookup failed tenant=%s: %s", tenant_id, e)
+            return []
+
+        if not value:
+            return []
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, list):
+                return [str(c) for c in parsed if c]
+            return []
+        except Exception as e:
+            logger.error("rag_categories parse error tenant=%s value=%s: %s", tenant_id, value, e)
+            return []
+
     # RFC 001 v0.2 §6.5 — run_turn 진입 시 pre-load 되어 CallState["stall_messages"] 에 주입됨
     _DEFAULT_STALL_MESSAGES = {"general": "잠시만요, 확인해 드리겠습니다."}
 
