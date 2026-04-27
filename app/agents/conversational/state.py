@@ -75,3 +75,8 @@ class CallState(TypedDict):
     # is_bargein=True 면 interrupted_response_text 에 끊긴 응답 원문이 보존됨.
     is_bargein: NotRequired[bool]
     interrupted_response_text: NotRequired[str]
+
+    # FAQ RAG miss 누적 횟수 — call.py 가 turn 간 누적 후 state 주입.
+    # faq_branch_node 가 LLM 분기 (1회: 모른다+재질문, 2+회: 카테고리 안내) 에 사용.
+    # response_path != "faq" 인 turn 은 0 으로 reset.
+    rag_miss_count: NotRequired[int]

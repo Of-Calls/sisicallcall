@@ -127,6 +127,7 @@ async def call_websocket(
         "last_question": None,
         "last_assistant_text": None,
         "clarify_count": 0,
+        "rag_miss_count": 0,  # FAQ RAG miss 누적 — faq_branch_node 가 분기에 사용
     }
 
     # Barge-in 상태 — 메인 루프 + _run_turn 공유
@@ -177,6 +178,12 @@ async def call_websocket(
             session_view["clarify_count"] += 1
         else:
             session_view["clarify_count"] = 0
+
+        # FAQ RAG miss 누적 — response_path=="faq" 인 turn 만 누적, 다른 path 는 reset
+        if _result.get("response_path") == "faq":
+            session_view["rag_miss_count"] = _result.get("rag_miss_count", 0)
+        else:
+            session_view["rag_miss_count"] = 0
 
     async def _cancel_turn_task() -> None:
         """진행 중 turn task 가 있으면 cancel + 정리."""
@@ -372,6 +379,8 @@ async def call_websocket(
                                 state["is_bargein"] = True
                                 state["interrupted_response_text"] = interrupted_response_text
                                 interrupted_response_text = ""
+                            # FAQ RAG miss 누적 카운터 주입 (faq_branch_node 가 LLM 분기에 사용)
+                            state["rag_miss_count"] = session_view.get("rag_miss_count", 0)
 
                             # 이전 turn task 가 아직 살아있으면 정리 (정상 흐름에선 거의 없음)
                             await _cancel_turn_task()

@@ -21,27 +21,39 @@ RAG_TOP_K = 3
 FAQ_SYSTEM_PROMPT = """당신은 전화 고객센터의 FAQ 응답 AI입니다. 사용자는 음성으로 답변을 듣습니다.
 반드시 아래 규칙을 지키세요.
 1) 제공된 '참고 자료' 범위 안에서만 답변합니다.
-2) **참고 자료에 답이 없을 때 절대 첫 시도부터 "담당자에게 연결" 이라고 답하지 마세요.**
-   대신 사용자에게 좀 더 구체적으로 되묻거나 가능한 옵션을 제시해 대화를 이어가세요.
-   예시:
-     - "어떤 진료과를 찾으시나요?"
-     - "예약 변경/취소/조회 중 어떤 작업이 필요하신가요?"
-     - "주차/응급실/운영시간 중 어떤 정보가 궁금하신가요?"
-   참고 자료가 부족할수록 더 좁고 구체적인 후속 질문을 만드세요.
+2) **참고 자료에 답이 없을 때 (RAG miss) 절대 첫 시도부터 "담당자에게 연결" 이라고 답하지 마세요.**
+   입력에 'rag_miss_count' 가 포함되어 있고 참고 자료가 부족할 때:
+     - rag_miss_count == 1 (첫 시도): "제가 그 부분은 잘 모르겠습니다. 어떤 부분이 궁금하신가요?" 같이
+       모른다는 사실 + 짧은 재질문 한 문장으로만 응답하세요. 정보를 만들지 마세요.
+     - rag_miss_count >= 2 (반복): "제가 안내드릴 수 있는 분야는 {available_categories} 입니다. 어떤 정보가 필요하신가요?"
+       형태로 입력의 'available_categories' 를 그대로 자연스럽게 안내하세요.
+       만약 available_categories 가 비어 있으면 일반적인 옵션 ("위치, 진료시간, 예약 등") 으로 안내하세요.
 3) **★최우선: 응답은 반드시 100자 이내, 1~2문장으로 끝낸다. 100자가 넘으면 안 된다.**
 4) 표/목록을 풀어서 길게 나열하지 말고, 핵심만 한 문장으로 요약한다.
    (예: "평일 09:00~17:30, 토요일 09:00~12:00 운영됩니다." — 점심시간/예외사항은 묻지 않으면 생략)
 5) 한국어 존댓말로 자연스럽게 답한다.
 6) 참고 자료에 없는 정보를 추측하거나 생성하지 않는다.
-7) RAG miss (참고 자료 없음) 시 응답은 1~2문장의 후속 질문으로 끝낸다. 정보를 만들지 않는다."""
+7) RAG miss 응답은 1~2문장의 후속 질문으로 끝낸다. 정보를 만들지 않는다."""
 
 
-def _compose_user_message(normalized_text: str, rag_results: list[str]) -> str:
+def _compose_user_message(
+    normalized_text: str,
+    rag_results: list[str],
+    rag_miss_count: int = 0,
+    available_categories: list[str] | None = None,
+) -> str:
     if rag_results:
         joined = "\n\n".join(f"[{i + 1}] {chunk}" for i, chunk in enumerate(rag_results))
     else:
         joined = "(참고 자료 없음)"
-    return f"참고 자료:\n{joined}\n\n고객 질문: {normalized_text}"
+    cats = available_categories or []
+    cats_line = ", ".join(cats) if cats else "(없음)"
+    return (
+        f"참고 자료:\n{joined}\n\n"
+        f"rag_miss_count: {rag_miss_count}\n"
+        f"available_categories: {cats_line}\n\n"
+        f"고객 질문: {normalized_text}"
+    )
 
 
 def _pick_stall_msg(state: CallState) -> str:
@@ -53,6 +65,7 @@ def _pick_stall_msg(state: CallState) -> str:
 async def faq_branch_node(state: CallState) -> dict:
     call_id = state["call_id"]
     query_embedding = state.get("query_embedding") or []
+    prev_miss_count = state.get("rag_miss_count", 0)
 
     # RAG 검색 — 임베딩 없으면 스킵 (cache_node 에서 실패한 경우)
     rag_results: list[str] = []
@@ -66,7 +79,17 @@ async def faq_branch_node(state: CallState) -> dict:
         except Exception as e:
             logger.error("rag search failed call_id=%s: %s", call_id, e)
 
-    user_message = _compose_user_message(state["normalized_text"], rag_results)
+    # LLM 분기 입력용 — RAG hit 이면 0, miss 면 prev + 1.
+    # 첫 RAG miss 면 1 (모른다 + 재질문), 2+ 이면 카테고리 안내.
+    incoming_miss_count = prev_miss_count + 1 if not rag_results else 0
+    # available_categories: Commit 2 에서 call.py 가 Redis 조회 후 주입. 없으면 빈 list.
+    available_categories = state.get("available_categories") or []  # type: ignore[typeddict-item]
+    user_message = _compose_user_message(
+        state["normalized_text"],
+        rag_results,
+        rag_miss_count=incoming_miss_count,
+        available_categories=available_categories,
+    )
 
     # LLM 호출 + stall trigger race — RFC 001 v0.2 §6.5
     # max_tokens=150 — 100자 응답 + 안전 마진 (한국어 1자 ≈ 1~2 토큰)
@@ -93,6 +116,8 @@ async def faq_branch_node(state: CallState) -> dict:
 
     # fallback 판정 — Semantic Cache 저장 차단 신호 (cache_store_node 가 검사)
     is_fallback = (not rag_results) or (response_text == FALLBACK_MESSAGE)
+    # 다음 turn 으로 넘길 누적 카운터 — RAG miss 이거나 fallback 응답이면 +1, 정상이면 reset
+    new_miss_count = prev_miss_count + 1 if is_fallback else 0
 
     return {
         "rag_results": rag_results,
@@ -100,4 +125,5 @@ async def faq_branch_node(state: CallState) -> dict:
         "response_path": "faq",
         "is_timeout": is_timeout,
         "is_fallback": is_fallback,
+        "rag_miss_count": new_miss_count,
     }
