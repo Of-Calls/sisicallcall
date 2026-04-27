@@ -76,6 +76,23 @@ class RedisSessionService:
         except (ValueError, TypeError):
             return 0
 
+    async def set_rag_categories(self, tenant_id: str, categories: list[str]) -> None:
+        """tenant 가용 RAG 카테고리 자연어 list 저장.
+
+        pdf_processor 가 PDF 처리 후 LLM 정제 결과를 write. JSON array str 로 저장.
+        TTL 없음 — PDF 재처리 시 덮어씀, tenant 삭제 시 별도 cleanup.
+        """
+        import json
+        key = self._tenant_key(tenant_id, "rag_categories")
+        try:
+            await self._redis.set(key, json.dumps(categories, ensure_ascii=False))
+            logger.info(
+                "rag_categories saved tenant=%s count=%d",
+                tenant_id, len(categories),
+            )
+        except Exception as e:
+            logger.error("redis rag_categories save failed tenant=%s: %s", tenant_id, e)
+
     async def get_rag_categories(self, tenant_id: str) -> list[str]:
         """tenant 가용 RAG 카테고리 자연어 list 반환.
 
