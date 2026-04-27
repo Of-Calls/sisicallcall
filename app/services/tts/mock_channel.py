@@ -56,6 +56,8 @@ class MockTTSOutputChannel(BaseTTSOutputChannel):
             logger.debug("stall already emitted for call_id=%s — skip", call_id)
             return
         self._stall_emitted[call_id] = True
+        # 통화 흐름 추적용 — 운영(twilio) 환경과 동일한 형식
+        logger.info("push_stall call_id=%s field=%s text=%r", call_id, audio_field, text[:200])
         self._emissions[call_id].append({
             "type": "stall",
             "call_id": call_id,
@@ -69,6 +71,8 @@ class MockTTSOutputChannel(BaseTTSOutputChannel):
             return
         # 송신 시뮬레이션 없음 — current_text 만 갱신해 barge-in 컨텍스트 노출.
         self._current_text[call_id] = text
+        # 통화 흐름 추적용 — 운영(twilio) 환경과 동일한 형식
+        logger.info("push_response call_id=%s path=%s text=%r", call_id, response_path, text[:200])
         self._emissions[call_id].append({
             "type": "response",
             "call_id": call_id,

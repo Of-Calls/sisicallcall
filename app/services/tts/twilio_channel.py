@@ -95,6 +95,8 @@ class TwilioTTSOutputChannel(BaseTTSOutputChannel):
             logger.debug("stall already emitted for call_id=%s — skip", call_id)
             return
         self._stall_emitted[call_id] = True
+        # 통화 흐름 추적용 — 200자 절단 (장문 stall 방어)
+        logger.info("push_stall call_id=%s field=%s text=%r", call_id, audio_field, text[:200])
         await self._synthesize_and_send(call_id, text, tag=f"stall:{audio_field}")
 
     async def push_response(self, call_id: str, text: str, response_path: str) -> None:
@@ -104,6 +106,8 @@ class TwilioTTSOutputChannel(BaseTTSOutputChannel):
         if not text:
             logger.debug("empty response text call_id=%s — skip", call_id)
             return
+        # 통화 흐름 추적용 — STT(사용자) → intent → push_response(AI) → emit 흐름 한 줄로
+        logger.info("push_response call_id=%s path=%s text=%r", call_id, response_path, text[:200])
         await self._synthesize_and_send(call_id, text, tag=f"response:{response_path}")
 
     async def cancel(self, call_id: str) -> None:
