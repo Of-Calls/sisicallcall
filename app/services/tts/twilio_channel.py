@@ -25,11 +25,6 @@ logger = get_logger(__name__)
 # Twilio Media Stream chunk 권장 크기: 160 bytes per 20ms at μ-law 8kHz
 _TWILIO_CHUNK_BYTES = 160
 
-# 송신 종료 후 Twilio jitter buffer 가 마지막 ~100ms 를 마저 재생하는 동안에도
-# is_speaking()=True 를 유지해 barge-in 게이트를 활성화. 너무 짧으면 막바지 echo 가
-# barge-in false-positive, 너무 길면 진짜 사용자 발화가 차단됨.
-_PLAY_TAIL_MARGIN_SEC = 0.15
-
 
 @dataclass
 class _CallBinding:
@@ -153,7 +148,7 @@ class TwilioTTSOutputChannel(BaseTTSOutputChannel):
         if binding.play_started_at == 0.0:
             return False
         elapsed = time.monotonic() - binding.play_started_at
-        return elapsed < (binding.play_duration_sec + _PLAY_TAIL_MARGIN_SEC)
+        return elapsed < (binding.play_duration_sec + settings.tts_play_tail_margin_sec)
 
     def current_text(self, call_id: str) -> str:
         binding = self._bindings.get(call_id)
@@ -198,13 +193,25 @@ class TwilioTTSOutputChannel(BaseTTSOutputChannel):
             binding.play_duration_sec = len(audio) / 8000
 
             # 160 byte (20ms) 청크로 쪼개 순차 송신 — 매 청크마다 cancel 체크
+            # Throttle (settings.tts_throttle_enabled): preroll 이후 청크부터 재생 속도(20ms)
+            # 만큼 sleep 삽입 → Twilio buffer 항상 얇음 → cancel 즉시 효과.
+            # asyncio.wait_for(cancel_event.wait()) 패턴으로 sleep 도중 cancel 도 즉시 깨움.
             total_chunks = max(len(audio) // _TWILIO_CHUNK_BYTES, 1)
+            preroll = settings.tts_preroll_chunks
+            interval = settings.tts_chunk_interval_sec
+            throttle_on = settings.tts_throttle_enabled
+            bytes_sent = 0
             async with binding.lock:
                 for i in range(0, len(audio), _TWILIO_CHUNK_BYTES):
+                    idx = i // _TWILIO_CHUNK_BYTES
                     if binding.cancel_event.is_set():
+                        # 잔여 재생 시간 단축 — currently-playing 청크가 곧 끝나 is_speaking 도 곧 False
+                        binding.play_duration_sec = bytes_sent / 8000
                         logger.info(
-                            "tts send interrupted (barge-in) call_id=%s tag=%s at chunk=%d/%d",
-                            call_id, tag, i // _TWILIO_CHUNK_BYTES, total_chunks,
+                            "tts send interrupted (barge-in) call_id=%s tag=%s at chunk=%d/%d "
+                            "played_sec=%.2f bytes_sent=%d total_bytes=%d",
+                            call_id, tag, idx, total_chunks,
+                            bytes_sent / 8000, bytes_sent, len(audio),
                         )
                         return
                     chunk = audio[i : i + _TWILIO_CHUNK_BYTES]
@@ -216,12 +223,26 @@ class TwilioTTSOutputChannel(BaseTTSOutputChannel):
                     })
                     try:
                         await binding.websocket.send_text(msg)
+                        bytes_sent += len(chunk)
                     except Exception as e:
                         logger.error(
                             "twilio send failed call_id=%s tag=%s chunk=%d: %s",
-                            call_id, tag, i // _TWILIO_CHUNK_BYTES, e,
+                            call_id, tag, idx, e,
                         )
                         return
+                    # Throttle: preroll 채운 후, 마지막 청크 전까지만 sleep
+                    if (
+                        throttle_on
+                        and idx >= preroll - 1
+                        and i + _TWILIO_CHUNK_BYTES < len(audio)
+                    ):
+                        try:
+                            await asyncio.wait_for(
+                                binding.cancel_event.wait(), timeout=interval,
+                            )
+                            # cancel 가 sleep 도중 set → 다음 iteration 의 cancel 분기에서 break
+                        except asyncio.TimeoutError:
+                            pass  # 정상 throttle
         finally:
             binding.is_speaking = False
             binding.current_text = ""
