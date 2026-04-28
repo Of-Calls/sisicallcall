@@ -1,7 +1,7 @@
 """
 TenantIntegration 모델 + TenantIntegrationRepository 테스트.
 
-검증 범위:
+검증 범위 (in-memory):
   1.  TenantIntegration 기본 생성 (필수 필드, 기본값)
   2.  upsert_integration → get_integration 왕복
   3.  동일 tenant+provider 재등록 시 덮어쓰기 (upsert)
@@ -12,12 +12,24 @@ TenantIntegration 모델 + TenantIntegrationRepository 테스트.
   8.  update_tokens — 없는 tenant 시 False 반환
   9.  clear_integrations — 전체 삭제
   10. IntegrationStatus enum 값 검증
+
+검증 범위 (file mode):
+  11. file mode upsert 후 새 repo 인스턴스에서 get 가능 (재시작 시뮬레이션)
+  12. file mode mark_disconnected 후 파일에 반영
+  13. file mode clear_integrations 가 파일도 비움
+  14. 암호화된 token만 파일에 저장 — 평문 없음
 """
 from __future__ import annotations
 
-import pytest
+import json
+import tempfile
 from datetime import datetime, timedelta
+from pathlib import Path
 
+import pytest
+
+
+# ── in-memory fixture ─────────────────────────────────────────────────────────
 
 @pytest.fixture(autouse=True)
 def _clear_repo():
@@ -196,3 +208,111 @@ def test_integration_status_enum_values():
     assert IntegrationStatus.disconnected == "disconnected"
     assert IntegrationStatus.expired == "expired"
     assert IntegrationStatus.error == "error"
+
+
+# ── file mode fixture ─────────────────────────────────────────────────────────
+
+@pytest.fixture()
+def file_repo(tmp_path, monkeypatch):
+    """격리된 임시 파일 경로를 사용하는 file mode repo."""
+    file = tmp_path / "tenant_integrations.json"
+    monkeypatch.setenv("TENANT_INTEGRATION_STORAGE", "file")
+    monkeypatch.setenv("TENANT_INTEGRATION_FILE_PATH", str(file))
+
+    from app.repositories.tenant_integration_repo import TenantIntegrationRepository
+    repo = TenantIntegrationRepository(storage="file")
+    # _file_path()가 env를 읽으므로 monkeypatch가 먼저 적용되어야 함
+    yield repo, file
+
+
+# ── 11. file mode 재시작 시뮬레이션 ─────────────────────────────────────────
+
+def test_file_mode_survives_repo_restart(file_repo, monkeypatch):
+    from app.models.tenant_integration import TenantIntegration, IntegrationStatus
+    from app.repositories.tenant_integration_repo import TenantIntegrationRepository
+
+    repo1, file = file_repo
+
+    repo1.upsert_integration(TenantIntegration(
+        tenant_id="restart-tenant",
+        provider="google_gmail",
+        status=IntegrationStatus.connected,
+        access_token_encrypted="fernet-enc-abc123",
+        external_account_email="user@company.com",
+    ))
+
+    # 새 인스턴스 = 서버 재시작 시뮬레이션
+    repo2 = TenantIntegrationRepository(storage="file")
+    result = repo2.get_integration("restart-tenant", "google_gmail")
+
+    assert result is not None
+    assert result.status == IntegrationStatus.connected
+    assert result.access_token_encrypted == "fernet-enc-abc123"
+    assert result.external_account_email == "user@company.com"
+
+
+# ── 12. file mode mark_disconnected → 파일 반영 ──────────────────────────────
+
+def test_file_mode_disconnect_reflected_in_file(file_repo, monkeypatch):
+    from app.models.tenant_integration import TenantIntegration, IntegrationStatus
+    from app.repositories.tenant_integration_repo import TenantIntegrationRepository
+
+    repo, file = file_repo
+
+    repo.upsert_integration(TenantIntegration(
+        tenant_id="disc-tenant", provider="slack",
+        access_token_encrypted="enc-slack",
+    ))
+    repo.mark_disconnected("disc-tenant", "slack")
+
+    # 파일에서 직접 읽어 확인
+    raw = json.loads(file.read_text(encoding="utf-8"))
+    key = "disc-tenant::slack"
+    assert key in raw
+    assert raw[key]["status"] == "disconnected"
+
+    # 새 인스턴스로 읽어도 disconnected
+    repo2 = TenantIntegrationRepository(storage="file")
+    result = repo2.get_integration("disc-tenant", "slack")
+    assert result is not None
+    assert result.status == IntegrationStatus.disconnected
+
+
+# ── 13. file mode clear_integrations → 파일도 비움 ──────────────────────────
+
+def test_file_mode_clear_empties_file(file_repo):
+    from app.models.tenant_integration import TenantIntegration
+
+    repo, file = file_repo
+
+    repo.upsert_integration(TenantIntegration(tenant_id="c1", provider="jira"))
+    repo.upsert_integration(TenantIntegration(tenant_id="c2", provider="slack"))
+    repo.clear_integrations()
+
+    assert repo.list_integrations("c1") == []
+    raw = json.loads(file.read_text(encoding="utf-8"))
+    assert raw == {}
+
+
+# ── 14. 암호화된 token만 파일에 저장 — 평문 없음 ─────────────────────────────
+
+def test_file_mode_stores_only_encrypted_tokens(file_repo):
+    from app.models.tenant_integration import TenantIntegration
+
+    repo, file = file_repo
+
+    plaintext_token = "ya29.this_is_plaintext_do_not_store"
+    encrypted_token = "gAAAAABfernet_encrypted_value_here_xyz"  # 실제 Fernet 값처럼 생긴 더미
+
+    repo.upsert_integration(TenantIntegration(
+        tenant_id="secure-tenant",
+        provider="google_gmail",
+        access_token_encrypted=encrypted_token,
+    ))
+
+    file_content = file.read_text(encoding="utf-8")
+
+    # 평문이 파일에 없음
+    assert plaintext_token not in file_content
+    # 암호화된 값은 파일에 있음
+    assert encrypted_token in file_content
