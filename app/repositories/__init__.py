@@ -1,3 +1,10 @@
+from app.repositories.call_repo import (
+    insert_call,
+    finalize_call,
+)
+from app.repositories.transcript_repo import (
+    insert_transcript,
+)
 from app.repositories.call_summary_repo import (
     CallSummaryRepository,
     save_summary,
@@ -33,6 +40,11 @@ __all__ = [
     "VOCAnalysisRepository",
     "MCPActionLogRepository",
     "DashboardRepository",
+    # call (calls 테이블 — 통화 메타)
+    "insert_call",
+    "finalize_call",
+    # transcript (transcripts 테이블 — 발화 단위)
+    "insert_transcript",
     # call_summary
     "save_summary",
     "get_summary_by_call_id",

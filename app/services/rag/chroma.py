@@ -32,6 +32,40 @@ class ChromaRAGService(BaseRAGService):
 
         return await loop.run_in_executor(None, _query)
 
+    async def search_with_meta(
+        self, query_embedding: list[float], tenant_id: str, top_k: int = 3
+    ) -> list[dict]:
+        """벡터 검색 + id/distance/metadata 동봉 반환 — 진단/로깅용."""
+        import asyncio
+
+        loop = asyncio.get_event_loop()
+
+        def _query():
+            col = self._client.get_or_create_collection(self._collection_name(tenant_id))
+            result = col.query(
+                query_embeddings=[query_embedding],
+                n_results=top_k,
+                include=["documents", "metadatas", "distances"],
+            )
+            docs_outer = result.get("documents") or []
+            if not docs_outer:
+                return []
+            ids = (result.get("ids") or [[]])[0]
+            docs = docs_outer[0] or []
+            metas = (result.get("metadatas") or [[]])[0]
+            dists = (result.get("distances") or [[]])[0]
+            out: list[dict] = []
+            for i, doc in enumerate(docs):
+                out.append({
+                    "id": ids[i] if i < len(ids) else "",
+                    "document": doc,
+                    "distance": dists[i] if i < len(dists) else None,
+                    "metadata": metas[i] if i < len(metas) else {},
+                })
+            return out
+
+        return await loop.run_in_executor(None, _query)
+
     async def upsert(
         self,
         doc_id: str,

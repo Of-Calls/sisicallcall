@@ -10,6 +10,16 @@ class BaseRAGService(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    async def search_with_meta(
+        self, query_embedding: list[float], tenant_id: str, top_k: int = 3
+    ) -> list[dict]:
+        """벡터 검색 + id/distance/metadata 동봉 반환 — 진단/로깅용.
+
+        각 원소: {"id": str, "document": str, "distance": float|None, "metadata": dict}
+        """
+        raise NotImplementedError
+
+    @abstractmethod
     async def upsert(
         self,
         doc_id: str,

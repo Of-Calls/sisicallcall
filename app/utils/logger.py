@@ -3,6 +3,8 @@ import glob
 import logging
 import logging.handlers
 import os
+import re
+import shutil
 import sys
 
 # 크로스플랫폼 ANSI 색상 지원 — Windows cmd/PowerShell 모두에서 색상 출력.
@@ -82,34 +84,54 @@ _root_file_handler_added = False
 _LOG_RETENTION_DAYS = 7
 
 
+_DATE_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
 def _expand_log_path(raw_path: str, started_at: datetime.datetime) -> str:
-    """LOG_FILE 경로에 서버 시작 timestamp 를 끼워 실행 단위 파일명 생성.
+    """LOG_FILE 경로에 날짜 폴더 + 시간 timestamp 를 부착해 실행 단위 파일명 생성.
 
     예시:
-        logs/server.log         → logs/server_20260423_233458.log
-        logs/app                → logs/app_20260423_233458
-        logs/foo/bar.txt        → logs/foo/bar_20260423_233458.txt
+        logs/server.log         → logs/2026-04-28/server_233458.log
+        logs/foo/bar.txt        → logs/foo/2026-04-28/bar_233458.txt
+        logs/app                → logs/2026-04-28/app_233458.log
     """
-    ts = started_at.strftime("%Y%m%d_%H%M%S")
+    date_str = started_at.strftime("%Y-%m-%d")
+    time_str = started_at.strftime("%H%M%S")
     base, ext = os.path.splitext(raw_path)
-    return f"{base}_{ts}{ext or '.log'}"
+    parent_dir, file_base = os.path.split(base)
+    target_dir = os.path.join(parent_dir, date_str) if parent_dir else date_str
+    return os.path.join(target_dir, f"{file_base}_{time_str}{ext or '.log'}")
 
 
 def _cleanup_old_logs(raw_path: str, retention_days: int) -> None:
-    """LOG_FILE 베이스 패턴(`logs/server_*.log`) 중 retention 초과 파일 삭제.
+    """`{LOG_FILE 부모}/{YYYY-MM-DD}` 형태 폴더 중 retention 초과면 통째 삭제.
 
-    같은 prefix(`logs/server_`) + suffix(`.log`) 인 파일만 대상으로 하므로
-    다른 시스템의 로그를 실수로 지우지 않는다.
+    YYYY-MM-DD 패턴인 폴더만 대상이라 다른 시스템 디렉토리를 실수로 지우지 않는다.
+    하위 호환: 옛날 평면 패턴(`logs/server_YYYYMMDD_HHMMSS.log`) 파일도 retention 초과 시 정리.
     """
+    parent_dir = os.path.dirname(raw_path) or "."
+    cutoff = datetime.datetime.now().timestamp() - retention_days * 86400
+
+    if os.path.isdir(parent_dir):
+        for entry in os.listdir(parent_dir):
+            full = os.path.join(parent_dir, entry)
+            # 1) 새 구조 — YYYY-MM-DD 폴더 통째 삭제
+            if _DATE_DIR_RE.match(entry) and os.path.isdir(full):
+                try:
+                    if os.path.getmtime(full) < cutoff:
+                        shutil.rmtree(full, ignore_errors=True)
+                except OSError:
+                    pass
+
+    # 2) 옛 구조 — `{base}_*.{ext}` 평면 파일도 mtime 기반 정리
     base, ext = os.path.splitext(raw_path)
     pattern = f"{base}_*{ext or '.log'}"
-    cutoff = datetime.datetime.now().timestamp() - retention_days * 86400
     for path in glob.glob(pattern):
         try:
             if os.path.getmtime(path) < cutoff:
                 os.remove(path)
         except OSError:
-            pass  # 동시 접근/삭제 race 무시
+            pass
 
 
 def _ensure_root_file_handler() -> None:
@@ -140,15 +162,15 @@ def _ensure_root_file_handler() -> None:
         _root_file_handler_added = True
         return
 
-    # 대상 디렉토리 자동 생성 (예: logs/ 가 없어도 동작)
-    log_dir = os.path.dirname(raw_log_file)
-    if log_dir:
-        os.makedirs(log_dir, exist_ok=True)
-
     started_at = datetime.datetime.now()
     actual_path = _expand_log_path(raw_log_file, started_at)
 
-    # 오래된 로그 정리 (best-effort)
+    # 대상 디렉토리 (날짜 폴더 포함) 자동 생성
+    target_dir = os.path.dirname(actual_path)
+    if target_dir:
+        os.makedirs(target_dir, exist_ok=True)
+
+    # 오래된 로그 정리 (best-effort) — YYYY-MM-DD 폴더 통째 또는 옛 평면 파일
     _cleanup_old_logs(raw_log_file, _LOG_RETENTION_DAYS)
 
     file_handler = logging.FileHandler(actual_path, encoding="utf-8")

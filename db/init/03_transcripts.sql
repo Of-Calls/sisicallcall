@@ -28,3 +28,5 @@ CREATE TABLE IF NOT EXISTS transcripts (
 );
 
 CREATE INDEX IF NOT EXISTS idx_transcripts_call_id ON transcripts(call_id);
+CREATE INDEX IF NOT EXISTS idx_transcripts_call_id_turn ON transcripts(call_id, turn_index);
+-- post_call 이 ORDER BY turn_index 로 SELECT 할 예정 — sort 비용 제거용 복합 인덱스.

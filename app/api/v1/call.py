@@ -16,6 +16,8 @@ from app.api.v1._tenant_helpers import (
     resolve_tenant_id,
 )
 from app.core.events import CALL_ENDED, CALL_STARTED
+from app.repositories.call_repo import finalize_call, insert_call
+from app.repositories.transcript_repo import insert_transcript
 from app.services.session.redis_session import RedisSessionService
 from app.services.speaker_verify.titanet import get_titanet_service
 from app.services.stt.deepgram_streaming import DeepgramStreamingSTTService
@@ -59,6 +61,34 @@ _KO_TTS_CHARS_PER_SEC = 3.0
 _GREETING_PLAY_BUFFER_SEC = 13.0
 _MSG_SILENCE_CHECK = "통화 중이십니까? 불편한 점이 있으시면 말씀해 주세요."
 _MSG_SILENCE_ESCALATION = "전화 연결이 원활하지 않은 것 같습니다. 상담원에게 연결해 드리겠습니다."
+
+# stall ("잠시만요") 발화 트리거 — graph 진입 후 이 시간 안에 응답 emit 안 되면 발화.
+# faq_branch LLM Phase2 (8초) 가 아니라 graph 진입 직후로 이동 (2026-04-28 개정).
+_STALL_DELAY_SEC = 1.5
+_STALL_DEFAULT_TEXT = "잠시만요, 확인해 드리겠습니다."
+
+
+async def _schedule_stall_task(
+    call_id: str,
+    stall_messages: dict,
+    delay: float = _STALL_DELAY_SEC,
+) -> None:
+    """graph 진입 후 delay 초 동안 응답 없으면 stall 발화. _run_turn finally 에서 cancel."""
+    try:
+        await asyncio.sleep(delay)
+    except asyncio.CancelledError:
+        return
+    text = (stall_messages or {}).get("general") or _STALL_DEFAULT_TEXT
+    try:
+        await tts_channel.push_stall(
+            call_id=call_id,
+            text=text,
+            audio_field="general",
+        )
+    except asyncio.CancelledError:
+        return
+    except Exception as exc:  # noqa: BLE001 — best-effort, stall 실패가 통화 흐름 차단 안 함
+        logger.warning("stall scheduler push 실패 call_id=%s: %s", call_id, exc)
 
 
 @router.post("/incoming")
@@ -136,6 +166,11 @@ async def call_websocket(
     # 한 발화당 verify 1회 가드 — utterance_buffer 0.8초 도달 시 verify, 발화 종료 시 reset
     bargein_verify_attempted: bool = False
 
+    # PostgreSQL 영구 기록 — calls.id (UUID, RETURNING 으로 채움). insert 실패 시 None 유지.
+    # transcripts INSERT 는 db_call_id 가 채워졌을 때만 시도.
+    db_call_id: Optional[str] = None
+    call_started_at_monotonic: Optional[float] = None
+
     async def _run_turn(state: CallState, streaming_transcript: str) -> None:
         """그래프 실행 + 결과 후처리. 백그라운드 task 로 메인 루프와 분리.
 
@@ -143,16 +178,28 @@ async def call_websocket(
         session_view dict 를 직접 갱신. asyncio 단일 이벤트 루프이므로 race 없음.
         barge-in 시 cancel 되면 갱신 자체가 일어나지 않아 다음 turn 의
         session_view 가 안전하게 유지된다.
+
+        Stall scheduler: graph 진입 후 _STALL_DELAY_SEC 안에 응답 없으면 "잠시만요"
+        발화. ainvoke 종료(정상/cancel/예외) 시 finally 에서 cancel.
         """
         nonlocal empty_stt_count, silence_alert_count, last_activity_at
+        stall_task: Optional[asyncio.Task] = None
+        if channel_opened:
+            stall_task = asyncio.create_task(
+                _schedule_stall_task(call_id, stall_messages)
+            )
         try:
-            result = await _graph.ainvoke(state)
-        except asyncio.CancelledError:
-            logger.info("call_id=%s turn cancelled (barge-in)", call_id)
-            raise
-        except Exception as e:
-            logger.error("call_id=%s turn 실행 오류: %s", call_id, e)
-            return
+            try:
+                result = await _graph.ainvoke(state)
+            except asyncio.CancelledError:
+                logger.info("call_id=%s turn cancelled (barge-in)", call_id)
+                raise
+            except Exception as e:
+                logger.error("call_id=%s turn 실행 오류: %s", call_id, e)
+                return
+        finally:
+            if stall_task is not None and not stall_task.done():
+                stall_task.cancel()
 
         _result = result if isinstance(result, dict) else {}
         if _result.get("raw_transcript"):
@@ -164,6 +211,30 @@ async def call_websocket(
         _resp_text = _result.get("response_text") or ""
         _play_buffer = len(_resp_text) / _KO_TTS_CHARS_PER_SEC
         last_activity_at = time.monotonic() + _play_buffer
+
+        # PostgreSQL transcripts 영구 기록 — best-effort, 통화 흐름 차단 안 함.
+        # barge-in cancel 시 ainvoke 가 CancelledError 로 빠져 이 블록 자체가 실행 안 됨.
+        if db_call_id:
+            customer_text = _result.get("normalized_text") or streaming_transcript
+            if customer_text:
+                await insert_transcript(
+                    db_call_id=db_call_id,
+                    turn_index=state["turn_index"],
+                    speaker="customer",
+                    text=customer_text,
+                    is_barge_in=bool(state.get("is_bargein")),
+                )
+            if _resp_text:
+                await insert_transcript(
+                    db_call_id=db_call_id,
+                    turn_index=state["turn_index"],
+                    speaker="agent",
+                    text=_resp_text,
+                    response_path=_result.get("response_path"),
+                    reviewer_applied=bool(_result.get("reviewer_applied")),
+                    reviewer_verdict=_result.get("reviewer_verdict"),
+                    is_barge_in=False,
+                )
 
         # 다음 턴의 Intent Router 가 사용할 맥락 누적
         _new_intent = _result.get("primary_intent")
@@ -311,6 +382,15 @@ async def call_websocket(
                 )
                 # greeting 재생 완료 후부터 침묵 타이머 시작
                 last_activity_at = time.monotonic() + _GREETING_PLAY_BUFFER_SEC
+
+                # PostgreSQL calls 영구 기록 — best-effort. 실패 시 db_call_id 는 None
+                # 으로 남고 transcripts INSERT 는 자연스럽게 skip 됨. 통화 흐름은 그대로.
+                db_call_id = await insert_call(
+                    tenant_id=tenant_id,
+                    twilio_call_sid=call_id,
+                    caller_number=None,
+                )
+                call_started_at_monotonic = time.monotonic()
 
             elif event == "media":
                 track = msg["media"].get("track", "inbound")
@@ -460,6 +540,12 @@ async def call_websocket(
                 await _streaming_stt.close(call_id)
                 if channel_opened:
                     await tts_channel.flush(call_id)
+                if db_call_id:
+                    _duration = (
+                        int(time.monotonic() - call_started_at_monotonic)
+                        if call_started_at_monotonic else None
+                    )
+                    await finalize_call(db_call_id, status="completed", duration_sec=_duration)
                 break
 
     except WebSocketDisconnect:
@@ -469,6 +555,12 @@ async def call_websocket(
         await _streaming_stt.close(call_id)
         if channel_opened:
             await tts_channel.flush(call_id)
+        if db_call_id:
+            _duration = (
+                int(time.monotonic() - call_started_at_monotonic)
+                if call_started_at_monotonic else None
+            )
+            await finalize_call(db_call_id, status="abandoned", duration_sec=_duration)
     except Exception as e:
         logger.error(f"call_id={call_id} WebSocket 오류: {e}")
         await _cancel_turn_task()
@@ -476,3 +568,9 @@ async def call_websocket(
         await _streaming_stt.close(call_id)
         if channel_opened:
             await tts_channel.flush(call_id)
+        if db_call_id:
+            _duration = (
+                int(time.monotonic() - call_started_at_monotonic)
+                if call_started_at_monotonic else None
+            )
+            await finalize_call(db_call_id, status="error", duration_sec=_duration)

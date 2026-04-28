@@ -124,10 +124,10 @@ async def get_greeting(tenant_id: str, within_hours: bool) -> str:
         conn = await asyncpg.connect(settings.database_url)
         try:
             row = await conn.fetchrow(
-                "SELECT settings FROM tenants WHERE id = $1::uuid", tenant_id
+                "SELECT settings, name FROM tenants WHERE id = $1::uuid", tenant_id
             )
-            if row and row["settings"]:
-                settings_data = row["settings"]
+            if row:
+                settings_data = row["settings"] or {}
                 if isinstance(settings_data, str):
                     settings_data = _json.loads(settings_data)
                 msg = settings_data.get(field)
@@ -141,6 +141,16 @@ async def get_greeting(tenant_id: str, within_hours: bool) -> str:
                             tenant_id,
                         )
                         return fallback
+                # settings.greeting 미설정 시 tenant.name 으로 동적 인사말 생성
+                tenant_name = row["name"]
+                if tenant_name:
+                    if within_hours:
+                        return f"안녕하세요, {tenant_name}입니다. 무엇을 도와드릴까요?"
+                    return (
+                        f"안녕하세요, {tenant_name}입니다. "
+                        f"현재 상담원 운영 시간이 아니지만 기본적인 문의는 도와드릴 수 있습니다. "
+                        f"무엇을 도와드릴까요?"
+                    )
         finally:
             await conn.close()
     except Exception as e:

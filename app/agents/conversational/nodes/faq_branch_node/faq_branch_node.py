@@ -14,8 +14,31 @@ logger = get_logger(__name__)
 _rag: BaseRAGService = ChromaRAGService()
 _llm: BaseLLMService = GPT4OMiniService()
 
-FAQ_LLM_TIMEOUT_SEC = 3.0
-RAG_TOP_K = 3
+# 2026-04-28: 3.0 → 5.0 상향. 첫 turn LLM 응답이 3초 초과해 hardcut → raw chunk
+# fallback 으로 빠지는 사례 빈발 (165225.log:69, 90). stall scheduler 가 1.5초에
+# "잠시만요" 이미 발화하므로 hardcut 까지 시간을 늘려도 사용자 체감 동일.
+FAQ_LLM_TIMEOUT_SEC = 5.0
+RAG_TOP_K = 8           # ChromaDB 후보 풀 (re-rank 전)
+RAG_RERANK_TOP_N = 3    # hybrid score 정렬 후 LLM 에 전달할 상위 N
+# 2026-04-28: ChromaDB cosine distance 가 이 값 초과인 chunk 는 LLM 입력에서 제외.
+# 변경 이력:
+#   0.85 → opendataloader chunks (평균 898자) 가 너무 길어 BGE-M3 임베딩 dilute,
+#         "메뉴가 뭐가 있어요" 같은 짧은 일반 질문이 chunk_4 (메뉴) distance 0.91~1.04
+#         로 임계값 못 넘는 사례 발생 (195111.log:117, 199, 221).
+#   0.85 → 0.95 — 임계값 완화 + chunk 700자 분할로 distance 자체도 줄어들 것.
+RAG_DISTANCE_THRESHOLD = 0.95
+# Hybrid retrieval: query 와 chunk 의 llm_keywords 가 substring 매칭되면 거리 차감.
+# 매칭 keyword 1개당 -0.05 — 너무 크면 distance 무시, 너무 작으면 효과 미미. 측정 후 조정.
+RAG_KEYWORD_BONUS = 0.05
+
+
+def _hybrid_score(distance: float, query: str, llm_keywords: str) -> tuple[float, list[str]]:
+    """(hybrid_score, matched_keywords) — distance 에서 keyword overlap 만큼 차감."""
+    keywords = [k.strip() for k in (llm_keywords or "").split(",") if k.strip()]
+    if not keywords or not query:
+        return distance, []
+    matched = [kw for kw in keywords if kw in query]
+    return max(distance - RAG_KEYWORD_BONUS * len(matched), 0.0), matched
 
 # TODO(agents.md 이관): 담당자 배정 후 프롬프트를 agents.md 로 이관
 FAQ_SYSTEM_PROMPT = """당신은 전화 고객센터의 FAQ 응답 AI입니다. 사용자는 음성으로 답변을 듣습니다.
@@ -61,6 +84,13 @@ def _compose_user_message(
     )
 
 
+def _short_chunk_id(full_id: str) -> str:
+    """`{document_uuid}_chunk_{n}` → `chunk_{n}` (UUID 생략, 로그용)."""
+    if "_chunk_" in full_id:
+        return "chunk_" + full_id.rsplit("_chunk_", 1)[-1]
+    return full_id[:12]
+
+
 def _pick_stall_msg(state: CallState) -> str:
     """CallState 에서 FAQ 대기 멘트 선택. 없으면 general → 하드코딩 순으로 fallback."""
     msgs = state.get("stall_messages") or {}
@@ -76,11 +106,54 @@ async def faq_branch_node(state: CallState) -> dict:
     rag_results: list[str] = []
     if query_embedding:
         try:
-            rag_results = await _rag.search(
+            rag_meta = await _rag.search_with_meta(
                 query_embedding=query_embedding,
                 tenant_id=state["tenant_id"],
                 top_k=RAG_TOP_K,
             )
+            # Hybrid score: distance 에서 query 와 chunk metadata 의 llm_keywords 매칭만큼 차감.
+            # ChromaDB metadata.llm_keywords 는 chunking 시 LLM 추출 ("메뉴, 한정식, 코스" 같은 string).
+            query_text = state.get("normalized_text", "") or state.get("raw_transcript", "") or ""
+            for r in rag_meta:
+                kws = (r.get("metadata") or {}).get("llm_keywords", "")
+                dist = r.get("distance") if r.get("distance") is not None else 1.0
+                hybrid, matched = _hybrid_score(dist, query_text, kws)
+                r["_hybrid"] = hybrid
+                r["_matched_kw"] = matched
+
+            # hybrid score 오름차순 정렬 → 상위 RAG_RERANK_TOP_N 추출
+            rag_meta.sort(key=lambda r: r.get("_hybrid", 1.0))
+            top_n = rag_meta[:RAG_RERANK_TOP_N]
+
+            # distance threshold 는 원본 distance 기준 filter (hybrid 가 아닌)
+            rag_results = [
+                r["document"] for r in top_n
+                if r.get("document")
+                and (r["distance"] if r.get("distance") is not None else 1.0)
+                <= RAG_DISTANCE_THRESHOLD
+            ]
+
+            if top_n:
+                summary = " | ".join(
+                    "%s@d=%.3f/h=%.3f%s%s:%r" % (
+                        _short_chunk_id(r.get("id") or ""),
+                        r.get("distance") if r.get("distance") is not None else float("nan"),
+                        r.get("_hybrid", float("nan")),
+                        ("(kw=" + "+".join(r["_matched_kw"]) + ")") if r.get("_matched_kw") else "",
+                        ""
+                        if (r.get("distance") if r.get("distance") is not None else 1.0)
+                        <= RAG_DISTANCE_THRESHOLD
+                        else "(filtered)",
+                        (r.get("document") or "")[:60],
+                    )
+                    for r in top_n
+                )
+                logger.info(
+                    "rag top_k=%d rerank=%d kept=%d threshold=%.2f bonus=%.2f call_id=%s tenant_id=%s top_n=[%s]",
+                    RAG_TOP_K, RAG_RERANK_TOP_N, len(rag_results),
+                    RAG_DISTANCE_THRESHOLD, RAG_KEYWORD_BONUS,
+                    call_id, state["tenant_id"], summary,
+                )
         except Exception as e:
             logger.error("rag search failed call_id=%s: %s", call_id, e)
 
