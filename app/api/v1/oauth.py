@@ -170,9 +170,23 @@ async def disconnect(
 # ── 내부 헬퍼 ─────────────────────────────────────────────────────────────────
 
 def _redirect_uri_for(provider: str) -> str:
-    """provider별 콜백 URI 결정."""
-    if provider in ("google_gmail", "google_calendar"):
-        return os.getenv("GOOGLE_OAUTH_REDIRECT_URI", "")
+    """provider별 콜백 URI 결정.
+
+    authorize URL 생성(get_authorize_url)과 token exchange(exchange_code) 양쪽이
+    동일한 redirect_uri를 사용해야 Google이 요청을 수락한다.
+    GoogleGmailOAuth._redirect_uri() / GoogleCalendarOAuth._redirect_uri()와
+    동일한 우선순위 로직을 따른다.
+    """
+    if provider == "google_calendar":
+        return (
+            os.getenv("GOOGLE_CALENDAR_REDIRECT_URI")
+            or os.getenv("GOOGLE_OAUTH_REDIRECT_URI", "")
+        )
+    if provider == "google_gmail":
+        return (
+            os.getenv("GOOGLE_GMAIL_REDIRECT_URI")
+            or os.getenv("GOOGLE_OAUTH_REDIRECT_URI", "")
+        )
     if provider == "slack":
         return os.getenv("SLACK_REDIRECT_URI", "")
     if provider == "jira":

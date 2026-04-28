@@ -15,11 +15,19 @@ MCP Connector 계층 테스트.
   11. MCPClient.registered_tools()로 등록된 tool 목록 확인
   12. CompanyDB: MCP_COMPANY_DB_REAL env도 real mode로 인식
   13. real mode env + config OK 이어도 connector 미구현이면 skipped
-  14. tenant OAuth: 연동된 테넌트 → tenant_token_found_but_real_execute_not_implemented
+  14. tenant OAuth: 연동된 테넌트 → tenant_token_found_but_real_execute_not_implemented (Gmail)
   15. tenant OAuth: 미연동 테넌트 → tenant_integration_not_connected
   16. tenant OAuth: 연동 후 폴백 없음 → env fallback 없이 skipped 반환
   17. tenant OAuth: MCP_ALLOW_ENV_FALLBACK=true + 미연동 → mock 결과 반환
   18. tenant OAuth: _oauth_provider_name 설정 확인
+  19. Calendar: tenant token 있을 때 Google Calendar API events.insert 성공
+  20. Calendar: Google Calendar API HTTP 오류 → failed 반환
+  21. Calendar: tenant token 없음 → skipped("tenant_integration_not_connected")
+  22. Calendar: params calendar_id > GOOGLE_CALENDAR_ID env > primary 우선순위
+  23. Calendar: start_time/end_time 직접 지정 시 이벤트 바디에 반영
+  24. Calendar: preferred_time만 있을 때 end_time 자동 생성 (default duration)
+  25. Calendar: 시간 정보 없을 때 현재+1시간 기본값 사용
+  26. Calendar: 결과에 access_token 평문 미포함
 """
 from __future__ import annotations
 
@@ -36,7 +44,9 @@ from app.services.mcp.client import MCPClient
 # ── 1. Gmail connector mock success ──────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_gmail_connector_mock_success():
+async def test_gmail_connector_mock_success(monkeypatch):
+    monkeypatch.delenv("GMAIL_MCP_REAL", raising=False)
+    monkeypatch.delenv("MCP_USE_TENANT_OAUTH", raising=False)
     connector = GmailConnector()
     result = await connector.execute(
         "send_manager_email",
@@ -56,7 +66,9 @@ async def test_gmail_connector_mock_success():
 # ── 2. Calendar connector mock success ───────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_calendar_connector_mock_success():
+async def test_calendar_connector_mock_success(monkeypatch):
+    monkeypatch.delenv("CALENDAR_MCP_REAL", raising=False)
+    monkeypatch.delenv("MCP_USE_TENANT_OAUTH", raising=False)
     connector = CalendarConnector()
     result = await connector.execute(
         "schedule_callback",
@@ -181,7 +193,9 @@ async def test_slack_connector_real_mode_config_missing_returns_skipped(monkeypa
 # ── 7. MCPClient가 tool_name으로 connector를 찾아 실행 ────────────────────────
 
 @pytest.mark.asyncio
-async def test_mcp_client_routes_to_correct_connector():
+async def test_mcp_client_routes_to_correct_connector(monkeypatch):
+    monkeypatch.delenv("GMAIL_MCP_REAL", raising=False)
+    monkeypatch.delenv("MCP_USE_TENANT_OAUTH", raising=False)
     client = MCPClient()
     client.register_connector("gmail", GmailConnector())
 
@@ -387,6 +401,7 @@ async def test_gmail_connector_tenant_oauth_with_env_fallback(monkeypatch):
 
     monkeypatch.setenv("MCP_USE_TENANT_OAUTH", "true")
     monkeypatch.setenv("MCP_ALLOW_ENV_FALLBACK", "true")
+    monkeypatch.delenv("GMAIL_MCP_REAL", raising=False)
     tenant_integration_repo.clear_integrations()
 
     connector = GmailConnector()
@@ -413,3 +428,300 @@ def test_connectors_have_oauth_provider_name():
     assert SlackConnector._oauth_provider_name == "slack"
     assert JiraConnector._oauth_provider_name == "jira"
     assert CompanyDBConnector._oauth_provider_name == ""  # OAuth 불필요
+
+
+# ── Calendar 실제 API 테스트 공통 fixture ─────────────────────────────────────
+
+def _setup_calendar_tenant(monkeypatch, enc_token: str, tenant_id: str = "cal-tenant") -> None:
+    from app.models.tenant_integration import TenantIntegration, IntegrationStatus
+    from app.repositories.tenant_integration_repo import tenant_integration_repo, upsert_integration
+    tenant_integration_repo.clear_integrations()
+    upsert_integration(TenantIntegration(
+        tenant_id=tenant_id,
+        provider="google_calendar",
+        status=IntegrationStatus.connected,
+        access_token_encrypted=enc_token,
+    ))
+
+
+def _make_mock_http_client(status_code: int, json_data: dict):
+    """httpx.AsyncClient를 대체하는 동기-호환 mock 팩토리."""
+    from unittest.mock import MagicMock, AsyncMock
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = status_code
+    mock_resp.json.return_value = json_data
+    mock_resp.text = str(json_data)
+
+    mock_client = AsyncMock()
+    mock_client.post = AsyncMock(return_value=mock_resp)
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+    return mock_client
+
+
+# ── 19. Calendar: tenant token → events.insert 성공 ──────────────────────────
+
+@pytest.mark.asyncio
+async def test_calendar_real_api_success(monkeypatch):
+    from cryptography.fernet import Fernet
+    import httpx
+    from app.services.oauth.token_crypto import reset_fernet_cache, encrypt_token
+
+    key = Fernet.generate_key()
+    monkeypatch.setenv("TOKEN_ENCRYPTION_KEY", key.decode())
+    monkeypatch.setenv("MCP_USE_TENANT_OAUTH", "true")
+    reset_fernet_cache()
+
+    enc = encrypt_token("ya29.fake_access_token")
+    _setup_calendar_tenant(monkeypatch, enc)
+
+    api_response = {
+        "id": "event-id-abc123",
+        "htmlLink": "https://calendar.google.com/event/abc123",
+        "start": {"dateTime": "2026-04-29T10:00:00+09:00"},
+        "end": {"dateTime": "2026-04-29T10:30:00+09:00"},
+    }
+    mock_client = _make_mock_http_client(200, api_response)
+    monkeypatch.setattr(httpx, "AsyncClient", lambda: mock_client)
+
+    connector = CalendarConnector()
+    result = await connector.execute(
+        "schedule_callback",
+        {"title": "고객 콜백", "reason": "요금 문의 후속"},
+        call_id="cal-001",
+        tenant_id="cal-tenant",
+    )
+
+    assert result["status"] == "success"
+    assert result["external_id"] == "event-id-abc123"
+    assert result["result"]["event_id"] == "event-id-abc123"
+    assert result["result"]["html_link"] == "https://calendar.google.com/event/abc123"
+    assert result["error"] is None
+
+    # 4개 표준 키 확인
+    for key_ in ("status", "external_id", "result", "error"):
+        assert key_ in result
+
+    from app.repositories.tenant_integration_repo import tenant_integration_repo
+    tenant_integration_repo.clear_integrations()
+    reset_fernet_cache()
+    monkeypatch.delenv("MCP_USE_TENANT_OAUTH", raising=False)
+    monkeypatch.delenv("TOKEN_ENCRYPTION_KEY", raising=False)
+
+
+# ── 20. Calendar: Google Calendar API HTTP 오류 → failed ─────────────────────
+
+@pytest.mark.asyncio
+async def test_calendar_real_api_http_failure(monkeypatch):
+    from cryptography.fernet import Fernet
+    import httpx
+    from app.services.oauth.token_crypto import reset_fernet_cache, encrypt_token
+
+    key = Fernet.generate_key()
+    monkeypatch.setenv("TOKEN_ENCRYPTION_KEY", key.decode())
+    monkeypatch.setenv("MCP_USE_TENANT_OAUTH", "true")
+    reset_fernet_cache()
+
+    enc = encrypt_token("ya29.fake_access_token")
+    _setup_calendar_tenant(monkeypatch, enc)
+
+    mock_client = _make_mock_http_client(401, {"error": "Unauthorized"})
+    monkeypatch.setattr(httpx, "AsyncClient", lambda: mock_client)
+
+    connector = CalendarConnector()
+    result = await connector.execute(
+        "schedule_callback", {},
+        call_id="cal-002",
+        tenant_id="cal-tenant",
+    )
+
+    assert result["status"] == "failed"
+    assert "401" in result["error"]
+
+    from app.repositories.tenant_integration_repo import tenant_integration_repo
+    tenant_integration_repo.clear_integrations()
+    reset_fernet_cache()
+    monkeypatch.delenv("MCP_USE_TENANT_OAUTH", raising=False)
+    monkeypatch.delenv("TOKEN_ENCRYPTION_KEY", raising=False)
+
+
+# ── 21. Calendar: tenant token 없음 → skipped ────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_calendar_no_tenant_integration_skipped(monkeypatch):
+    from app.repositories.tenant_integration_repo import tenant_integration_repo
+
+    monkeypatch.setenv("MCP_USE_TENANT_OAUTH", "true")
+    monkeypatch.delenv("MCP_ALLOW_ENV_FALLBACK", raising=False)
+    tenant_integration_repo.clear_integrations()
+
+    connector = CalendarConnector()
+    result = await connector.execute(
+        "schedule_callback", {},
+        call_id="cal-003",
+        tenant_id="no-calendar-tenant",
+    )
+
+    assert result["status"] == "skipped"
+    assert result["error"] == "tenant_integration_not_connected"
+
+    monkeypatch.delenv("MCP_USE_TENANT_OAUTH", raising=False)
+
+
+# ── 22. Calendar: calendar_id 우선순위 (params > env > primary) ───────────────
+
+@pytest.mark.asyncio
+async def test_calendar_calendar_id_priority(monkeypatch):
+    from cryptography.fernet import Fernet
+    import httpx
+    from app.services.oauth.token_crypto import reset_fernet_cache, encrypt_token
+    from unittest.mock import AsyncMock, MagicMock
+
+    key = Fernet.generate_key()
+    monkeypatch.setenv("TOKEN_ENCRYPTION_KEY", key.decode())
+    monkeypatch.setenv("MCP_USE_TENANT_OAUTH", "true")
+    monkeypatch.setenv("GOOGLE_CALENDAR_ID", "env-calendar@group.calendar.google.com")
+    reset_fernet_cache()
+
+    enc = encrypt_token("ya29.fake_token")
+    _setup_calendar_tenant(monkeypatch, enc)
+
+    captured_urls: list[str] = []
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = {"id": "ev1", "htmlLink": "", "start": {}, "end": {}}
+    mock_resp.text = ""
+
+    mock_client = AsyncMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+
+    async def _post(url, **kwargs):
+        captured_urls.append(url)
+        return mock_resp
+
+    mock_client.post = _post
+    monkeypatch.setattr(httpx, "AsyncClient", lambda: mock_client)
+
+    connector = CalendarConnector()
+
+    # params calendar_id 우선
+    captured_urls.clear()
+    await connector.execute(
+        "schedule_callback",
+        {"calendar_id": "params-calendar@group.calendar.google.com"},
+        call_id="cal-004a", tenant_id="cal-tenant",
+    )
+    assert "params-calendar" in captured_urls[0]
+
+    # env GOOGLE_CALENDAR_ID (params 없음)
+    captured_urls.clear()
+    await connector.execute(
+        "schedule_callback", {},
+        call_id="cal-004b", tenant_id="cal-tenant",
+    )
+    assert "env-calendar" in captured_urls[0]
+
+    # primary (params 없음, env 없음)
+    monkeypatch.delenv("GOOGLE_CALENDAR_ID", raising=False)
+    captured_urls.clear()
+    await connector.execute(
+        "schedule_callback", {},
+        call_id="cal-004c", tenant_id="cal-tenant",
+    )
+    assert "/primary/" in captured_urls[0]
+
+    from app.repositories.tenant_integration_repo import tenant_integration_repo
+    tenant_integration_repo.clear_integrations()
+    reset_fernet_cache()
+    monkeypatch.delenv("MCP_USE_TENANT_OAUTH", raising=False)
+    monkeypatch.delenv("TOKEN_ENCRYPTION_KEY", raising=False)
+
+
+# ── 23. Calendar: start_time/end_time 직접 지정 ──────────────────────────────
+
+def test_calendar_event_body_explicit_start_end():
+    connector = CalendarConnector()
+    body = connector._build_event_body({
+        "title": "명시 시간 테스트",
+        "start_time": "2026-05-01T09:00:00",
+        "end_time": "2026-05-01T10:00:00",
+    })
+
+    assert body["summary"] == "명시 시간 테스트"
+    assert "2026-05-01T09:00:00" in body["start"]["dateTime"]
+    assert "2026-05-01T10:00:00" in body["end"]["dateTime"]
+
+
+# ── 24. Calendar: preferred_time → end_time 자동 생성 ────────────────────────
+
+def test_calendar_event_body_preferred_time_auto_end():
+    connector = CalendarConnector()
+    body = connector._build_event_body({
+        "preferred_time": "2026-05-01T14:00:00",
+    })
+
+    from datetime import datetime, timedelta
+    start_dt = datetime.fromisoformat(body["start"]["dateTime"])
+    end_dt = datetime.fromisoformat(body["end"]["dateTime"])
+
+    assert start_dt.hour == 14
+    diff = end_dt - start_dt
+    assert diff == timedelta(minutes=30)  # CALENDAR_DEFAULT_DURATION_MIN 기본값
+
+
+# ── 25. Calendar: 시간 없을 때 현재+1시간 ────────────────────────────────────
+
+def test_calendar_event_body_default_time():
+    from datetime import datetime, timedelta
+
+    before = datetime.utcnow() + timedelta(minutes=55)  # 약간의 여유
+    connector = CalendarConnector()
+    body = connector._build_event_body({"title": "시간 없음"})
+    after = datetime.utcnow() + timedelta(hours=1, minutes=5)
+
+    start_dt = datetime.fromisoformat(body["start"]["dateTime"])
+    assert before <= start_dt <= after
+
+
+# ── 26. Calendar: 결과에 access_token 평문 미포함 ────────────────────────────
+
+@pytest.mark.asyncio
+async def test_calendar_access_token_not_in_result(monkeypatch):
+    from cryptography.fernet import Fernet
+    import httpx
+    from app.services.oauth.token_crypto import reset_fernet_cache, encrypt_token
+
+    plaintext_token = "ya29.super_secret_access_token_do_not_leak"
+
+    key = Fernet.generate_key()
+    monkeypatch.setenv("TOKEN_ENCRYPTION_KEY", key.decode())
+    monkeypatch.setenv("MCP_USE_TENANT_OAUTH", "true")
+    reset_fernet_cache()
+
+    enc = encrypt_token(plaintext_token)
+    _setup_calendar_tenant(monkeypatch, enc)
+
+    api_response = {"id": "ev-safe", "htmlLink": "", "start": {}, "end": {}}
+    mock_client = _make_mock_http_client(200, api_response)
+    monkeypatch.setattr(httpx, "AsyncClient", lambda: mock_client)
+
+    connector = CalendarConnector()
+    result = await connector.execute(
+        "schedule_callback", {},
+        call_id="cal-safe",
+        tenant_id="cal-tenant",
+    )
+
+    # result dict를 str로 변환해도 평문 토큰이 없어야 함
+    result_str = str(result)
+    assert plaintext_token not in result_str
+    assert result["status"] == "success"
+
+    from app.repositories.tenant_integration_repo import tenant_integration_repo
+    tenant_integration_repo.clear_integrations()
+    reset_fernet_cache()
+    monkeypatch.delenv("MCP_USE_TENANT_OAUTH", raising=False)
+    monkeypatch.delenv("TOKEN_ENCRYPTION_KEY", raising=False)

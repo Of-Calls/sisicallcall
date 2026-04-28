@@ -4,11 +4,17 @@ Google OAuth 2.0 구현 — Gmail / Google Calendar 공통 기반.
 env:
   GOOGLE_OAUTH_CLIENT_ID       (필수)
   GOOGLE_OAUTH_CLIENT_SECRET   (필수)
-  GOOGLE_OAUTH_REDIRECT_URI    (필수)
 
-scope 예:
-  Gmail:    https://www.googleapis.com/auth/gmail.send
-  Calendar: https://www.googleapis.com/auth/calendar
+provider별 redirect URI (우선순위):
+  google_calendar → GOOGLE_CALENDAR_REDIRECT_URI → GOOGLE_OAUTH_REDIRECT_URI
+  google_gmail    → GOOGLE_GMAIL_REDIRECT_URI    → GOOGLE_OAUTH_REDIRECT_URI
+
+authorize URL 생성과 token exchange 양쪽에 동일한 redirect_uri가 사용되도록
+_redirect_uri() 메서드를 통해 결정한다.
+
+Google Cloud Console 승인된 리디렉션 URI 등록 필요:
+  http://localhost:8000/api/v1/oauth/google_calendar/callback
+  http://localhost:8000/api/v1/oauth/google_gmail/callback
 """
 from __future__ import annotations
 
@@ -29,6 +35,7 @@ _USERINFO_URL = "https://www.googleapis.com/oauth2/v2/userinfo"
 
 class _GoogleOAuthBase(BaseOAuthProvider):
     _default_scopes: list[str] = []
+    _redirect_uri_env: str = ""  # 서브클래스가 provider별 env 이름을 지정
 
     def _client_id(self) -> str:
         return os.getenv("GOOGLE_OAUTH_CLIENT_ID", "")
@@ -37,6 +44,16 @@ class _GoogleOAuthBase(BaseOAuthProvider):
         return os.getenv("GOOGLE_OAUTH_CLIENT_SECRET", "")
 
     def _redirect_uri(self) -> str:
+        """provider별 redirect URI를 반환한다.
+
+        우선순위:
+          1. _redirect_uri_env 에 지정된 env var (예: GOOGLE_CALENDAR_REDIRECT_URI)
+          2. 하위 호환 GOOGLE_OAUTH_REDIRECT_URI
+        """
+        if self._redirect_uri_env:
+            val = os.getenv(self._redirect_uri_env, "")
+            if val:
+                return val
         return os.getenv("GOOGLE_OAUTH_REDIRECT_URI", "")
 
     def get_authorize_url(self, state: str, scopes: list[str] | None = None) -> str:
@@ -53,6 +70,11 @@ class _GoogleOAuthBase(BaseOAuthProvider):
         return f"{_AUTH_URL}?{urllib.parse.urlencode(params)}"
 
     async def exchange_code(self, code: str, redirect_uri: str) -> TokenResult:
+        """redirect_uri는 authorize URL 생성 시 사용한 값과 동일해야 한다.
+
+        caller(oauth.py callback 엔드포인트)는 _redirect_uri()와 같은 값을
+        넘겨야 한다. _redirect_uri_for() 헬퍼가 이를 보장한다.
+        """
         async with httpx.AsyncClient() as client:
             resp = await client.post(_TOKEN_URL, data={
                 "code": code,
@@ -113,6 +135,7 @@ class _GoogleOAuthBase(BaseOAuthProvider):
 
 class GoogleGmailOAuth(_GoogleOAuthBase):
     provider_name = "google_gmail"
+    _redirect_uri_env = "GOOGLE_GMAIL_REDIRECT_URI"
     _default_scopes = [
         "https://www.googleapis.com/auth/gmail.send",
         "openid",
@@ -122,6 +145,7 @@ class GoogleGmailOAuth(_GoogleOAuthBase):
 
 class GoogleCalendarOAuth(_GoogleOAuthBase):
     provider_name = "google_calendar"
+    _redirect_uri_env = "GOOGLE_CALENDAR_REDIRECT_URI"
     _default_scopes = [
         "https://www.googleapis.com/auth/calendar",
         "openid",

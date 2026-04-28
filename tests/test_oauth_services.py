@@ -20,6 +20,12 @@ OAuth 서비스 계층 테스트.
     11. SlackOAuth.get_authorize_url에 state 포함
     12. JiraOAuth.get_authorize_url에 state 포함
     13. 각 provider에 provider_name 속성 설정 확인
+
+  provider별 redirect URI:
+    14. GoogleCalendarOAuth → GOOGLE_CALENDAR_REDIRECT_URI 우선 사용
+    15. GoogleGmailOAuth → GOOGLE_GMAIL_REDIRECT_URI 우선 사용
+    16. provider별 URI 미설정 시 GOOGLE_OAUTH_REDIRECT_URI fallback
+    17. authorize URL redirect_uri == exchange_code redirect_uri (동일성)
 """
 from __future__ import annotations
 
@@ -220,3 +226,77 @@ def test_oauth_provider_names():
     assert GoogleCalendarOAuth.provider_name == "google_calendar"
     assert SlackOAuth.provider_name == "slack"
     assert JiraOAuth.provider_name == "jira"
+
+
+# ── 14. GoogleCalendarOAuth → GOOGLE_CALENDAR_REDIRECT_URI 우선 ───────────────
+
+def test_google_calendar_uses_provider_specific_redirect_uri(monkeypatch):
+    monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_ID", "test-cid")
+    monkeypatch.setenv("GOOGLE_CALENDAR_REDIRECT_URI", "http://localhost:8000/api/v1/oauth/google_calendar/callback")
+    monkeypatch.setenv("GOOGLE_OAUTH_REDIRECT_URI", "https://fallback.example.com/callback")
+
+    from app.services.oauth.google_oauth import GoogleCalendarOAuth
+    oauth = GoogleCalendarOAuth()
+    url = oauth.get_authorize_url("cal-state")
+
+    assert "localhost%3A8000" in url or "localhost:8000" in url
+    assert "google_calendar" in url
+    # fallback URI는 포함되지 않아야 함
+    assert "fallback.example.com" not in url
+
+
+# ── 15. GoogleGmailOAuth → GOOGLE_GMAIL_REDIRECT_URI 우선 ────────────────────
+
+def test_google_gmail_uses_provider_specific_redirect_uri(monkeypatch):
+    monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_ID", "test-cid")
+    monkeypatch.setenv("GOOGLE_GMAIL_REDIRECT_URI", "http://localhost:8000/api/v1/oauth/google_gmail/callback")
+    monkeypatch.setenv("GOOGLE_OAUTH_REDIRECT_URI", "https://fallback.example.com/callback")
+
+    from app.services.oauth.google_oauth import GoogleGmailOAuth
+    oauth = GoogleGmailOAuth()
+    url = oauth.get_authorize_url("gmail-state")
+
+    assert "localhost%3A8000" in url or "localhost:8000" in url
+    assert "google_gmail" in url
+    assert "fallback.example.com" not in url
+
+
+# ── 16. provider별 URI 미설정 → GOOGLE_OAUTH_REDIRECT_URI fallback ─────────────
+
+def test_google_oauth_fallback_redirect_uri(monkeypatch):
+    monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_ID", "test-cid")
+    monkeypatch.setenv("GOOGLE_OAUTH_REDIRECT_URI", "https://fallback.example.com/callback")
+    monkeypatch.delenv("GOOGLE_CALENDAR_REDIRECT_URI", raising=False)
+    monkeypatch.delenv("GOOGLE_GMAIL_REDIRECT_URI", raising=False)
+
+    from app.services.oauth.google_oauth import GoogleCalendarOAuth, GoogleGmailOAuth
+
+    cal_url = GoogleCalendarOAuth().get_authorize_url("s1")
+    gmail_url = GoogleGmailOAuth().get_authorize_url("s2")
+
+    assert "fallback.example.com" in cal_url
+    assert "fallback.example.com" in gmail_url
+
+
+# ── 17. authorize redirect_uri == exchange_code redirect_uri ──────────────────
+
+def test_google_calendar_redirect_uri_consistent(monkeypatch):
+    """_redirect_uri()와 oauth.py의 _redirect_uri_for()가 동일 값을 반환."""
+    specific = "http://localhost:8000/api/v1/oauth/google_calendar/callback"
+    monkeypatch.setenv("GOOGLE_CALENDAR_REDIRECT_URI", specific)
+    monkeypatch.setenv("GOOGLE_OAUTH_REDIRECT_URI", "https://should-not-use.example.com/cb")
+    monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_ID", "cid")
+
+    from app.services.oauth.google_oauth import GoogleCalendarOAuth
+    from app.api.v1.oauth import _redirect_uri_for
+
+    oauth = GoogleCalendarOAuth()
+
+    # authorize URL 쪽
+    authorize_redirect = oauth._redirect_uri()
+    # callback(token exchange) 쪽
+    callback_redirect = _redirect_uri_for("google_calendar")
+
+    assert authorize_redirect == specific
+    assert callback_redirect == specific
+    assert authorize_redirect == callback_redirect

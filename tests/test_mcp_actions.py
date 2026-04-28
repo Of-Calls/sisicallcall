@@ -10,6 +10,15 @@ from app.agents.post_call.actions.registry import (
 from app.agents.post_call.schemas import ActionType, Tool, ActionStatus
 
 
+@pytest.fixture(autouse=True)
+def _clear_real_mode_envs(monkeypatch):
+    """테스트가 .env의 real-mode 설정에 영향받지 않도록 격리."""
+    monkeypatch.delenv("GMAIL_MCP_REAL", raising=False)
+    monkeypatch.delenv("CALENDAR_MCP_REAL", raising=False)
+    monkeypatch.delenv("MCP_USE_TENANT_OAUTH", raising=False)
+    monkeypatch.delenv("MCP_ALLOW_ENV_FALLBACK", raising=False)
+
+
 @pytest.fixture
 def executor():
     return ActionExecutor()
