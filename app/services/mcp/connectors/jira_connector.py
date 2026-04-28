@@ -37,6 +37,7 @@ class JiraConnector(BaseMCPConnector):
     connector_name = "jira"
     _real_mode_env = "JIRA_MCP_REAL"
     _required_config = ("JIRA_PROJECT_KEY", "JIRA_ISSUE_TYPE")
+    _oauth_provider_name = "jira"
 
     async def execute(
         self,
@@ -47,9 +48,15 @@ class JiraConnector(BaseMCPConnector):
         tenant_id: str = "",
     ) -> dict:
         logger.info(
-            "JiraConnector call_id=%s action_type=%s real_mode=%s",
-            call_id, action_type, self.is_real_mode(),
+            "JiraConnector call_id=%s action_type=%s real_mode=%s tenant_oauth=%s",
+            call_id, action_type, self.is_real_mode(), self._use_tenant_oauth(),
         )
+
+        # tenant OAuth 우선 시도
+        if self._use_tenant_oauth() and tenant_id:
+            result = await self._try_tenant_token(tenant_id)
+            if result["error"] != "tenant_integration_not_connected" or not self._allow_env_fallback():
+                return result
 
         if not self.is_real_mode():
             return self._mock(params, call_id)

@@ -15,6 +15,11 @@ MCP Connector 계층 테스트.
   11. MCPClient.registered_tools()로 등록된 tool 목록 확인
   12. CompanyDB: MCP_COMPANY_DB_REAL env도 real mode로 인식
   13. real mode env + config OK 이어도 connector 미구현이면 skipped
+  14. tenant OAuth: 연동된 테넌트 → tenant_token_found_but_real_execute_not_implemented
+  15. tenant OAuth: 미연동 테넌트 → tenant_integration_not_connected
+  16. tenant OAuth: 연동 후 폴백 없음 → env fallback 없이 skipped 반환
+  17. tenant OAuth: MCP_ALLOW_ENV_FALLBACK=true + 미연동 → mock 결과 반환
+  18. tenant OAuth: _oauth_provider_name 설정 확인
 """
 from __future__ import annotations
 
@@ -283,3 +288,128 @@ async def test_calendar_connector_real_mode_config_ok_returns_skipped(monkeypatc
     )
 
     assert result["status"] in ("skipped", "failed")
+
+
+# ── 14. tenant OAuth: 연동된 테넌트 → not_implemented skipped ────────────────
+
+@pytest.mark.asyncio
+async def test_gmail_connector_tenant_oauth_connected(monkeypatch):
+    from cryptography.fernet import Fernet
+    from app.models.tenant_integration import TenantIntegration, IntegrationStatus
+    from app.repositories.tenant_integration_repo import (
+        tenant_integration_repo, upsert_integration,
+    )
+    from app.services.oauth.token_crypto import reset_fernet_cache
+
+    key = Fernet.generate_key()
+    monkeypatch.setenv("TOKEN_ENCRYPTION_KEY", key.decode())
+    monkeypatch.setenv("MCP_USE_TENANT_OAUTH", "true")
+    reset_fernet_cache()
+    tenant_integration_repo.clear_integrations()
+
+    from app.services.oauth.token_crypto import encrypt_token
+    enc_token = encrypt_token("fake-access-token")
+
+    upsert_integration(TenantIntegration(
+        tenant_id="tenant-oauth-001",
+        provider="google_gmail",
+        status=IntegrationStatus.connected,
+        access_token_encrypted=enc_token,
+    ))
+
+    connector = GmailConnector()
+    result = await connector.execute(
+        "send_manager_email", {},
+        call_id="oauth-001",
+        tenant_id="tenant-oauth-001",
+    )
+
+    assert result["status"] == "skipped"
+    assert result["error"] == "tenant_token_found_but_real_execute_not_implemented"
+
+    tenant_integration_repo.clear_integrations()
+    reset_fernet_cache()
+    monkeypatch.delenv("MCP_USE_TENANT_OAUTH", raising=False)
+    monkeypatch.delenv("TOKEN_ENCRYPTION_KEY", raising=False)
+
+
+# ── 15. tenant OAuth: 미연동 테넌트 → not_connected skipped ─────────────────
+
+@pytest.mark.asyncio
+async def test_gmail_connector_tenant_oauth_not_connected(monkeypatch):
+    from app.repositories.tenant_integration_repo import tenant_integration_repo
+
+    monkeypatch.setenv("MCP_USE_TENANT_OAUTH", "true")
+    tenant_integration_repo.clear_integrations()
+
+    connector = GmailConnector()
+    result = await connector.execute(
+        "send_manager_email", {},
+        call_id="oauth-002",
+        tenant_id="no-such-tenant",
+    )
+
+    assert result["status"] == "skipped"
+    assert result["error"] == "tenant_integration_not_connected"
+
+    monkeypatch.delenv("MCP_USE_TENANT_OAUTH", raising=False)
+
+
+# ── 16. tenant OAuth: MCP_ALLOW_ENV_FALLBACK 없음 → not_connected 반환 ───────
+
+@pytest.mark.asyncio
+async def test_gmail_connector_tenant_oauth_no_fallback(monkeypatch):
+    from app.repositories.tenant_integration_repo import tenant_integration_repo
+
+    monkeypatch.setenv("MCP_USE_TENANT_OAUTH", "true")
+    monkeypatch.delenv("MCP_ALLOW_ENV_FALLBACK", raising=False)
+    tenant_integration_repo.clear_integrations()
+
+    connector = GmailConnector()
+    result = await connector.execute(
+        "send_manager_email", {},
+        call_id="oauth-003",
+        tenant_id="no-such-tenant",
+    )
+
+    # fallback 없으므로 not_connected skipped 반환 (mock으로 내려가지 않음)
+    assert result["status"] == "skipped"
+    assert result["error"] == "tenant_integration_not_connected"
+
+    monkeypatch.delenv("MCP_USE_TENANT_OAUTH", raising=False)
+
+
+# ── 17. tenant OAuth: MCP_ALLOW_ENV_FALLBACK=true + 미연동 → mock 반환 ───────
+
+@pytest.mark.asyncio
+async def test_gmail_connector_tenant_oauth_with_env_fallback(monkeypatch):
+    from app.repositories.tenant_integration_repo import tenant_integration_repo
+
+    monkeypatch.setenv("MCP_USE_TENANT_OAUTH", "true")
+    monkeypatch.setenv("MCP_ALLOW_ENV_FALLBACK", "true")
+    tenant_integration_repo.clear_integrations()
+
+    connector = GmailConnector()
+    result = await connector.execute(
+        "send_manager_email",
+        {"to": "manager@example.com", "subject": "fallback test"},
+        call_id="oauth-004",
+        tenant_id="no-such-tenant",
+    )
+
+    # 미연동 + fallback 허용 → mock 결과
+    assert result["status"] == "success"
+    assert result["result"]["mock"] is True
+
+    monkeypatch.delenv("MCP_USE_TENANT_OAUTH", raising=False)
+    monkeypatch.delenv("MCP_ALLOW_ENV_FALLBACK", raising=False)
+
+
+# ── 18. tenant OAuth: _oauth_provider_name 설정 확인 ─────────────────────────
+
+def test_connectors_have_oauth_provider_name():
+    assert GmailConnector._oauth_provider_name == "google_gmail"
+    assert CalendarConnector._oauth_provider_name == "google_calendar"
+    assert SlackConnector._oauth_provider_name == "slack"
+    assert JiraConnector._oauth_provider_name == "jira"
+    assert CompanyDBConnector._oauth_provider_name == ""  # OAuth 불필요
