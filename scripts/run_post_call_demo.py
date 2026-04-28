@@ -1,12 +1,18 @@
 """시연용 Post-call 실행 스크립트.
 
 demo-call-critical 컨텍스트를 시드한 뒤 PostCallAgent를 실행해 MCP 액션 결과를 출력한다.
-기본값은 demo LLM mock (OpenAI 불필요).
-POST_CALL_USE_REAL_LLM=true 환경변수를 설정하면 실제 LLM을 사용한다.
+
+동작 모드:
+  기본 (--real-actions 없음): 모든 connector를 mock으로 강제 실행
+  --real-actions:             .env의 각 *_MCP_REAL 설정을 그대로 따름
+  --real-actions --only-tool notion:
+                              notion만 .env 설정을 따르고, 나머지는 mock으로 강제
 
 사용 예:
     python scripts/run_post_call_demo.py
     python scripts/run_post_call_demo.py --real-actions
+    python scripts/run_post_call_demo.py --real-actions --only-tool notion
+    python scripts/run_post_call_demo.py --real-actions --only-tool sms
     python scripts/run_post_call_demo.py --tenant-id my-tenant --call-id my-call-001
 """
 from __future__ import annotations
@@ -16,7 +22,12 @@ import asyncio
 import os
 import sys
 
+# ── 프로젝트 루트를 sys.path에 추가 ──────────────────────────────────────────
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# ── .env 로드 (실제 환경 변수보다 우선도가 낮으므로 override=False) ────────────
+from dotenv import load_dotenv  # noqa: E402
+load_dotenv(override=False)
 
 from tests.fixtures.demo_post_call_context import (  # noqa: E402
     DEMO_POST_CALL_CONTEXT,
@@ -46,12 +57,59 @@ def _status_color(status: str) -> str:
     return _c(color + _BOLD, status.upper())
 
 
+# ── Tool → env var 매핑 ───────────────────────────────────────────────────────
+_VALID_TOOLS = ("calendar", "slack", "sms", "notion", "gmail", "jira", "company_db")
+
+_TOOL_ENV_VARS: dict[str, list[str]] = {
+    "calendar":   ["CALENDAR_MCP_REAL"],
+    "slack":      ["SLACK_MCP_REAL"],
+    "sms":        ["SMS_MCP_REAL"],
+    "notion":     ["NOTION_MCP_REAL"],
+    "gmail":      ["GMAIL_MCP_REAL"],
+    "jira":       ["JIRA_MCP_REAL"],
+    "company_db": ["COMPANY_DB_MCP_REAL", "MCP_COMPANY_DB_REAL"],
+}
+
+
+def _apply_connector_modes(real_actions: bool, only_tool: str | None) -> dict[str, bool]:
+    """connector별 real mode를 결정하고 os.environ에 적용한다.
+
+    반환값: {tool_name: is_real} — 출력용
+    """
+    effective: dict[str, bool] = {}
+
+    for tool, env_vars in _TOOL_ENV_VARS.items():
+        if not real_actions:
+            # mock 강제
+            for ev in env_vars:
+                os.environ[ev] = "false"
+            effective[tool] = False
+        elif only_tool is not None and tool != only_tool:
+            # --only-tool X: 지정 도구 외는 mock 강제
+            for ev in env_vars:
+                os.environ[ev] = "false"
+            effective[tool] = False
+        else:
+            # .env / 기존 환경변수 그대로 사용 (첫 번째 env var 기준으로 상태 읽기)
+            val = os.environ.get(env_vars[0], "false").lower() in ("1", "true")
+            effective[tool] = val
+
+    return effective
+
+
 # ── 출력 헬퍼 ─────────────────────────────────────────────────────────────────
 
 def _print_section(title: str) -> None:
     print(f"\n{_c(_BOLD, '─' * 60)}")
     print(_c(_CYAN + _BOLD, f"  {title}"))
     print(_c(_BOLD, "─" * 60))
+
+
+def _print_connector_modes(modes: dict[str, bool]) -> None:
+    _print_section("Connector 실행 모드")
+    for tool, is_real in modes.items():
+        tag = _c(_GREEN + _BOLD, "REAL") if is_real else _c(_YELLOW, "mock")
+        print(f"    {tool:12s}: {tag}")
 
 
 def _print_result(result: dict) -> None:
@@ -140,32 +198,32 @@ def _patch_llm_nodes() -> None:
 
 # ── 메인 실행 ─────────────────────────────────────────────────────────────────
 
-async def _run(tenant_id: str, call_id: str, real_actions: bool) -> None:
+async def _run(tenant_id: str, call_id: str, real_actions: bool, only_tool: str | None) -> None:
     ctx = DEMO_POST_CALL_CONTEXT
 
     print(_c(_BOLD, "\n시시콜콜 Post-call MCP 시연 스크립트"))
     print(f"  call_id   : {call_id}")
     print(f"  tenant_id : {tenant_id}")
 
-    if real_actions:
-        os.environ["SMS_MCP_REAL"]    = "true"
-        os.environ["NOTION_MCP_REAL"] = "true"
-        os.environ["SLACK_MCP_REAL"]  = "true"
-        print(f"  mode      : {_c(_GREEN + _BOLD, 'REAL 모드')} (SMS / Notion / Slack 실제 호출)")
-    else:
-        os.environ.setdefault("SMS_MCP_REAL",    "false")
-        os.environ.setdefault("NOTION_MCP_REAL", "false")
-        os.environ.setdefault("SLACK_MCP_REAL",  "false")
+    if not real_actions:
+        print(f"  mode      : {_c(_YELLOW + _BOLD, 'MOCK 모드')} (모든 connector mock — --real-actions로 .env 설정 적용)")
+    elif only_tool:
         print(
-            f"  mode      : {_c(_YELLOW + _BOLD, 'MOCK 모드')} "
-            f"(외부 API 미호출 — --real-actions 플래그로 실제 실행)"
+            f"  mode      : {_c(_GREEN + _BOLD, 'REAL 모드')} "
+            f"({only_tool}만 .env 설정 적용, 나머지 mock)"
         )
+    else:
+        print(f"  mode      : {_c(_GREEN + _BOLD, 'REAL 모드')} (.env 각 *_MCP_REAL 설정 적용)")
+
+    # connector real mode 결정 및 적용
+    connector_modes = _apply_connector_modes(real_actions, only_tool)
+    _print_connector_modes(connector_modes)
 
     use_real_llm = os.environ.get("POST_CALL_USE_REAL_LLM", "").lower() == "true"
     if use_real_llm:
-        print(f"  LLM       : {_c(_GREEN, '실제 LLM (POST_CALL_USE_REAL_LLM=true)')}")
+        print(f"\n  LLM       : {_c(_GREEN, '실제 LLM (POST_CALL_USE_REAL_LLM=true)')}")
     else:
-        print(f"  LLM       : {_c(_YELLOW, 'Demo Mock LLM (angry/critical 시나리오 고정)')}")
+        print(f"\n  LLM       : {_c(_YELLOW, 'Demo Mock LLM (angry/critical 시나리오 고정)')}")
         _patch_llm_nodes()
 
     # 시연 컨텍스트 seed
@@ -196,6 +254,13 @@ async def _run(tenant_id: str, call_id: str, real_actions: bool) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="시연용 Post-call MCP 실행 스크립트 (기본: Mock 모드)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""예시:
+  python scripts/run_post_call_demo.py                          # 전체 mock
+  python scripts/run_post_call_demo.py --real-actions           # .env 설정 전체 적용
+  python scripts/run_post_call_demo.py --real-actions --only-tool notion  # Notion만 real
+  python scripts/run_post_call_demo.py --real-actions --only-tool sms     # SMS만 real
+""",
     )
     parser.add_argument(
         "--tenant-id",
@@ -210,10 +275,24 @@ def main() -> None:
     parser.add_argument(
         "--real-actions",
         action="store_true",
-        help="실제 SMS / Notion / Slack 호출 활성화 (기본: mock)",
+        help=".env의 각 *_MCP_REAL 설정을 따름 (없으면 전체 mock 강제)",
+    )
+    parser.add_argument(
+        "--only-tool",
+        choices=list(_VALID_TOOLS),
+        default=None,
+        metavar="TOOL",
+        help=(
+            "--real-actions와 함께 사용. 지정한 도구만 .env real 설정을 따르고 "
+            f"나머지는 mock 강제. 선택: {', '.join(_VALID_TOOLS)}"
+        ),
     )
     args = parser.parse_args()
-    asyncio.run(_run(args.tenant_id, args.call_id, args.real_actions))
+
+    if args.only_tool and not args.real_actions:
+        parser.error("--only-tool은 --real-actions와 함께 사용해야 합니다.")
+
+    asyncio.run(_run(args.tenant_id, args.call_id, args.real_actions, args.only_tool))
 
 
 if __name__ == "__main__":
