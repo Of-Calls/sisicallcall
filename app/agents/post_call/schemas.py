@@ -14,6 +14,8 @@ class ActionType(str, Enum):
     schedule_callback = "schedule_callback"
     add_priority_queue = "add_priority_queue"
     mark_faq_candidate = "mark_faq_candidate"
+    create_jira_issue = "create_jira_issue"
+    send_slack_alert = "send_slack_alert"
 
 
 class Tool(str, Enum):
@@ -21,6 +23,8 @@ class Tool(str, Enum):
     gmail = "gmail"
     calendar = "calendar"
     internal_dashboard = "internal_dashboard"
+    jira = "jira"
+    slack = "slack"
 
 
 class ActionStatus(str, Enum):

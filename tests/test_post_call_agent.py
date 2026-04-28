@@ -681,7 +681,7 @@ async def test_planner_action_params_contain_call_id():
 @pytest.mark.asyncio
 async def test_planner_tool_mapping_is_valid():
     """각 action 의 tool 값이 허용된 enum 값이어야 한다."""
-    allowed_tools = {"company_db", "gmail", "calendar", "internal_dashboard"}
+    allowed_tools = {"company_db", "gmail", "calendar", "internal_dashboard", "jira", "slack"}
     state = _make_planner_state(
         call_id="p-011",
         summary={

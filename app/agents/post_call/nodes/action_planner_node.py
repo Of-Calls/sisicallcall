@@ -102,11 +102,14 @@ def _build_plan(
         _add("create_voc_issue", "company_db", {},
              "negative+반복 문의 → VOC 등록")
 
-    # ── Rule 5: critical priority → send_manager_email 필수 ──────────────────
+    # ── Rule 5: critical priority → send_manager_email + send_slack_alert 필수 ──
     if priority_level == "critical":
         _add("send_manager_email", "gmail",
              {"subject": f"[CRITICAL] {call_id}", "to": "manager@example.com"},
              "critical priority → 팀장 이메일 필수")
+        _add("send_slack_alert", "slack",
+             {"channel": "#alerts", "message": f"[CRITICAL] {call_id}: {summary_short}"},
+             "critical priority → Slack 알림 필수")
 
     # ── Rule 6: 콜백 필요성 감지 ──────────────────────────────────────────────
     if _is_callback_needed(handoff_notes, suggested_action):

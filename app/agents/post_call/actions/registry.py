@@ -73,11 +73,15 @@ def _register_defaults() -> None:
     from app.agents.post_call.actions.gmail_action import GmailAction
     from app.agents.post_call.actions.company_db_action import CompanyDBAction
     from app.agents.post_call.actions.calendar_action import CalendarAction
+    from app.agents.post_call.actions.jira_action import JiraAction
+    from app.agents.post_call.actions.slack_action import SlackAction
 
     register("gmail", GmailAction())
     register("company_db", CompanyDBAction())
     register("calendar", CalendarAction())
     register("internal_dashboard", InternalDashboardAction())
+    register("jira", JiraAction())
+    register("slack", SlackAction())
 
 
 _register_defaults()

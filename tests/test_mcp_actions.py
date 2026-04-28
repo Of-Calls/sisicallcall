@@ -303,15 +303,27 @@ async def test_execute_actions_one_fail_does_not_stop_others():
 # ── KDT-76 후속 보강: registry / result helper 테스트 ─────────────────────────
 
 def test_default_tools_registered():
-    """기본 4개 tool이 registry에 등록되어 있어야 한다."""
+    """기본 6개 tool이 registry에 등록되어 있어야 한다."""
     tools = registered_tools()
-    for tool in ("gmail", "company_db", "calendar", "internal_dashboard"):
+    for tool in ("gmail", "company_db", "calendar", "internal_dashboard", "jira", "slack"):
         assert tool in tools, f"기본 tool {tool!r} 이 registry에 없음"
+
+
+def test_jira_tool_registered():
+    """jira tool이 registry에 등록되어 있어야 한다."""
+    assert get_handler("jira") is not None
+    assert hasattr(get_handler("jira"), "execute")
+
+
+def test_slack_tool_registered():
+    """slack tool이 registry에 등록되어 있어야 한다."""
+    assert get_handler("slack") is not None
+    assert hasattr(get_handler("slack"), "execute")
 
 
 def test_get_handler_returns_handler_for_known_tools():
     """알려진 tool 이름으로 handler를 조회할 수 있어야 한다."""
-    for tool in ("gmail", "company_db", "calendar", "internal_dashboard"):
+    for tool in ("gmail", "company_db", "calendar", "internal_dashboard", "jira", "slack"):
         handler = get_handler(tool)
         assert handler is not None, f"{tool!r} handler가 None"
         assert hasattr(handler, "execute"), f"{tool!r} handler에 execute 메서드 없음"
@@ -373,22 +385,22 @@ async def test_handler_exception_continues_next_action():
 async def test_register_new_handler_and_execute():
     """새 dummy handler를 registry에 등록하면 execute_actions로 즉시 실행 가능하다."""
 
-    class DummySlackAction:
+    class DummyTestAction:
         async def execute(self, action, *, call_id, tenant_id=""):
             return {
-                "external_id": f"slack-{call_id}",
+                "external_id": f"dummy-{call_id}",
                 "status": "success",
                 "result": {"posted": True, "channel": action.get("params", {}).get("channel", "#general")},
             }
 
-    register("slack", DummySlackAction())
+    register("dummy_test", DummyTestAction())
     try:
         results = await execute_actions(
             call_id="reg-001",
             tenant_id="t",
             actions=[{
-                "action_type": "post_slack_message",
-                "tool": "slack",
+                "action_type": "post_message",
+                "tool": "dummy_test",
                 "params": {"channel": "#alerts"},
                 "status": "pending",
             }],
@@ -396,9 +408,9 @@ async def test_register_new_handler_and_execute():
         assert results[0]["status"] == "success"
         assert results[0]["result"]["posted"] is True
         assert results[0]["result"]["channel"] == "#alerts"
-        assert results[0]["external_id"] == "slack-reg-001"
+        assert results[0]["external_id"] == "dummy-reg-001"
     finally:
-        unregister("slack")
+        unregister("dummy_test")
 
 
 @pytest.mark.asyncio
@@ -449,3 +461,98 @@ def test_real_mode_env_does_not_break_import(monkeypatch):
     assert gmail_mod.GmailMCPService is not None
     assert cdb_mod.CompanyDBMCPService is not None
     assert cal_mod.CalendarMCPService is not None
+
+
+# ── MCPClient 경유 실행 테스트 ────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_gmail_action_via_mcp_client(executor):
+    """GmailAction이 MCPClient/connector 경유로 실행된다."""
+    action = {
+        "action_type": ActionType.send_manager_email.value,
+        "tool": Tool.gmail.value,
+        "params": {"subject": "MCPClient 경유 테스트", "to": "mgr@example.com"},
+        "status": ActionStatus.pending.value,
+    }
+    results = await executor.execute_all([action], call_id="mcp-001")
+    assert results[0]["status"] == "success"
+    assert results[0]["result"]["sent"] is True
+    assert results[0]["external_id"] == "gmail-mock-mcp-001"
+
+
+@pytest.mark.asyncio
+async def test_jira_action_via_mcp_client(executor):
+    """JiraAction이 MCPClient/connector 경유로 실행된다."""
+    action = {
+        "action_type": "create_jira_issue",
+        "tool": "jira",
+        "params": {"summary_short": "Jira 이슈 테스트"},
+        "status": "pending",
+    }
+    results = await executor.execute_all([action], call_id="mcp-002")
+    assert results[0]["status"] == "success"
+    assert results[0]["external_id"] == "jira-mock-mcp-002"
+    assert results[0]["result"]["mock"] is True
+
+
+@pytest.mark.asyncio
+async def test_slack_action_via_mcp_client(executor):
+    """SlackAction이 MCPClient/connector 경유로 실행된다."""
+    action = {
+        "action_type": "send_slack_alert",
+        "tool": "slack",
+        "params": {"channel": "#critical", "message": "[CRITICAL] 테스트"},
+        "status": "pending",
+    }
+    results = await executor.execute_all([action], call_id="mcp-003")
+    assert results[0]["status"] == "success"
+    assert results[0]["external_id"] == "slack-mock-mcp-003"
+    assert results[0]["result"]["channel"] == "#critical"
+    assert results[0]["result"]["mock"] is True
+
+
+@pytest.mark.asyncio
+async def test_execute_all_six_action_types(executor):
+    """execute_actions가 gmail/jira/slack/calendar/company_db/internal_dashboard를 모두 실행 가능하다."""
+    actions = [
+        {"action_type": "send_manager_email",  "tool": "gmail",              "params": {}, "status": "pending"},
+        {"action_type": "create_jira_issue",   "tool": "jira",               "params": {}, "status": "pending"},
+        {"action_type": "send_slack_alert",    "tool": "slack",              "params": {}, "status": "pending"},
+        {"action_type": "schedule_callback",   "tool": "calendar",           "params": {}, "status": "pending"},
+        {"action_type": "create_voc_issue",    "tool": "company_db",         "params": {}, "status": "pending"},
+        {"action_type": "add_priority_queue",  "tool": "internal_dashboard", "params": {}, "status": "pending"},
+    ]
+    results = await execute_actions(call_id="six-001", tenant_id="t", actions=actions)
+    assert len(results) == 6
+    for r in results:
+        assert r["status"] == "success", f"action {r['action_type']} failed: {r.get('error')}"
+
+
+@pytest.mark.asyncio
+async def test_one_connector_failure_does_not_stop_others(executor):
+    """하나의 connector 실패가 전체 실행을 막지 않는다."""
+    actions = [
+        {"action_type": "noop", "tool": "nonexistent_tool", "params": {}, "status": "pending"},
+        {"action_type": "send_manager_email", "tool": "gmail", "params": {}, "status": "pending"},
+        {"action_type": "send_slack_alert", "tool": "slack", "params": {}, "status": "pending"},
+    ]
+    results = await execute_actions(call_id="fail-001", tenant_id="t", actions=actions)
+    assert len(results) == 3
+    assert results[0]["status"] == "failed"
+    assert results[1]["status"] == "success"
+    assert results[2]["status"] == "success"
+
+
+@pytest.mark.asyncio
+async def test_all_action_results_have_standard_6_keys(executor):
+    """모든 action result가 action_type/tool/status/external_id/error/result 키를 포함한다."""
+    actions = [
+        {"action_type": "send_manager_email",  "tool": "gmail",      "params": {}, "status": "pending"},
+        {"action_type": "create_jira_issue",   "tool": "jira",       "params": {}, "status": "pending"},
+        {"action_type": "send_slack_alert",    "tool": "slack",      "params": {}, "status": "pending"},
+        {"action_type": "noop",                "tool": "bad_tool",   "params": {}, "status": "pending"},
+    ]
+    results = await execute_actions(call_id="key-001", tenant_id="t", actions=actions)
+    for r in results:
+        for key in ("action_type", "tool", "status", "external_id", "error", "result"):
+            assert key in r, f"action {r.get('action_type')} 결과에 {key!r} 키 없음"
