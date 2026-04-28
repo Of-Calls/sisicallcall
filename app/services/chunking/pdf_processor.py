@@ -15,7 +15,7 @@
 import asyncio
 import json
 import re
-import subprocess
+import tempfile
 import uuid
 from pathlib import Path
 from typing import Optional
@@ -56,33 +56,22 @@ _RCS = RecursiveCharacterTextSplitter(
 #   3 PDF 모두 opendataloader 가 chunks 수↓·평균↑·헤더 hierarchy 인식 압도적,
 #   docling 의 13~18배 빠름. PyTorch 의존 0 (XTTS cu124 트라이앵글 안전).
 #   JVM 11+ 만 필요 (로컬 Temurin 17 검증, Dockerfile 은 eclipse-temurin:17-jre-jammy).
-# venv 격리: docling install 시도에서 본 venv 의 torch cu124 가 강제 다운그레이드된
-# 사고 (2026-04-28) 후 별도 venv-docling 으로 분리. opendataloader 도 동 venv 에 함께 설치.
-_PROJECT_ROOT = Path(__file__).resolve().parents[3]
-_PARSER_PYTHON = _PROJECT_ROOT / "venv-docling" / "Scripts" / "python.exe"
-_OPENDATALOADER_RUNNER = _PROJECT_ROOT / "scripts" / "_opendataloader_runner.py"
 
 
 def _extract_text(pdf_path: str) -> str:
-    """PDF → 마크다운. 우선 opendataloader (venv-docling subprocess), 실패 시 pymupdf4llm fallback."""
-    pdf = Path(pdf_path)
-    if _PARSER_PYTHON.exists() and _OPENDATALOADER_RUNNER.exists():
-        out_md = _PROJECT_ROOT / "tmp" / f"_odl_pdfproc_{pdf.stem}_{uuid.uuid4().hex[:8]}.md"
-        out_md.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            subprocess.run(
-                [str(_PARSER_PYTHON), str(_OPENDATALOADER_RUNNER), str(pdf), str(out_md)],
-                check=True, capture_output=True, timeout=600,
-            )
-            text = out_md.read_text(encoding="utf-8")
-            logger.info("pdf parsed by opendataloader len=%d path=%s", len(text), pdf_path)
-            try:
-                out_md.unlink()
-            except OSError:
-                pass
-            return text
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as e:
-            logger.warning("opendataloader failed (%s) — fallback to pymupdf4llm: %s", e, pdf_path)
+    """PDF → 마크다운. opendataloader-pdf 우선, 실패(JVM 미설치 등) 시 pymupdf4llm fallback."""
+    try:
+        from opendataloader_pdf import convert
+        with tempfile.TemporaryDirectory(prefix="odl_") as tmp:
+            convert(input_path=pdf_path, output_dir=tmp, format="markdown", quiet=True)
+            md_files = list(Path(tmp).rglob("*.md"))
+            if not md_files:
+                raise RuntimeError("opendataloader produced no markdown output")
+            text = md_files[0].read_text(encoding="utf-8")
+        logger.info("pdf parsed by opendataloader len=%d path=%s", len(text), pdf_path)
+        return text
+    except Exception as e:
+        logger.warning("opendataloader failed (%s) — fallback to pymupdf4llm: %s", e, pdf_path)
 
     import pymupdf4llm
     text = pymupdf4llm.to_markdown(pdf_path)
