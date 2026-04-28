@@ -16,6 +16,11 @@ class ActionType(str, Enum):
     mark_faq_candidate = "mark_faq_candidate"
     create_jira_issue = "create_jira_issue"
     send_slack_alert = "send_slack_alert"
+    send_callback_sms = "send_callback_sms"
+    send_voc_receipt_sms = "send_voc_receipt_sms"
+    send_reservation_confirmation = "send_reservation_confirmation"
+    create_notion_call_record = "create_notion_call_record"
+    create_notion_voc_record = "create_notion_voc_record"
 
 
 class Tool(str, Enum):
@@ -25,6 +30,8 @@ class Tool(str, Enum):
     internal_dashboard = "internal_dashboard"
     jira = "jira"
     slack = "slack"
+    sms = "sms"
+    notion = "notion"
 
 
 class ActionStatus(str, Enum):

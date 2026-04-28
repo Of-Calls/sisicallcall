@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 from app.agents.post_call.state import PostCallAgentState
 from app.utils.logger import get_logger
 
@@ -22,6 +24,7 @@ def _build_plan(
     summary: dict,
     voc: dict,
     priority: dict,
+    customer_phone: str = "",
 ) -> dict:
     """rule-based action plan 생성기.
 
@@ -95,6 +98,15 @@ def _build_plan(
              "angry+에스컬레이션 → 팀장 이메일")
         _add("add_priority_queue", "internal_dashboard", {},
              "angry+에스컬레이션 → 우선순위 큐")
+        _add("send_slack_alert", "slack",
+             {"channel": "#alerts", "message": f"[긴급] {call_id}: {summary_short}"},
+             "angry+에스컬레이션 → Slack 긴급 알림")
+        _add("send_voc_receipt_sms", "sms",
+             {"customer_phone": customer_phone},
+             "angry+에스컬레이션 → SMS VOC 접수 안내")
+        _add("create_notion_voc_record", "notion",
+             {"customer_phone": customer_phone},
+             "angry+에스컬레이션 → Notion VOC 기록")
 
     # ── Rule 4: negative + repeated issue ─────────────────────────────────────
     is_negative: bool = sentiment in ("negative", "angry") or emotion in ("negative", "angry")
@@ -102,7 +114,7 @@ def _build_plan(
         _add("create_voc_issue", "company_db", {},
              "negative+반복 문의 → VOC 등록")
 
-    # ── Rule 5: critical priority → send_manager_email + send_slack_alert 필수 ──
+    # ── Rule 5: critical priority → 필수 액션 ─────────────────────────────────
     if priority_level == "critical":
         _add("send_manager_email", "gmail",
              {"subject": f"[CRITICAL] {call_id}", "to": "manager@example.com"},
@@ -110,12 +122,21 @@ def _build_plan(
         _add("send_slack_alert", "slack",
              {"channel": "#alerts", "message": f"[CRITICAL] {call_id}: {summary_short}"},
              "critical priority → Slack 알림 필수")
+        _add("create_notion_voc_record", "notion",
+             {"customer_phone": customer_phone},
+             "critical priority → Notion VOC 기록")
+        _add("send_voc_receipt_sms", "sms",
+             {"customer_phone": customer_phone},
+             "critical priority → SMS VOC 접수 안내")
 
     # ── Rule 6: 콜백 필요성 감지 ──────────────────────────────────────────────
     if _is_callback_needed(handoff_notes, suggested_action):
         _add("schedule_callback", "calendar",
              {"callback_reason": suggested_action or "에스컬레이션 후 콜백"},
              "콜백 필요 감지 → 콜백 예약")
+        _add("send_callback_sms", "sms",
+             {"customer_phone": customer_phone},
+             "콜백 필요 감지 → SMS 콜백 안내")
 
     # ── Rule 7: faq_candidate ─────────────────────────────────────────────────
     # Rule 2 ("action_required=false여도 faq_candidate=true이면 생성 가능") 도 여기서 처리
@@ -123,6 +144,12 @@ def _build_plan(
         _add("mark_faq_candidate", "internal_dashboard",
              {"question": primary_category},
              "faq_candidate=True → FAQ 후보 등록")
+
+    # ── Rule N4: POST_CALL_ENABLE_NOTION_RECORD=true → 모든 통화 Notion 저장 ──
+    if os.getenv("POST_CALL_ENABLE_NOTION_RECORD", "").lower() in ("1", "true"):
+        _add("create_notion_call_record", "notion",
+             {"customer_phone": customer_phone},
+             "POST_CALL_ENABLE_NOTION_RECORD=true → Notion 통화 기록")
 
     # ── 기본 폴백: high/critical + action_required 이면 VOC 등록 보장 ──────────
     if action_required and priority_level in ("high", "critical") and "create_voc_issue" not in action_set:
@@ -152,6 +179,8 @@ async def action_planner_node(state: PostCallAgentState) -> dict:
         summary: dict = state.get("summary") or {}        # type: ignore[call-overload]
         voc: dict = state.get("voc_analysis") or {}       # type: ignore[call-overload]
         priority: dict = state.get("priority_result") or {}  # type: ignore[call-overload]
+        metadata: dict = state.get("call_metadata") or {}  # type: ignore[call-overload]
+        customer_phone: str = metadata.get("customer_phone", "")
 
         plan = _build_plan(
             call_id=call_id,
@@ -159,6 +188,7 @@ async def action_planner_node(state: PostCallAgentState) -> dict:
             summary=summary,
             voc=voc,
             priority=priority,
+            customer_phone=customer_phone,
         )
         logger.info(
             "action_planner 완료 call_id=%s actions=%d action_required=%s",

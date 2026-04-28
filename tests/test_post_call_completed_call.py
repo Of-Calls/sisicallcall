@@ -452,3 +452,201 @@ async def test_angry_critical_generates_and_executes_required_actions(monkeypatc
     for a in executed:
         for key in ("action_type", "tool", "status", "external_id", "error", "result"):
             assert key in a, f"action {a.get('action_type')} 에 {key!r} 키 없음"
+
+
+# ── 시연용 demo context 통합 테스트 ──────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_demo_context_generates_required_action_plan(monkeypatch):
+    """demo context가 action_planner에서 Calendar/Slack/SMS/Notion 액션을 생성한다."""
+    from tests.fixtures.demo_post_call_context import (
+        DEMO_POST_CALL_CONTEXT, DEMO_LLM_SUMMARY, DEMO_LLM_VOC, DEMO_LLM_PRIORITY,
+    )
+    from app.agents.post_call.nodes.action_planner_node import _build_plan
+
+    plan = _build_plan(
+        call_id=DEMO_POST_CALL_CONTEXT["metadata"]["call_id"],
+        tenant_id=DEMO_POST_CALL_CONTEXT["metadata"]["tenant_id"],
+        summary=DEMO_LLM_SUMMARY,
+        voc=DEMO_LLM_VOC,
+        priority=DEMO_LLM_PRIORITY,
+        customer_phone=DEMO_POST_CALL_CONTEXT["metadata"]["customer_phone"],
+    )
+
+    assert plan["action_required"] is True
+    action_types = {a["action_type"] for a in plan["actions"]}
+
+    # Calendar: 콜백 필요 → schedule_callback
+    assert "schedule_callback" in action_types, f"schedule_callback 없음: {action_types}"
+    # Slack: critical + angry+escalated
+    assert "send_slack_alert" in action_types, f"send_slack_alert 없음: {action_types}"
+    # SMS: 콜백 → send_callback_sms 또는 VOC → send_voc_receipt_sms
+    sms_types = {"send_callback_sms", "send_voc_receipt_sms"}
+    assert action_types & sms_types, f"SMS 액션 없음: {action_types}"
+    # Notion: critical + angry+escalated
+    notion_types = {"create_notion_call_record", "create_notion_voc_record"}
+    assert action_types & notion_types, f"Notion 액션 없음: {action_types}"
+
+
+@pytest.mark.asyncio
+async def test_demo_context_customer_phone_in_sms_params(monkeypatch):
+    """SMS 액션 params에 customer_phone이 포함된다."""
+    from tests.fixtures.demo_post_call_context import (
+        DEMO_POST_CALL_CONTEXT, DEMO_LLM_SUMMARY, DEMO_LLM_VOC, DEMO_LLM_PRIORITY,
+    )
+    from app.agents.post_call.nodes.action_planner_node import _build_plan
+
+    plan = _build_plan(
+        call_id="demo-call-critical",
+        tenant_id="demo-tenant",
+        summary=DEMO_LLM_SUMMARY,
+        voc=DEMO_LLM_VOC,
+        priority=DEMO_LLM_PRIORITY,
+        customer_phone="01099990000",
+    )
+
+    sms_actions = [a for a in plan["actions"] if a["tool"] == "sms"]
+    assert len(sms_actions) > 0, "SMS 액션이 없음"
+    for a in sms_actions:
+        assert a["params"].get("customer_phone") == "01099990000", \
+            f"customer_phone 없음: {a['params']}"
+
+
+@pytest.mark.asyncio
+async def test_demo_notion_record_env_adds_call_record(monkeypatch):
+    """POST_CALL_ENABLE_NOTION_RECORD=true이면 create_notion_call_record가 추가된다."""
+    from tests.fixtures.demo_post_call_context import (
+        DEMO_LLM_SUMMARY, DEMO_LLM_VOC, DEMO_LLM_PRIORITY,
+    )
+    from app.agents.post_call.nodes.action_planner_node import _build_plan
+
+    monkeypatch.setenv("POST_CALL_ENABLE_NOTION_RECORD", "true")
+
+    plan = _build_plan(
+        call_id="demo-call-critical",
+        tenant_id="demo-tenant",
+        summary=DEMO_LLM_SUMMARY,
+        voc=DEMO_LLM_VOC,
+        priority=DEMO_LLM_PRIORITY,
+        customer_phone="01099990000",
+    )
+
+    action_types = {a["action_type"] for a in plan["actions"]}
+    assert "create_notion_call_record" in action_types
+
+    monkeypatch.delenv("POST_CALL_ENABLE_NOTION_RECORD", raising=False)
+
+
+@pytest.mark.asyncio
+async def test_demo_all_actions_standard_format(monkeypatch):
+    """demo plan의 모든 action이 표준 포맷을 유지한다."""
+    from tests.fixtures.demo_post_call_context import (
+        DEMO_LLM_SUMMARY, DEMO_LLM_VOC, DEMO_LLM_PRIORITY,
+    )
+    from app.agents.post_call.nodes.action_planner_node import _build_plan
+    from app.agents.post_call.actions.executor import execute_actions
+
+    plan = _build_plan(
+        call_id="demo-fmt-001",
+        tenant_id="demo-tenant",
+        summary=DEMO_LLM_SUMMARY,
+        voc=DEMO_LLM_VOC,
+        priority=DEMO_LLM_PRIORITY,
+        customer_phone="01099990000",
+    )
+
+    results = await execute_actions(
+        call_id="demo-fmt-001",
+        tenant_id="demo-tenant",
+        actions=plan["actions"],
+    )
+
+    for r in results:
+        for key in ("action_type", "tool", "status", "external_id", "error", "result"):
+            assert key in r, f"action {r.get('action_type')} 에 {key!r} 키 없음"
+
+
+@pytest.mark.asyncio
+async def test_demo_slack_failure_does_not_stop_others(monkeypatch):
+    """Slack 실패가 Calendar/SMS/Notion 실행을 막지 않는다."""
+    from app.agents.post_call.actions.executor import execute_actions
+    from app.agents.post_call.actions.registry import register, unregister
+
+    class ExplodingSlack:
+        async def execute(self, action, *, call_id, tenant_id=""):
+            raise RuntimeError("Slack 의도적 폭발")
+
+    register("slack_demo_fail", ExplodingSlack())
+    try:
+        actions = [
+            {"action_type": "send_slack_alert",          "tool": "slack_demo_fail", "params": {}, "status": "pending"},
+            {"action_type": "schedule_callback",         "tool": "calendar",        "params": {}, "status": "pending"},
+            {"action_type": "send_callback_sms",         "tool": "sms",             "params": {"customer_phone": "01099990000"}, "status": "pending"},
+            {"action_type": "create_notion_call_record", "tool": "notion",          "params": {}, "status": "pending"},
+        ]
+        results = await execute_actions(call_id="slack-fail-demo", tenant_id="demo-tenant", actions=actions)
+        assert len(results) == 4
+        assert results[0]["status"] == "failed"   # slack 폭발
+        assert results[1]["status"] == "success"  # calendar ok
+        assert results[2]["status"] == "success"  # sms ok
+        assert results[3]["status"] == "success"  # notion ok
+    finally:
+        unregister("slack_demo_fail")
+
+
+@pytest.mark.asyncio
+async def test_demo_full_flow_with_mock_llm(monkeypatch):
+    """demo context + mock LLM으로 전체 Post-call 플로우 실행 → executed_actions 검증."""
+    from app.agents.post_call.completed_call_runner import run_post_call_for_completed_call
+    from tests.fixtures.demo_post_call_context import (
+        DEMO_POST_CALL_CONTEXT, DEMO_LLM_SUMMARY, DEMO_LLM_VOC, DEMO_LLM_PRIORITY,
+    )
+    import copy
+
+    ctx = copy.deepcopy(DEMO_POST_CALL_CONTEXT)
+
+    async def fake_db(call_id, tenant_id=None):
+        return copy.deepcopy(ctx)
+
+    monkeypatch.setattr(
+        "app.agents.post_call.context_provider.get_completed_call_context_from_db",
+        fake_db,
+    )
+
+    class DemoMockLLM:
+        async def call_json(self, system_prompt, user_message, max_tokens=1024):
+            if "summary_short" in system_prompt:
+                return DEMO_LLM_SUMMARY
+            if "sentiment_result" in system_prompt:
+                return DEMO_LLM_VOC
+            return DEMO_LLM_PRIORITY
+
+    import app.agents.post_call.nodes.summary_node as summary_mod
+    import app.agents.post_call.nodes.voc_analysis_node as voc_mod
+    import app.agents.post_call.nodes.priority_node as priority_mod
+
+    mock_llm = DemoMockLLM()
+    monkeypatch.setattr(summary_mod, "_caller", mock_llm)
+    monkeypatch.setattr(voc_mod, "_caller", mock_llm)
+    monkeypatch.setattr(priority_mod, "_caller", mock_llm)
+
+    result = await run_post_call_for_completed_call(
+        call_id="demo-call-critical",
+        tenant_id="demo-tenant",
+        trigger="call_ended",
+    )
+
+    assert result["ok"] is True
+    agent_result = result["result"]
+    executed = agent_result.get("executed_actions", [])
+    assert isinstance(executed, list)
+    assert len(executed) > 0, "executed_actions가 비어 있음"
+
+    action_types = {a["action_type"] for a in executed}
+    assert "schedule_callback" in action_types, f"schedule_callback 없음: {action_types}"
+    assert "send_slack_alert" in action_types, f"send_slack_alert 없음: {action_types}"
+
+    # 모든 action이 표준 6-key 포맷
+    for a in executed:
+        for key in ("action_type", "tool", "status", "external_id", "error", "result"):
+            assert key in a, f"action {a.get('action_type')} 에 {key!r} 키 없음"

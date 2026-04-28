@@ -271,7 +271,7 @@ def test_mcp_client_registered_tools():
     from app.services.mcp.client import mcp_client
 
     tools = mcp_client.registered_tools()
-    for expected in ("gmail", "calendar", "company_db", "jira", "slack"):
+    for expected in ("gmail", "calendar", "company_db", "jira", "slack", "sms", "notion"):
         assert expected in tools, f"기본 등록 tool {expected!r} 이 없음"
 
 
@@ -725,3 +725,472 @@ async def test_calendar_access_token_not_in_result(monkeypatch):
     reset_fernet_cache()
     monkeypatch.delenv("MCP_USE_TENANT_OAUTH", raising=False)
     monkeypatch.delenv("TOKEN_ENCRYPTION_KEY", raising=False)
+
+
+# ── Slack tenant OAuth helper ────────────────────────────────────────────────
+
+def _setup_slack_tenant(monkeypatch, enc_token: str, tenant_id: str = "slack-tenant") -> None:
+    from app.models.tenant_integration import TenantIntegration, IntegrationStatus
+    from app.repositories.tenant_integration_repo import tenant_integration_repo, upsert_integration
+    tenant_integration_repo.clear_integrations()
+    upsert_integration(TenantIntegration(
+        tenant_id=tenant_id,
+        provider="slack",
+        status=IntegrationStatus.connected,
+        access_token_encrypted=enc_token,
+    ))
+
+
+def _make_mock_slack_client(status_code: int, json_data: dict):
+    from unittest.mock import MagicMock, AsyncMock
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = status_code
+    mock_resp.json.return_value = json_data
+    mock_resp.text = str(json_data)
+
+    mock_client = AsyncMock()
+    mock_client.post = AsyncMock(return_value=mock_resp)
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+    return mock_client
+
+
+
+# ── 27. Slack: tenant token 있을 때 chat.postMessage 성공 ────────────────────
+
+@pytest.mark.asyncio
+async def test_slack_real_api_success(monkeypatch):
+    from cryptography.fernet import Fernet
+    import httpx
+    from app.services.oauth.token_crypto import reset_fernet_cache, encrypt_token
+    from app.services.mcp.connectors.slack_connector import SlackConnector
+
+    plaintext_token = "xoxb-fake-slack-bot-token"
+    key = Fernet.generate_key()
+    monkeypatch.setenv("TOKEN_ENCRYPTION_KEY", key.decode())
+    monkeypatch.setenv("MCP_USE_TENANT_OAUTH", "true")
+    monkeypatch.setenv("SLACK_ALERT_CHANNEL", "#alerts")
+    reset_fernet_cache()
+    enc = encrypt_token(plaintext_token)
+    _setup_slack_tenant(monkeypatch, enc)
+
+    api_response = {"ok": True, "channel": "C123456", "ts": "1745900000.123456", "message": {"text": "[CRITICAL]"}}
+    mock_client = _make_mock_slack_client(200, api_response)
+    monkeypatch.setattr(httpx, "AsyncClient", lambda: mock_client)
+
+    connector = SlackConnector()
+    result = await connector.execute(
+        "send_slack_alert",
+        {"channel": "#alerts", "message": "[CRITICAL] demo-call"},
+        call_id="slack-001",
+        tenant_id="slack-tenant",
+    )
+
+    assert result["status"] == "success"
+    assert result["error"] is None
+    assert result["result"]["channel"] == "C123456"
+    assert result["result"]["ts"] == "1745900000.123456"
+    assert plaintext_token not in str(result)
+    for key_ in ("status", "external_id", "result", "error"):
+        assert key_ in result
+
+    from app.repositories.tenant_integration_repo import tenant_integration_repo
+    tenant_integration_repo.clear_integrations()
+    reset_fernet_cache()
+    monkeypatch.delenv("MCP_USE_TENANT_OAUTH", raising=False)
+    monkeypatch.delenv("TOKEN_ENCRYPTION_KEY", raising=False)
+
+
+# ── 28. Slack: API ok=false → failed ────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_slack_real_api_ok_false(monkeypatch):
+    from cryptography.fernet import Fernet
+    import httpx
+    from app.services.oauth.token_crypto import reset_fernet_cache, encrypt_token
+    from app.services.mcp.connectors.slack_connector import SlackConnector
+
+    key = Fernet.generate_key()
+    monkeypatch.setenv("TOKEN_ENCRYPTION_KEY", key.decode())
+    monkeypatch.setenv("MCP_USE_TENANT_OAUTH", "true")
+    monkeypatch.setenv("SLACK_ALERT_CHANNEL", "#alerts")
+    reset_fernet_cache()
+    enc = encrypt_token("xoxb-fake-token")
+    _setup_slack_tenant(monkeypatch, enc)
+
+    mock_client = _make_mock_slack_client(200, {"ok": False, "error": "not_in_channel"})
+    monkeypatch.setattr(httpx, "AsyncClient", lambda: mock_client)
+
+    connector = SlackConnector()
+    result = await connector.execute("send_slack_alert", {}, call_id="slack-002", tenant_id="slack-tenant")
+
+    assert result["status"] == "failed"
+    assert "not_in_channel" in result["error"]
+
+    from app.repositories.tenant_integration_repo import tenant_integration_repo
+    tenant_integration_repo.clear_integrations()
+    reset_fernet_cache()
+    monkeypatch.delenv("MCP_USE_TENANT_OAUTH", raising=False)
+    monkeypatch.delenv("TOKEN_ENCRYPTION_KEY", raising=False)
+
+
+# ── 29. Slack: HTTP 오류 → failed ─────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_slack_real_api_http_failure(monkeypatch):
+    from cryptography.fernet import Fernet
+    import httpx
+    from app.services.oauth.token_crypto import reset_fernet_cache, encrypt_token
+    from app.services.mcp.connectors.slack_connector import SlackConnector
+
+    key = Fernet.generate_key()
+    monkeypatch.setenv("TOKEN_ENCRYPTION_KEY", key.decode())
+    monkeypatch.setenv("MCP_USE_TENANT_OAUTH", "true")
+    monkeypatch.setenv("SLACK_ALERT_CHANNEL", "#alerts")
+    reset_fernet_cache()
+    enc = encrypt_token("xoxb-fake-token")
+    _setup_slack_tenant(monkeypatch, enc)
+
+    mock_client = _make_mock_slack_client(500, {})
+    monkeypatch.setattr(httpx, "AsyncClient", lambda: mock_client)
+
+    connector = SlackConnector()
+    result = await connector.execute("send_slack_alert", {}, call_id="slack-003", tenant_id="slack-tenant")
+
+    assert result["status"] == "failed"
+    assert "500" in result["error"]
+
+    from app.repositories.tenant_integration_repo import tenant_integration_repo
+    tenant_integration_repo.clear_integrations()
+    reset_fernet_cache()
+    monkeypatch.delenv("MCP_USE_TENANT_OAUTH", raising=False)
+    monkeypatch.delenv("TOKEN_ENCRYPTION_KEY", raising=False)
+
+
+# ── 30. Slack: channel 우선순위 ───────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_slack_channel_priority(monkeypatch):
+    from cryptography.fernet import Fernet
+    import httpx
+    from app.services.oauth.token_crypto import reset_fernet_cache, encrypt_token
+    from app.services.mcp.connectors.slack_connector import SlackConnector
+    from unittest.mock import AsyncMock, MagicMock
+
+    key = Fernet.generate_key()
+    monkeypatch.setenv("TOKEN_ENCRYPTION_KEY", key.decode())
+    monkeypatch.setenv("MCP_USE_TENANT_OAUTH", "true")
+    monkeypatch.setenv("SLACK_ALERT_CHANNEL", "#env-alerts")
+    monkeypatch.setenv("SLACK_CRITICAL_CHANNEL", "#critical-channel")
+    reset_fernet_cache()
+    enc = encrypt_token("xoxb-fake")
+    _setup_slack_tenant(monkeypatch, enc)
+
+    captured_bodies = []
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = {"ok": True, "channel": "C1", "ts": "1.0", "message": {}}
+    mock_resp.text = ""
+    mock_client = AsyncMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+
+    async def _post(url, *, json=None, headers=None, timeout=None):
+        captured_bodies.append(json or {})
+        return mock_resp
+
+    mock_client.post = _post
+    monkeypatch.setattr(httpx, "AsyncClient", lambda: mock_client)
+
+    connector = SlackConnector()
+
+    captured_bodies.clear()
+    await connector.execute("send_slack_alert", {"channel": "#params-channel"}, call_id="ch-1", tenant_id="slack-tenant")
+    assert captured_bodies[0]["channel"] == "#params-channel"
+
+    captured_bodies.clear()
+    await connector.execute("send_slack_alert", {"channel_type": "critical"}, call_id="ch-2", tenant_id="slack-tenant")
+    assert captured_bodies[0]["channel"] == "#critical-channel"
+
+    captured_bodies.clear()
+    await connector.execute("send_slack_alert", {}, call_id="ch-3", tenant_id="slack-tenant")
+    assert captured_bodies[0]["channel"] == "#env-alerts"
+
+    from app.repositories.tenant_integration_repo import tenant_integration_repo
+    tenant_integration_repo.clear_integrations()
+    reset_fernet_cache()
+    monkeypatch.delenv("MCP_USE_TENANT_OAUTH", raising=False)
+    monkeypatch.delenv("TOKEN_ENCRYPTION_KEY", raising=False)
+
+
+# ── 31. Slack: message 우선순위 ──────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_slack_message_priority(monkeypatch):
+    from cryptography.fernet import Fernet
+    import httpx
+    from app.services.oauth.token_crypto import reset_fernet_cache, encrypt_token
+    from app.services.mcp.connectors.slack_connector import SlackConnector
+    from unittest.mock import AsyncMock, MagicMock
+
+    key = Fernet.generate_key()
+    monkeypatch.setenv("TOKEN_ENCRYPTION_KEY", key.decode())
+    monkeypatch.setenv("MCP_USE_TENANT_OAUTH", "true")
+    monkeypatch.setenv("SLACK_ALERT_CHANNEL", "#alerts")
+    reset_fernet_cache()
+    enc = encrypt_token("xoxb-fake")
+    _setup_slack_tenant(monkeypatch, enc)
+
+    captured_bodies = []
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = {"ok": True, "channel": "C1", "ts": "1.0", "message": {}}
+    mock_resp.text = ""
+    mock_client = AsyncMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+
+    async def _post(url, *, json=None, headers=None, timeout=None):
+        captured_bodies.append(json or {})
+        return mock_resp
+
+    mock_client.post = _post
+    monkeypatch.setattr(httpx, "AsyncClient", lambda: mock_client)
+
+    connector = SlackConnector()
+
+    captured_bodies.clear()
+    await connector.execute("send_slack_alert", {"message": "msg-A"}, call_id="msg-1", tenant_id="slack-tenant")
+    assert captured_bodies[0]["text"] == "msg-A"
+
+    captured_bodies.clear()
+    await connector.execute("send_slack_alert", {"text": "text-B"}, call_id="msg-2", tenant_id="slack-tenant")
+    assert captured_bodies[0]["text"] == "text-B"
+
+    captured_bodies.clear()
+    await connector.execute("send_slack_alert", {"summary_short": "summary-C"}, call_id="msg-3", tenant_id="slack-tenant")
+    assert captured_bodies[0]["text"] == "summary-C"
+
+    captured_bodies.clear()
+    await connector.execute("send_slack_alert", {}, call_id="msg-4", tenant_id="slack-tenant")
+    assert captured_bodies[0]["text"] == "Post-call alert"
+
+    from app.repositories.tenant_integration_repo import tenant_integration_repo
+    tenant_integration_repo.clear_integrations()
+    reset_fernet_cache()
+    monkeypatch.delenv("MCP_USE_TENANT_OAUTH", raising=False)
+    monkeypatch.delenv("TOKEN_ENCRYPTION_KEY", raising=False)
+
+
+# ── 32. Slack: tenant token 없음 → skipped ──────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_slack_no_tenant_integration_skipped(monkeypatch):
+    from app.repositories.tenant_integration_repo import tenant_integration_repo
+    from app.services.mcp.connectors.slack_connector import SlackConnector
+
+    monkeypatch.setenv("MCP_USE_TENANT_OAUTH", "true")
+    monkeypatch.delenv("MCP_ALLOW_ENV_FALLBACK", raising=False)
+    tenant_integration_repo.clear_integrations()
+
+    connector = SlackConnector()
+    result = await connector.execute(
+        "send_slack_alert", {},
+        call_id="slack-notoken",
+        tenant_id="no-slack-tenant",
+    )
+
+    assert result["status"] == "skipped"
+    assert result["error"] == "tenant_integration_not_connected"
+    monkeypatch.delenv("MCP_USE_TENANT_OAUTH", raising=False)
+
+
+# ── 33. Slack: access_token 평문 미포함 ──────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_slack_access_token_not_in_result(monkeypatch):
+    from cryptography.fernet import Fernet
+    import httpx
+    from app.services.oauth.token_crypto import reset_fernet_cache, encrypt_token
+    from app.services.mcp.connectors.slack_connector import SlackConnector
+
+    plaintext_token = "xoxb-super-secret-do-not-leak-slack-token"
+    key = Fernet.generate_key()
+    monkeypatch.setenv("TOKEN_ENCRYPTION_KEY", key.decode())
+    monkeypatch.setenv("MCP_USE_TENANT_OAUTH", "true")
+    monkeypatch.setenv("SLACK_ALERT_CHANNEL", "#alerts")
+    reset_fernet_cache()
+    enc = encrypt_token(plaintext_token)
+    _setup_slack_tenant(monkeypatch, enc)
+
+    mock_client = _make_mock_slack_client(200, {"ok": True, "channel": "C1", "ts": "1.0", "message": {}})
+    monkeypatch.setattr(httpx, "AsyncClient", lambda: mock_client)
+
+    connector = SlackConnector()
+    result = await connector.execute("send_slack_alert", {}, call_id="slack-safe", tenant_id="slack-tenant")
+
+    assert plaintext_token not in str(result)
+    assert result["status"] == "success"
+
+    from app.repositories.tenant_integration_repo import tenant_integration_repo
+    tenant_integration_repo.clear_integrations()
+    reset_fernet_cache()
+    monkeypatch.delenv("MCP_USE_TENANT_OAUTH", raising=False)
+    monkeypatch.delenv("TOKEN_ENCRYPTION_KEY", raising=False)
+
+
+# ── 34. SMSConnector: mock success ──────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_sms_connector_mock_success(monkeypatch):
+    from app.services.mcp.connectors.sms_connector import SMSConnector
+    monkeypatch.delenv("SMS_MCP_REAL", raising=False)
+
+    connector = SMSConnector()
+    result = await connector.execute("send_callback_sms", {"customer_phone": "01012345678"}, call_id="sms-001")
+
+    assert result["status"] == "success"
+    assert result["external_id"] == "sms-mock-sms-001"
+    assert result["result"]["to"] == "01012345678"
+    assert result["result"]["mock"] is True
+    assert result["error"] is None
+    for key_ in ("status", "external_id", "result", "error"):
+        assert key_ in result
+
+
+# ── 35. SMSConnector: real mode Solapi monkeypatched ─────────────────────────
+
+@pytest.mark.asyncio
+async def test_sms_connector_real_mode_monkeypatched(monkeypatch):
+    from app.services.mcp.connectors.sms_connector import SMSConnector
+    monkeypatch.setenv("SMS_MCP_REAL", "true")
+    call_log = []
+
+    async def fake_send_real(self, to, message, call_id):
+        call_log.append((to, message))
+        return self._success(external_id=f"sms-solapi-{call_id}", result={"to": to, "sent": True})
+
+    monkeypatch.setattr(SMSConnector, "_send_real", fake_send_real)
+
+    connector = SMSConnector()
+    result = await connector.execute("send_callback_sms", {"customer_phone": "01099998888"}, call_id="sms-real-001")
+
+    assert result["status"] == "success"
+    assert result["result"]["sent"] is True
+    assert len(call_log) == 1
+    assert call_log[0][0] == "01099998888"
+
+
+# ── 36. SMSConnector: customer_phone 없음 → skipped ─────────────────────────
+
+@pytest.mark.asyncio
+async def test_sms_connector_missing_phone_skipped(monkeypatch):
+    from app.services.mcp.connectors.sms_connector import SMSConnector
+    monkeypatch.delenv("SMS_MCP_REAL", raising=False)
+
+    connector = SMSConnector()
+    result = await connector.execute("send_callback_sms", {}, call_id="sms-noPhone")
+
+    assert result["status"] == "skipped"
+    assert result["error"] == "customer_phone_missing"
+
+
+# ── 37. SMSConnector: send_voc_receipt_sms 템플릿 ────────────────────────────
+
+@pytest.mark.asyncio
+async def test_sms_connector_voc_receipt_template(monkeypatch):
+    from app.services.mcp.connectors.sms_connector import SMSConnector
+    monkeypatch.delenv("SMS_MCP_REAL", raising=False)
+
+    connector = SMSConnector()
+    result = await connector.execute("send_voc_receipt_sms", {"customer_phone": "01011112222"}, call_id="sms-voc-001")
+
+    assert result["status"] == "success"
+    assert "sms-voc-001" in result["result"]["message"]
+    assert "접수번호" in result["result"]["message"]
+
+
+# ── 38. NotionConnector: mock success ────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_notion_connector_mock_success(monkeypatch):
+    from app.services.mcp.connectors.notion_connector import NotionConnector
+    monkeypatch.delenv("NOTION_MCP_REAL", raising=False)
+
+    connector = NotionConnector()
+    result = await connector.execute("create_notion_call_record", {"summary_short": "테스트", "priority": "high"}, call_id="notion-001")
+
+    assert result["status"] == "success"
+    assert result["external_id"] == "notion-mock-notion-001"
+    assert result["result"]["mock"] is True
+    assert result["error"] is None
+    for key_ in ("status", "external_id", "result", "error"):
+        assert key_ in result
+
+
+# ── 39. NotionConnector: real mode API 성공 monkeypatch ─────────────────────
+
+@pytest.mark.asyncio
+async def test_notion_connector_real_api_success(monkeypatch):
+    import httpx
+    from app.services.mcp.connectors.notion_connector import NotionConnector
+
+    monkeypatch.setenv("NOTION_MCP_REAL", "true")
+    monkeypatch.setenv("NOTION_API_TOKEN", "secret_fake_notion_token")
+    monkeypatch.setenv("NOTION_DATABASE_ID", "fake-db-id-12345")
+
+    api_response = {"id": "page-id-abc123", "url": "https://www.notion.so/page-id-abc123"}
+    mock_client = _make_mock_http_client(200, api_response)
+    monkeypatch.setattr(httpx, "AsyncClient", lambda: mock_client)
+
+    connector = NotionConnector()
+    result = await connector.execute(
+        "create_notion_call_record",
+        {"summary_short": "VOC 요약", "priority": "critical", "customer_emotion": "angry"},
+        call_id="notion-real-001",
+    )
+
+    assert result["status"] == "success"
+    assert result["external_id"] == "page-id-abc123"
+    assert result["result"]["page_id"] == "page-id-abc123"
+    assert result["error"] is None
+    assert "secret_fake_notion_token" not in str(result)
+
+
+# ── 40. NotionConnector: real mode API 실패 ──────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_notion_connector_real_api_failure(monkeypatch):
+    import httpx
+    from app.services.mcp.connectors.notion_connector import NotionConnector
+
+    monkeypatch.setenv("NOTION_MCP_REAL", "true")
+    monkeypatch.setenv("NOTION_API_TOKEN", "secret_fake")
+    monkeypatch.setenv("NOTION_DATABASE_ID", "fake-db-id")
+
+    mock_client = _make_mock_http_client(400, {"message": "validation_error"})
+    monkeypatch.setattr(httpx, "AsyncClient", lambda: mock_client)
+
+    connector = NotionConnector()
+    result = await connector.execute("create_notion_voc_record", {}, call_id="notion-fail-001")
+
+    assert result["status"] == "failed"
+    assert "400" in result["error"]
+
+
+# ── 41. NotionConnector: token/db_id 누락 → skipped ─────────────────────────
+
+@pytest.mark.asyncio
+async def test_notion_connector_missing_config_skipped(monkeypatch):
+    from app.services.mcp.connectors.notion_connector import NotionConnector
+
+    monkeypatch.setenv("NOTION_MCP_REAL", "true")
+    monkeypatch.delenv("NOTION_API_TOKEN", raising=False)
+    monkeypatch.delenv("NOTION_DATABASE_ID", raising=False)
+
+    connector = NotionConnector()
+    result = await connector.execute("create_notion_call_record", {}, call_id="notion-noconfig")
+
+    assert result["status"] == "skipped"
+    assert result["error"] == "notion_not_configured"

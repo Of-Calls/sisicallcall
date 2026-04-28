@@ -75,6 +75,8 @@ def _register_defaults() -> None:
     from app.agents.post_call.actions.calendar_action import CalendarAction
     from app.agents.post_call.actions.jira_action import JiraAction
     from app.agents.post_call.actions.slack_action import SlackAction
+    from app.agents.post_call.actions.sms_action import SMSAction
+    from app.agents.post_call.actions.notion_action import NotionAction
 
     register("gmail", GmailAction())
     register("company_db", CompanyDBAction())
@@ -82,6 +84,8 @@ def _register_defaults() -> None:
     register("internal_dashboard", InternalDashboardAction())
     register("jira", JiraAction())
     register("slack", SlackAction())
+    register("sms", SMSAction())
+    register("notion", NotionAction())
 
 
 _register_defaults()

@@ -112,12 +112,14 @@ class MCPClient:
 
 
 def _build_default_client() -> MCPClient:
-    """기본 5개 connector를 등록한 MCPClient 인스턴스를 반환한다."""
+    """기본 7개 connector를 등록한 MCPClient 인스턴스를 반환한다."""
     from app.services.mcp.connectors.gmail_connector import GmailConnector
     from app.services.mcp.connectors.calendar_connector import CalendarConnector
     from app.services.mcp.connectors.company_db_connector import CompanyDBConnector
     from app.services.mcp.connectors.jira_connector import JiraConnector
     from app.services.mcp.connectors.slack_connector import SlackConnector
+    from app.services.mcp.connectors.sms_connector import SMSConnector
+    from app.services.mcp.connectors.notion_connector import NotionConnector
 
     client = MCPClient()
     client.register_connector("gmail", GmailConnector())
@@ -125,6 +127,8 @@ def _build_default_client() -> MCPClient:
     client.register_connector("company_db", CompanyDBConnector())
     client.register_connector("jira", JiraConnector())
     client.register_connector("slack", SlackConnector())
+    client.register_connector("sms", SMSConnector())
+    client.register_connector("notion", NotionConnector())
     return client
 
 
