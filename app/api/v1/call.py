@@ -9,6 +9,7 @@ from fastapi import APIRouter, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response
 
 from app.agents.conversational.graph import build_call_graph
+from app.agents.post_call.runner import run_post_call_agent_safely
 from app.agents.conversational.state import CallState
 from app.api.v1._tenant_helpers import (
     get_greeting,
@@ -460,6 +461,16 @@ async def call_websocket(
                 await _streaming_stt.close(call_id)
                 if channel_opened:
                     await tts_channel.flush(call_id)
+                # Post-call Agent 비동기 실행 — 통화 종료 흐름을 blocking하지 않는다.
+                # 예외는 run_post_call_agent_safely 내부에서 전부 처리하므로
+                # create_task 실패가 WebSocket 종료에 영향을 주지 않는다.
+                asyncio.create_task(
+                    run_post_call_agent_safely(
+                        call_id=call_id,
+                        trigger="call_ended",
+                        tenant_id=tenant_id,
+                    )
+                )
                 break
 
     except WebSocketDisconnect:
