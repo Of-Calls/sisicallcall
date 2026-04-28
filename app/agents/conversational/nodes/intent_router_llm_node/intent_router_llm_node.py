@@ -206,17 +206,13 @@ def _parse_intent_response(raw: str) -> dict | None:
     if intent == "intent_clarify" and not clarify_question:
         clarify_question = "조금 더 자세히 말씀해 주시겠어요?"
 
-    out = {
-        "primary_intent": intent,
-        "secondary_intents": parsed.get("secondary_intents") or [],
-        "routing_reason": parsed.get("routing_reason") or "llm_routed",
-    }
+    out = {"primary_intent": intent}
     if intent == "intent_clarify":
         out["clarify_question"] = clarify_question
     return out
 
 
-def _fallback(reason: str) -> dict:
+def _fallback() -> dict:
     """LLM timeout/parse 실패 시 폴백 분류 — 항상 clarify 로 회귀.
 
     의도 파악 자체 실패 = "다시 한 번 물어보는" 게 자연스러움.
@@ -224,8 +220,6 @@ def _fallback(reason: str) -> dict:
     """
     return {
         "primary_intent": "intent_clarify",
-        "secondary_intents": [],
-        "routing_reason": f"{reason}_clarify_fallback",
         "clarify_question": "죄송합니다, 다시 한 번 말씀해 주시겠어요?",
     }
 
@@ -242,11 +236,7 @@ def _force_escalation_if_clarify_exhausted(state: CallState) -> dict | None:
             "intent_router clarify 누적 한도 초과 call_id=%s clarify_count=%d → 강제 escalation",
             state["call_id"], sv.get("clarify_count"),
         )
-        return {
-            "primary_intent": "intent_escalation",
-            "secondary_intents": [],
-            "routing_reason": "clarify_exhausted_forced",
-        }
+        return {"primary_intent": "intent_escalation"}
     return None
 
 
@@ -271,10 +261,10 @@ async def intent_router_llm_node(state: CallState) -> dict:
         )
     except asyncio.TimeoutError:
         logger.warning("intent_router timeout call_id=%s", state["call_id"])
-        return _fallback("llm_timeout")
+        return _fallback()
     except Exception as e:
         logger.error("intent_router error call_id=%s: %s", state["call_id"], e)
-        return _fallback("llm_error")
+        return _fallback()
 
     parsed = _parse_intent_response(raw)
     if parsed is None:
@@ -282,11 +272,11 @@ async def intent_router_llm_node(state: CallState) -> dict:
             "intent_router parse failed call_id=%s raw=%r",
             state["call_id"], raw[:200],
         )
-        return _fallback("llm_parse_error")
+        return _fallback()
 
     logger.info(
-        "intent_router 결과 call_id=%s intent=%s reason=%s clarify=%s",
-        state["call_id"], parsed["primary_intent"], parsed["routing_reason"],
+        "intent_router 결과 call_id=%s intent=%s clarify=%s",
+        state["call_id"], parsed["primary_intent"],
         bool(parsed.get("clarify_question")),
     )
     return parsed

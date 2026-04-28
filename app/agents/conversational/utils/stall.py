@@ -1,13 +1,11 @@
 """_run_with_stall — LLM 응답 hardcut helper.
 
-2026-04-28 개정:
-  - stall 발화 책임을 `app/api/v1/call.py:_run_turn` 의 background scheduler 로 이관
-    (graph 진입 직후 1.5초). 본 헬퍼는 hardcut 만 담당.
-  - hardcut 시 rag_results[0] 을 그대로 fallback 으로 쓰면 raw markdown 청크가
-    TTS 로 흘러가 "##" 같은 마커가 음성으로 발음됨 → `_sanitize_chunk_for_voice`
-    로 정제 후 반환.
+stall 발화 책임은 `app/api/v1/call.py:_schedule_stall_task` (graph 진입 직후 1.5초
+background scheduler) 로 이관됨 (2026-04-28). 본 헬퍼는 hardcut 만 담당.
 
-기존 인자 (`stall_msg`, `stall_audio_field`, `delay`) 는 호환성을 위해 유지하되 무시됨.
+hardcut 시 rag_results[0] 을 그대로 fallback 으로 쓰면 raw markdown 청크가
+TTS 로 흘러가 "##" 같은 마커가 음성으로 발음됨 → `_sanitize_chunk_for_voice`
+로 정제 후 반환.
 """
 import asyncio
 import re
@@ -37,9 +35,6 @@ async def _run_with_stall(
     *,
     coro: Awaitable[str],
     call_id: str,
-    stall_msg: str,  # noqa: ARG001 — 호환 유지, scheduler 로 이관됨
-    stall_audio_field: str,  # noqa: ARG001 — 동일
-    delay: float,  # noqa: ARG001 — 동일
     hardcut_sec: float,
     rag_results: Optional[list[str]] = None,
     fallback_text: str = FALLBACK_MESSAGE,

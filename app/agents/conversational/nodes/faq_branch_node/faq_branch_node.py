@@ -91,12 +91,6 @@ def _short_chunk_id(full_id: str) -> str:
     return full_id[:12]
 
 
-def _pick_stall_msg(state: CallState) -> str:
-    """CallState 에서 FAQ 대기 멘트 선택. 없으면 general → 하드코딩 순으로 fallback."""
-    msgs = state.get("stall_messages") or {}
-    return msgs.get("faq") or msgs.get("general") or "잠시만요, 확인해 드리겠습니다."
-
-
 async def faq_branch_node(state: CallState) -> dict:
     call_id = state["call_id"]
     query_embedding = state.get("query_embedding") or []
@@ -180,9 +174,6 @@ async def faq_branch_node(state: CallState) -> dict:
             max_tokens=150,
         ),
         call_id=call_id,
-        stall_msg=_pick_stall_msg(state),
-        stall_audio_field="faq",
-        delay=state.get("stall_delay_sec", 1.0),
         hardcut_sec=FAQ_LLM_TIMEOUT_SEC,
         rag_results=rag_results,
         fallback_text=FALLBACK_MESSAGE,

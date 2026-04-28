@@ -19,6 +19,9 @@ from app.core.events import CALL_ENDED, CALL_STARTED
 from app.repositories.call_repo import finalize_call, insert_call
 from app.repositories.transcript_repo import insert_transcript
 from app.services.session.redis_session import RedisSessionService
+from app.agents.conversational.nodes.enrollment_node.enrollment_node import (
+    cleanup as cleanup_enrollment_state,
+)
 from app.services.speaker_verify.titanet import get_titanet_service
 from app.services.stt.deepgram_streaming import DeepgramStreamingSTTService
 from app.services.tts.channel import tts_channel
@@ -441,8 +444,6 @@ async def call_websocket(
                                 "query_embedding": [],
                                 "cache_hit": False,
                                 "primary_intent": None,
-                                "secondary_intents": [],
-                                "routing_reason": None,
                                 "session_view": session_view,
                                 "rag_results": [],
                                 "response_text": "",
@@ -450,7 +451,6 @@ async def call_websocket(
                                 "reviewer_applied": False,
                                 "reviewer_verdict": None,
                                 "is_timeout": False,
-                                "error": None,
                                 "stall_messages": stall_messages,
                                 "stall_delay_sec": 1.0,
                                 "empty_stt_count": empty_stt_count,
@@ -574,3 +574,11 @@ async def call_websocket(
                 if call_started_at_monotonic else None
             )
             await finalize_call(db_call_id, status="error", duration_sec=_duration)
+    finally:
+        # per-call 메모리 해제 — enrollment 모듈 전역 dict + titanet voiceprint.
+        # 종료 경로(stop / WebSocketDisconnect / Exception) 무엇이든 항상 정리.
+        try:
+            cleanup_enrollment_state(call_id)
+            get_titanet_service().cleanup(call_id)
+        except Exception as e:  # noqa: BLE001 — cleanup 실패가 통화 종료 흐름 차단 안 함
+            logger.warning("call_id=%s 종료 cleanup 실패: %s", call_id, e)

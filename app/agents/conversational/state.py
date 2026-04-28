@@ -24,8 +24,6 @@ class CallState(TypedDict):
 
     # 라우팅
     primary_intent: Optional[str]       # "intent_faq" | "intent_task" | "intent_auth" | "intent_clarify" | "intent_escalation"
-    secondary_intents: list[str]
-    routing_reason: Optional[str]
 
     # 세션 view (Redis 에서 로드한 당 턴 관점 정보)
     session_view: dict
@@ -41,9 +39,8 @@ class CallState(TypedDict):
     reviewer_applied: bool
     reviewer_verdict: Optional[str]     # "pass" | "revise"
 
-    # 에러 / 타임아웃
+    # 타임아웃
     is_timeout: bool
-    error: Optional[str]
 
     # 대기 멘트 (RFC 001 v0.2) — run_turn 진입 시 tenant settings 에서 pre-load
     # 노드는 .get() 로 안전 접근. 키 부재 시 _run_with_stall 이 하드코딩 기본값 사용.
