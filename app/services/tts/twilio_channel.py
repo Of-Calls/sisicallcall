@@ -16,11 +16,15 @@ from typing import Optional
 
 from fastapi import WebSocket
 
+from app.services.session.redis_session import RedisSessionService
 from app.services.tts.base import BaseTTSOutputChannel, BaseTTSService
 from app.utils.config import settings
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+# stall 사전 음원 lazy cache 용 — push_stall 이 합성 전 조회, miss 시 합성 후 write-back.
+_session = RedisSessionService()
 
 # Twilio Media Stream chunk 권장 크기: 160 bytes per 20ms at μ-law 8kHz
 _TWILIO_CHUNK_BYTES = 160
@@ -95,9 +99,37 @@ class TwilioTTSOutputChannel(BaseTTSOutputChannel):
             logger.debug("stall already emitted for call_id=%s — skip", call_id)
             return
         self._stall_emitted[call_id] = True
-        # 통화 흐름 추적용 — 200자 절단 (장문 stall 방어)
-        logger.info("push_stall call_id=%s field=%s text=%r", call_id, audio_field, text[:200])
-        await self._synthesize_and_send(call_id, text, tag=f"stall:{audio_field}")
+
+        # 사전 음원 lazy cache 조회 — hit 시 Azure TTS API skip, ~10ms 만에 송신 시작.
+        # miss 시 합성 후 write-back (다음 호출부터 hit).
+        tenant_id = self._bindings[call_id].tenant_id
+        cached_audio = await _session.get_stall_audio(tenant_id, audio_field)
+        cache_status = "hit" if cached_audio is not None else "miss"
+        logger.info(
+            "push_stall (%s) call_id=%s field=%s text=%r",
+            cache_status, call_id, audio_field, text[:200],
+        )
+
+        if cached_audio is not None:
+            await self._send_audio_bytes(
+                call_id, cached_audio, text, tag=f"stall:{audio_field}"
+            )
+            return
+
+        try:
+            audio = await self._get_tts().synthesize(text)
+        except Exception as e:
+            logger.error(
+                "tts synthesize failed call_id=%s field=%s: %s",
+                call_id, audio_field, e,
+            )
+            return
+        await self._send_audio_bytes(call_id, audio, text, tag=f"stall:{audio_field}")
+        # write-back fire-and-forget — 송신 실패해도 cache 만 채우면 다음 호출 빠름.
+        asyncio.create_task(
+            _session.set_stall_audio(tenant_id, audio_field, audio),
+            name=f"stall_cache_writeback:{call_id}:{audio_field}",
+        )
 
     async def push_response(self, call_id: str, text: str, response_path: str) -> None:
         if call_id not in self._bindings:
@@ -161,7 +193,18 @@ class TwilioTTSOutputChannel(BaseTTSOutputChannel):
     # ── 내부 helper ───────────────────────────────────────────
 
     async def _synthesize_and_send(self, call_id: str, text: str, tag: str) -> None:
-        """text → μ-law 8kHz → 160 byte chunk 로 쪼개 Twilio outbound media 송출.
+        """text → 합성 → 청크 송신. push_response path 와 stall cache miss path 가 사용."""
+        try:
+            audio = await self._get_tts().synthesize(text)
+        except Exception as e:
+            logger.error("tts synthesize failed call_id=%s tag=%s: %s", call_id, tag, e)
+            return
+        await self._send_audio_bytes(call_id, audio, text, tag)
+
+    async def _send_audio_bytes(
+        self, call_id: str, audio: bytes, text: str, tag: str
+    ) -> None:
+        """이미 합성된 μ-law 8kHz 바이트를 Twilio 로 청크 단위 송신.
 
         barge-in 지원:
           - 진입 시 cancel_event 초기화 + is_speaking/current_text 토글
@@ -175,13 +218,7 @@ class TwilioTTSOutputChannel(BaseTTSOutputChannel):
         binding.current_text = text
 
         try:
-            try:
-                audio = await self._get_tts().synthesize(text)
-            except Exception as e:
-                logger.error("tts synthesize failed call_id=%s tag=%s: %s", call_id, tag, e)
-                return
-
-            # 합성 도중 cancel 가 들어왔으면 송신 자체 skip
+            # 합성 도중 cancel 가 들어왔으면 송신 자체 skip (cache hit path 에선 사실상 미발동)
             if binding.cancel_event.is_set():
                 logger.info("tts cancelled before send call_id=%s tag=%s", call_id, tag)
                 return

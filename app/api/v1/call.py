@@ -188,8 +188,10 @@ async def call_websocket(
         nonlocal empty_stt_count, silence_alert_count, last_activity_at
         stall_task: Optional[asyncio.Task] = None
         if channel_opened:
+            # state["stall_delay_sec"] 우선, 부재 시 모듈 상수 fallback. (Phase D)
+            stall_delay = state.get("stall_delay_sec", _STALL_DELAY_SEC)
             stall_task = asyncio.create_task(
-                _schedule_stall_task(call_id, stall_messages)
+                _schedule_stall_task(call_id, stall_messages, delay=stall_delay)
             )
         try:
             try:
@@ -452,7 +454,7 @@ async def call_websocket(
                                 "reviewer_verdict": None,
                                 "is_timeout": False,
                                 "stall_messages": stall_messages,
-                                "stall_delay_sec": 1.0,
+                                "stall_delay_sec": _STALL_DELAY_SEC,  # 모듈 상수와 통일 (Phase D)
                                 "empty_stt_count": empty_stt_count,
                             }
                             if interrupted_response_text:
