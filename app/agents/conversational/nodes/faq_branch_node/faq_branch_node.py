@@ -156,6 +156,29 @@ async def faq_branch_node(state: CallState) -> dict:
     incoming_miss_count = prev_miss_count + 1 if not rag_results else 0
     # available_categories: Commit 2 에서 call.py 가 Redis 조회 후 주입. 없으면 빈 list.
     available_categories = state.get("available_categories") or []  # type: ignore[typeddict-item]
+
+    # Option 4 (architect Day 2~3) — 연속 RAG miss 2회+ AND tenant categories 보유 시
+    # LLM 호출 SKIP, 카테고리 안내 직접 합성. ~3초 latency 절약.
+    # response_path="clarify" 로 cache_store 자동 차단 + is_fallback=True.
+    # 후속 cycle 검토: 같은 텍스트 반복 시 escalation 트리거 또는 텍스트 다양화.
+    if not rag_results and incoming_miss_count >= 2 and available_categories:
+        cats_text = ", ".join(available_categories)
+        synth_text = (
+            f"안내드릴 수 있는 분야는 {cats_text} 입니다. 어떤 정보가 필요하신가요?"
+        )
+        logger.info(
+            "rag miss synth (LLM skip) call_id=%s miss_count=%d cats=%s",
+            call_id, incoming_miss_count, cats_text,
+        )
+        return {
+            "rag_results": rag_results,
+            "response_text": synth_text,
+            "response_path": "clarify",
+            "is_timeout": False,
+            "is_fallback": True,
+            "rag_miss_count": prev_miss_count + 1,
+        }
+
     user_message = _compose_user_message(
         state["normalized_text"],
         rag_results,
