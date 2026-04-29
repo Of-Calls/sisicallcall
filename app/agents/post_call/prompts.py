@@ -104,3 +104,105 @@ PRIORITY_USER = """\
 
 [VOC 분석]
 {voc_analysis}"""
+
+
+# ── Post-call 통합 분석 (ANALYSIS_COMBINED) ───────────────────────────────────
+# MockLLMCaller 및 DemoLLM 라우팅 마커: "ANALYSIS_COMBINED"
+
+ANALYSIS_SYSTEM = f"""\
+당신은 콜센터 통화 분석 전문가입니다. [ANALYSIS_COMBINED]
+제공된 통화 녹취 텍스트만을 근거로 summary, voc_analysis, priority_result를 한 번에 분석하세요.
+녹취에 없는 내용을 추측하거나 생성하지 마세요.
+
+{_JSON_ONLY}
+
+출력 JSON 스키마:
+{{
+  "summary": {{
+    "summary_short": "한 줄 요약 — 50자 이내",
+    "summary_detailed": "상세 요약 — 200자 이내",
+    "customer_intent": "고객의 핵심 문의/요청 의도를 한 문장으로",
+    "customer_emotion": "positive | neutral | negative | angry",
+    "resolution_status": "resolved | escalated | abandoned",
+    "keywords": ["핵심 키워드 최대 5개"],
+    "handoff_notes": "인수인계 메모 또는 null"
+  }},
+  "voc_analysis": {{
+    "sentiment_result": {{
+      "sentiment": "positive | neutral | negative | angry",
+      "intensity": 0.0,
+      "reason": "감정 판단 근거를 한 문장으로"
+    }},
+    "intent_result": {{
+      "primary_category": "주요 문의 카테고리",
+      "sub_categories": ["세부 카테고리"],
+      "is_repeat_topic": false,
+      "faq_candidate": false
+    }},
+    "priority_result": {{
+      "priority": "low | medium | high | critical",
+      "action_required": false,
+      "suggested_action": "권고 조치 또는 null",
+      "reason": "우선순위 판단 근거를 한 문장으로"
+    }}
+  }},
+  "priority_result": {{
+    "priority": "low | medium | high | critical",
+    "tier": "low | medium | high | critical",
+    "action_required": false,
+    "suggested_action": "구체적인 권고 조치 또는 null",
+    "reason": "우선순위 결정 근거를 한 문장으로"
+  }}
+}}
+
+priority_result.tier 는 priority 와 동일한 값으로 설정하세요."""
+
+ANALYSIS_USER = """\
+아래 통화 녹취를 분석하세요.
+
+통화 녹취:
+{transcripts}"""
+
+
+# ── Review Gate (REVIEW_VERDICT) ──────────────────────────────────────────────
+# MockLLMCaller 및 DemoLLM 라우팅 마커: "REVIEW_VERDICT"
+
+REVIEW_SYSTEM = f"""\
+당신은 콜센터 분석 품질 검토 전문가입니다. [REVIEW_VERDICT]
+통화 녹취와 분석 결과를 비교하여 분석이 원문 녹취에 충분히 근거하는지 검토하세요.
+분석이 정확하면 pass, 일부 교정이 필요하면 correctable, 재분석이 필요하면 retry, 외부 action 실행이 위험하면 fail을 반환하세요.
+
+{_JSON_ONLY}
+
+출력 JSON 스키마:
+{{
+  "verdict": "pass | correctable | retry | fail",
+  "confidence": 0.0,
+  "issues": [
+    {{
+      "type": "issue_type",
+      "message": "문제 설명",
+      "evidence": "녹취 근거 또는 null"
+    }}
+  ],
+  "corrections": {{
+    "summary": {{}},
+    "voc_analysis": {{}},
+    "priority_result": {{}}
+  }},
+  "blocked_actions": [],
+  "reason": "검토 결과 한 줄 요약"
+}}
+
+verdict 기준:
+- pass       : 분석 결과가 녹취에 충분히 근거함, action 실행 가능
+- correctable: 일부 필드 교정 후 진행 가능, corrections 에 수정 내용 포함
+- retry      : 재분석 시 개선 가능 (1회 한정)
+- fail       : 외부 action 실행 위험이 큼, human review 필요"""
+
+REVIEW_USER = """\
+[통화 녹취]
+{transcripts}
+
+[분석 결과]
+{analysis}"""

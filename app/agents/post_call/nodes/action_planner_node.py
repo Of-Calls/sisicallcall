@@ -207,9 +207,27 @@ async def action_planner_node(state: PostCallAgentState) -> dict:
             priority=priority,
             customer_phone=customer_phone,
         )
+
+        # blocked_actions 필터 적용 (review_node가 설정한 경우)
+        blocked: set[str] = set(state.get("blocked_actions") or [])  # type: ignore[call-overload]
+        if blocked and plan.get("actions"):
+            original_count = len(plan["actions"])
+            plan["actions"] = [
+                a for a in plan["actions"]
+                if a.get("action_type") not in blocked
+                and a.get("tool") not in blocked
+            ]
+            plan["action_required"] = len(plan["actions"]) > 0
+            if original_count != len(plan["actions"]):
+                filtered = original_count - len(plan["actions"])
+                plan["rationale"] = (
+                    f"{plan.get('rationale', '')}; "
+                    f"blocked_actions 적용: {sorted(blocked)} ({filtered}개 제거)"
+                )
+
         logger.info(
-            "action_planner 완료 call_id=%s actions=%d action_required=%s",
-            call_id, len(plan["actions"]), plan["action_required"],
+            "action_planner 완료 call_id=%s actions=%d action_required=%s blocked=%s",
+            call_id, len(plan["actions"]), plan["action_required"], sorted(blocked) or None,
         )
         return {"action_plan": plan}
 

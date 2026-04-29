@@ -34,6 +34,8 @@ from tests.fixtures.demo_post_call_context import (  # noqa: E402
     DEMO_LLM_SUMMARY,
     DEMO_LLM_VOC,
     DEMO_LLM_PRIORITY,
+    DEMO_LLM_ANALYSIS,
+    DEMO_LLM_REVIEW_PASS,
 )
 from app.agents.post_call.context_provider import seed_test_context  # noqa: E402
 from app.agents.post_call.completed_call_runner import run_post_call_for_completed_call  # noqa: E402
@@ -116,13 +118,25 @@ def _print_result(result: dict) -> None:
     _print_section("Post-call 분석 결과")
 
     summary = result.get("summary") or {}
-    print(f"  summary_short    : {summary.get('summary_short', '—')}")
-    print(f"  customer_emotion : {_c(_BOLD, str(summary.get('customer_emotion', '—')))}")
-    print(f"  resolution_status: {summary.get('resolution_status', '—')}")
+    print(f"  summary_short      : {summary.get('summary_short', '—')}")
+    print(f"  customer_emotion   : {_c(_BOLD, str(summary.get('customer_emotion', '—')))}")
+    print(f"  resolution_status  : {summary.get('resolution_status', '—')}")
 
     priority = result.get("priority_result") or {}
-    print(f"  priority         : {_c(_BOLD, str(priority.get('priority', '—')))}")
-    print(f"  action_required  : {priority.get('action_required', False)}")
+    print(f"  priority           : {_c(_BOLD, str(priority.get('priority', '—')))}")
+    print(f"  action_required    : {priority.get('action_required', False)}")
+
+    review_verdict = result.get("review_verdict") or "—"
+    human_review = result.get("human_review_required", False)
+    blocked = result.get("blocked_actions") or []
+    retry_count = result.get("review_retry_count", 0)
+    verdict_color = _GREEN if review_verdict == "pass" else (_YELLOW if review_verdict == "correctable" else _RED)
+    print(f"  review_verdict     : {_c(verdict_color + _BOLD, review_verdict)}")
+    print(f"  human_review_req   : {human_review}")
+    if blocked:
+        print(f"  blocked_actions    : {blocked}")
+    if retry_count:
+        print(f"  review_retry_count : {retry_count}")
 
     _print_section("Action Plan")
     plan = result.get("action_plan") or {}
@@ -177,6 +191,13 @@ def _print_result(result: dict) -> None:
 
 class _DemoLLM:
     async def call_json(self, system_prompt: str, user_message: str, max_tokens: int = 1024) -> dict:
+        # 새 통합 분석 노드 (우선 검사)
+        if "ANALYSIS_COMBINED" in system_prompt:
+            return DEMO_LLM_ANALYSIS
+        # 새 리뷰 게이트 노드
+        if "REVIEW_VERDICT" in system_prompt:
+            return DEMO_LLM_REVIEW_PASS
+        # 하위 호환 — legacy 노드가 혹시 남아 있는 경우
         if "summary_short" in system_prompt:
             return DEMO_LLM_SUMMARY
         if "sentiment_result" in system_prompt:
@@ -186,11 +207,16 @@ class _DemoLLM:
 
 def _patch_llm_nodes() -> None:
     """LLM 노드의 _caller를 demo stub으로 교체한다."""
+    import app.agents.post_call.nodes.post_call_analysis_node as _analysis
+    import app.agents.post_call.nodes.review_node as _review
+    # 하위 호환 — legacy 노드도 patch (롤백 시 대비)
     import app.agents.post_call.nodes.summary_node as _summary
     import app.agents.post_call.nodes.voc_analysis_node as _voc
     import app.agents.post_call.nodes.priority_node as _priority
 
     _demo = _DemoLLM()
+    _analysis._caller = _demo  # type: ignore[attr-defined]
+    _review._caller   = _demo  # type: ignore[attr-defined]
     _summary._caller  = _demo  # type: ignore[attr-defined]
     _voc._caller      = _demo  # type: ignore[attr-defined]
     _priority._caller = _demo  # type: ignore[attr-defined]

@@ -45,6 +45,13 @@ async def save_result_node(state: PostCallAgentState) -> dict:
         "executed_actions": state.get("executed_actions", []),  # type: ignore[call-overload]
         "errors": errors,
         "partial_success": final_partial_success,
+        # ── Review Gate 필드 ─────────────────────────────────────────────
+        "analysis_result": state.get("analysis_result"),  # type: ignore[call-overload]
+        "review_result": state.get("review_result"),  # type: ignore[call-overload]
+        "review_verdict": state.get("review_verdict"),  # type: ignore[call-overload]
+        "review_retry_count": state.get("review_retry_count", 0),  # type: ignore[call-overload]
+        "human_review_required": state.get("human_review_required", False),  # type: ignore[call-overload]
+        "blocked_actions": state.get("blocked_actions", []),  # type: ignore[call-overload]
     }
 
     try:

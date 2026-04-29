@@ -394,51 +394,67 @@ async def test_angry_critical_generates_and_executes_required_actions(monkeypatc
     )
 
     # LLM caller를 angry + critical 응답으로 교체
+    _ANGRY_SUMMARY = {
+        "summary_short": "[TEST] 긴급 에스컬레이션",
+        "summary_detailed": "[TEST] 고객이 매우 화남",
+        "customer_intent": "불만 처리",
+        "customer_emotion": "angry",
+        "resolution_status": "escalated",
+        "keywords": ["불만", "에스컬레이션"],
+        "handoff_notes": None,
+    }
+    _ANGRY_VOC = {
+        "sentiment_result": {"sentiment": "angry", "intensity": 0.9, "reason": "매우 화남"},
+        "intent_result": {
+            "primary_category": "불만",
+            "sub_categories": [],
+            "is_repeat_topic": False,
+            "faq_candidate": False,
+        },
+        "priority_result": {
+            "priority": "critical",
+            "action_required": True,
+            "suggested_action": None,
+            "reason": "즉시 대응 필요",
+        },
+    }
+    _ANGRY_PRIORITY = {
+        "priority": "critical",
+        "tier": "critical",
+        "action_required": True,
+        "suggested_action": None,
+        "reason": "즉시 대응 필요",
+    }
+
     class AngryMockLLM:
         async def call_json(self, system_prompt, user_message, max_tokens=1024):
+            # 새 통합 분석 노드 (우선 검사)
+            if "ANALYSIS_COMBINED" in system_prompt:
+                return {
+                    "summary": _ANGRY_SUMMARY,
+                    "voc_analysis": _ANGRY_VOC,
+                    "priority_result": _ANGRY_PRIORITY,
+                }
+            # 리뷰 게이트 — pass 반환
+            if "REVIEW_VERDICT" in system_prompt:
+                return {"verdict": "pass", "confidence": 0.95, "issues": [], "corrections": {}, "blocked_actions": [], "reason": "pass"}
+            # 하위 호환
             if "summary_short" in system_prompt:
-                return {
-                    "summary_short": "[TEST] 긴급 에스컬레이션",
-                    "summary_detailed": "[TEST] 고객이 매우 화남",
-                    "customer_intent": "불만 처리",
-                    "customer_emotion": "angry",
-                    "resolution_status": "escalated",
-                    "keywords": ["불만", "에스컬레이션"],
-                    "handoff_notes": None,
-                }
+                return _ANGRY_SUMMARY
             if "sentiment_result" in system_prompt:
-                return {
-                    "sentiment_result": {
-                        "sentiment": "angry", "intensity": 0.9, "reason": "매우 화남"
-                    },
-                    "intent_result": {
-                        "primary_category": "불만",
-                        "sub_categories": [],
-                        "is_repeat_topic": False,
-                        "faq_candidate": False,
-                    },
-                    "priority_result": {
-                        "priority": "critical",
-                        "action_required": True,
-                        "suggested_action": None,
-                        "reason": "즉시 대응 필요",
-                    },
-                }
-            # priority node
-            return {
-                "priority": "critical",
-                "tier": "critical",
-                "action_required": True,
-                "suggested_action": None,
-                "reason": "즉시 대응 필요",
-            }
+                return _ANGRY_VOC
+            return _ANGRY_PRIORITY
 
     angry_mock = AngryMockLLM()
 
+    import app.agents.post_call.nodes.post_call_analysis_node as analysis_node_mod
+    import app.agents.post_call.nodes.review_node as review_node_mod
     import app.agents.post_call.nodes.summary_node as summary_node_mod
     import app.agents.post_call.nodes.voc_analysis_node as voc_node_mod
     import app.agents.post_call.nodes.priority_node as priority_node_mod
 
+    monkeypatch.setattr(analysis_node_mod, "_caller", angry_mock)
+    monkeypatch.setattr(review_node_mod, "_caller", angry_mock)
     monkeypatch.setattr(summary_node_mod, "_caller", angry_mock)
     monkeypatch.setattr(voc_node_mod, "_caller", angry_mock)
     monkeypatch.setattr(priority_node_mod, "_caller", angry_mock)
@@ -623,6 +639,7 @@ async def test_demo_full_flow_with_mock_llm(monkeypatch):
     from app.agents.post_call.completed_call_runner import run_post_call_for_completed_call
     from tests.fixtures.demo_post_call_context import (
         DEMO_POST_CALL_CONTEXT, DEMO_LLM_SUMMARY, DEMO_LLM_VOC, DEMO_LLM_PRIORITY,
+        DEMO_LLM_ANALYSIS, DEMO_LLM_REVIEW_PASS,
     )
     import copy
 
@@ -638,17 +655,28 @@ async def test_demo_full_flow_with_mock_llm(monkeypatch):
 
     class DemoMockLLM:
         async def call_json(self, system_prompt, user_message, max_tokens=1024):
+            # 새 통합 분석 노드 (우선 검사)
+            if "ANALYSIS_COMBINED" in system_prompt:
+                return DEMO_LLM_ANALYSIS
+            # 리뷰 게이트
+            if "REVIEW_VERDICT" in system_prompt:
+                return DEMO_LLM_REVIEW_PASS
+            # 하위 호환
             if "summary_short" in system_prompt:
                 return DEMO_LLM_SUMMARY
             if "sentiment_result" in system_prompt:
                 return DEMO_LLM_VOC
             return DEMO_LLM_PRIORITY
 
+    import app.agents.post_call.nodes.post_call_analysis_node as analysis_mod
+    import app.agents.post_call.nodes.review_node as review_node_mod
     import app.agents.post_call.nodes.summary_node as summary_mod
     import app.agents.post_call.nodes.voc_analysis_node as voc_mod
     import app.agents.post_call.nodes.priority_node as priority_mod
 
     mock_llm = DemoMockLLM()
+    monkeypatch.setattr(analysis_mod, "_caller", mock_llm)
+    monkeypatch.setattr(review_node_mod, "_caller", mock_llm)
     monkeypatch.setattr(summary_mod, "_caller", mock_llm)
     monkeypatch.setattr(voc_mod, "_caller", mock_llm)
     monkeypatch.setattr(priority_mod, "_caller", mock_llm)

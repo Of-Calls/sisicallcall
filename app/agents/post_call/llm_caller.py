@@ -61,6 +61,13 @@ class MockLLMCaller:
 
     POST_CALL_USE_REAL_LLM=true 가 아닐 때 팩토리 함수에서 반환된다.
     스키마는 schemas.py 의 SummaryResult / VOCResult / PriorityNodeResult 를 따른다.
+
+    라우팅 우선순위 (system_prompt 마커 기준):
+      1. ANALYSIS_COMBINED → 통합 분석 결과 (post_call_analysis_node)
+      2. REVIEW_VERDICT    → 검토 결과 pass (review_node)
+      3. summary_short     → 요약 결과 (legacy summary_node)
+      4. sentiment_result  → VOC 결과 (legacy voc_analysis_node)
+      5. else              → 우선순위 결과 (legacy priority_node)
     """
 
     _MOCK_SUMMARY = {
@@ -101,12 +108,51 @@ class MockLLMCaller:
         "reason": "[MOCK] 일반 처리",
     }
 
+    _MOCK_ANALYSIS = {
+        "summary": {
+            "summary_short": "[MOCK] 상담 요약",
+            "summary_detailed": "[MOCK] 고객이 서비스 문의를 했고 상담원이 안내 후 처리됨",
+            "customer_intent": "서비스 문의",
+            "customer_emotion": "neutral",
+            "resolution_status": "resolved",
+            "keywords": ["문의", "안내"],
+            "handoff_notes": None,
+        },
+        "voc_analysis": {
+            "sentiment_result": {"sentiment": "neutral", "intensity": 0.2, "reason": "[MOCK] 특이사항 없음"},
+            "intent_result": {
+                "primary_category": "서비스 문의",
+                "sub_categories": [],
+                "is_repeat_topic": False,
+                "faq_candidate": False,
+            },
+            "priority_result": {"priority": "low", "action_required": False, "suggested_action": None, "reason": "[MOCK] 일반 처리"},
+        },
+        "priority_result": {"priority": "low", "tier": "low", "action_required": False, "suggested_action": None, "reason": "[MOCK] 일반 처리"},
+    }
+
+    _MOCK_REVIEW_PASS = {
+        "verdict": "pass",
+        "confidence": 0.95,
+        "issues": [],
+        "corrections": {"summary": {}, "voc_analysis": {}, "priority_result": {}},
+        "blocked_actions": [],
+        "reason": "[MOCK] Analysis validated.",
+    }
+
     async def call_json(
         self,
         system_prompt: str,
         user_message: str,
         max_tokens: int = 1024,
     ) -> dict:
+        # 우선순위 1: 통합 분석 노드
+        if "ANALYSIS_COMBINED" in system_prompt:
+            return copy.deepcopy(self._MOCK_ANALYSIS)
+        # 우선순위 2: 검토 게이트 노드
+        if "REVIEW_VERDICT" in system_prompt:
+            return copy.deepcopy(self._MOCK_REVIEW_PASS)
+        # 하위 호환 — legacy 노드
         if "summary_short" in system_prompt:
             return copy.deepcopy(self._MOCK_SUMMARY)
         if "sentiment_result" in system_prompt:
@@ -173,4 +219,22 @@ def make_priority_caller() -> PostCallLLMCaller | MockLLMCaller:
         logger.info("POST_CALL_USE_REAL_LLM=true — GPT4OMiniService 사용 (priority)")
         return PostCallLLMCaller(GPT4OMiniService())
     logger.debug("POST_CALL_USE_REAL_LLM 미설정 — MockLLMCaller 사용 (priority)")
+    return MockLLMCaller()
+
+
+def make_analysis_caller() -> PostCallLLMCaller | MockLLMCaller:
+    if _use_real_llm():
+        from app.services.llm.gpt4o import GPT4OService  # noqa: PLC0415
+        logger.info("POST_CALL_USE_REAL_LLM=true — GPT4OService 사용 (analysis)")
+        return PostCallLLMCaller(GPT4OService())
+    logger.debug("POST_CALL_USE_REAL_LLM 미설정 — MockLLMCaller 사용 (analysis)")
+    return MockLLMCaller()
+
+
+def make_review_caller() -> PostCallLLMCaller | MockLLMCaller:
+    if _use_real_llm():
+        from app.services.llm.gpt4o import GPT4OService  # noqa: PLC0415
+        logger.info("POST_CALL_USE_REAL_LLM=true — GPT4OService 사용 (review)")
+        return PostCallLLMCaller(GPT4OService())
+    logger.debug("POST_CALL_USE_REAL_LLM 미설정 — MockLLMCaller 사용 (review)")
     return MockLLMCaller()

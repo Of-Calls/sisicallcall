@@ -15,12 +15,25 @@ def _clear_real_mode_envs(monkeypatch):
     """테스트가 .env의 real-mode 설정에 영향받지 않도록 격리."""
     monkeypatch.delenv("GMAIL_MCP_REAL", raising=False)
     monkeypatch.delenv("CALENDAR_MCP_REAL", raising=False)
+    monkeypatch.delenv("JIRA_MCP_REAL", raising=False)
     monkeypatch.delenv("SLACK_MCP_REAL", raising=False)
     monkeypatch.delenv("SMS_MCP_REAL", raising=False)
     monkeypatch.delenv("NOTION_MCP_REAL", raising=False)
+    monkeypatch.delenv("COMPANY_DB_MCP_REAL", raising=False)
     monkeypatch.delenv("MCP_USE_TENANT_OAUTH", raising=False)
     monkeypatch.delenv("MCP_ALLOW_ENV_FALLBACK", raising=False)
     monkeypatch.delenv("POST_CALL_ENABLE_NOTION_RECORD", raising=False)
+
+
+def _force_mcp_actions_mock_mode(monkeypatch) -> None:
+    """모든 MCP connector를 강제로 mock 모드로 고정한다 (delenv 대신 setenv false)."""
+    for key in (
+        "GMAIL_MCP_REAL", "CALENDAR_MCP_REAL", "JIRA_MCP_REAL",
+        "SLACK_MCP_REAL", "SMS_MCP_REAL", "NOTION_MCP_REAL",
+        "COMPANY_DB_MCP_REAL", "MCP_COMPANY_DB_REAL",
+        "MCP_USE_TENANT_OAUTH", "POST_CALL_ENABLE_NOTION_RECORD",
+    ):
+        monkeypatch.setenv(key, "false")
 
 
 @pytest.fixture
@@ -494,8 +507,9 @@ async def test_gmail_action_via_mcp_client(executor):
 
 
 @pytest.mark.asyncio
-async def test_jira_action_via_mcp_client(executor):
+async def test_jira_action_via_mcp_client(executor, monkeypatch):
     """JiraAction이 MCPClient/connector 경유로 실행된다."""
+    monkeypatch.setenv("JIRA_MCP_REAL", "false")
     action = {
         "action_type": "create_jira_issue",
         "tool": "jira",
@@ -525,8 +539,9 @@ async def test_slack_action_via_mcp_client(executor):
 
 
 @pytest.mark.asyncio
-async def test_execute_all_six_action_types(executor):
+async def test_execute_all_six_action_types(executor, monkeypatch):
     """execute_actions가 gmail/jira/slack/calendar/company_db/internal_dashboard를 모두 실행 가능하다."""
+    _force_mcp_actions_mock_mode(monkeypatch)
     actions = [
         {"action_type": "send_manager_email",  "tool": "gmail",              "params": {}, "status": "pending"},
         {"action_type": "create_jira_issue",   "tool": "jira",               "params": {}, "status": "pending"},
@@ -557,8 +572,9 @@ async def test_one_connector_failure_does_not_stop_others(executor):
 
 
 @pytest.mark.asyncio
-async def test_all_action_results_have_standard_6_keys(executor):
+async def test_all_action_results_have_standard_6_keys(executor, monkeypatch):
     """모든 action result가 action_type/tool/status/external_id/error/result 키를 포함한다."""
+    _force_mcp_actions_mock_mode(monkeypatch)
     actions = [
         {"action_type": "send_manager_email",  "tool": "gmail",      "params": {}, "status": "pending"},
         {"action_type": "create_jira_issue",   "tool": "jira",       "params": {}, "status": "pending"},
@@ -631,8 +647,9 @@ async def test_notion_action_voc_record_mock_success(executor):
 
 
 @pytest.mark.asyncio
-async def test_execute_all_eight_action_types(executor):
+async def test_execute_all_eight_action_types(executor, monkeypatch):
     """execute_actions가 8개 tool을 모두 실행 가능하다."""
+    _force_mcp_actions_mock_mode(monkeypatch)
     actions = [
         {"action_type": "send_manager_email",       "tool": "gmail",              "params": {}, "status": "pending"},
         {"action_type": "create_jira_issue",        "tool": "jira",               "params": {}, "status": "pending"},

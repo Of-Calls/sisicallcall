@@ -84,3 +84,25 @@ DEMO_LLM_PRIORITY = {
     "suggested_action": "환불 담당팀 에스컬레이션 후 오늘 중 콜백",
     "reason": "환불 지연 반복 문의와 강한 불만으로 긴급 후속 조치 필요",
 }
+
+# ── 통합 분석 mock (post_call_analysis_node 전용) ─────────────────────────────
+# DEMO_LLM_SUMMARY / DEMO_LLM_VOC / DEMO_LLM_PRIORITY 는 호환용으로 유지한다.
+DEMO_LLM_ANALYSIS = {
+    "summary": DEMO_LLM_SUMMARY,
+    "voc_analysis": DEMO_LLM_VOC,
+    "priority_result": DEMO_LLM_PRIORITY,
+}
+
+# ── Review Pass mock (review_node 전용) ──────────────────────────────────────
+DEMO_LLM_REVIEW_PASS = {
+    "verdict": "pass",
+    "confidence": 0.95,
+    "issues": [],
+    "corrections": {
+        "summary": {},
+        "voc_analysis": {},
+        "priority_result": {},
+    },
+    "blocked_actions": [],
+    "reason": "Transcript supports the analysis.",
+}

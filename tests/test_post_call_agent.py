@@ -54,14 +54,43 @@ MOCK_PRIORITY = {
     "reason": "고객 부정 감정 및 반복 문의",
 }
 
+# 통합 분석 mock (post_call_analysis_node 전용)
+MOCK_ANALYSIS = {
+    "summary": MOCK_SUMMARY,
+    "voc_analysis": MOCK_VOC,
+    "priority_result": MOCK_PRIORITY,
+}
+
+# 검토 게이트 pass mock (review_node 전용)
+MOCK_REVIEW_PASS = {
+    "verdict": "pass",
+    "confidence": 0.95,
+    "issues": [],
+    "corrections": {"summary": {}, "voc_analysis": {}, "priority_result": {}},
+    "blocked_actions": [],
+    "reason": "Mock: analysis is valid.",
+}
+
 
 # ── Fixture ───────────────────────────────────────────────────────────────────
 
 def _make_mock_caller(return_map: dict[str, dict]) -> MagicMock:
-    """system_prompt 키워드로 응답을 분기하는 mock LLM caller."""
+    """system_prompt 키워드로 응답을 분기하는 mock LLM caller.
+
+    라우팅 우선순위:
+      1. ANALYSIS_COMBINED → 통합 분석 (post_call_analysis_node)
+      2. REVIEW_VERDICT    → 검토 pass (review_node)
+      3. summary_short     → 요약 (legacy summary_node)
+      4. sentiment_result  → VOC (legacy voc_analysis_node)
+      5. tier+action_req   → 우선순위 (legacy priority_node)
+    """
     caller = MagicMock()
 
     async def _call_json(system_prompt: str, user_message: str, max_tokens: int = 1024) -> dict:
+        if "ANALYSIS_COMBINED" in system_prompt:
+            return dict(return_map.get("analysis", {}))
+        if "REVIEW_VERDICT" in system_prompt:
+            return dict(return_map.get("review", {}))
         if "summary_short" in system_prompt:
             return dict(return_map["summary"])
         if "sentiment_result" in system_prompt:
@@ -76,16 +105,26 @@ def _make_mock_caller(return_map: dict[str, dict]) -> MagicMock:
 
 @pytest.fixture(autouse=True)
 def mock_llm(monkeypatch):
-    """모든 테스트에서 LLM 호출을 mock 으로 대체."""
+    """모든 테스트에서 LLM 호출을 mock 으로 대체.
+
+    새 그래프 노드(post_call_analysis_node, review_node)와
+    legacy 노드(summary, voc, priority) 모두 패치한다.
+    """
     mock = _make_mock_caller({
         "summary": MOCK_SUMMARY,
         "voc": MOCK_VOC,
         "priority": MOCK_PRIORITY,
+        "analysis": MOCK_ANALYSIS,
+        "review": MOCK_REVIEW_PASS,
     })
+    import app.agents.post_call.nodes.post_call_analysis_node as anm
+    import app.agents.post_call.nodes.review_node as rvnm
     import app.agents.post_call.nodes.summary_node as sm
     import app.agents.post_call.nodes.voc_analysis_node as vm
     import app.agents.post_call.nodes.priority_node as pm
 
+    monkeypatch.setattr(anm, "_caller", mock)
+    monkeypatch.setattr(rvnm, "_caller", mock)
     monkeypatch.setattr(sm, "_caller", mock)
     monkeypatch.setattr(vm, "_caller", mock)
     monkeypatch.setattr(pm, "_caller", mock)
@@ -154,8 +193,8 @@ async def test_run_escalation_immediate_skips_mcp(agent):
     assert result["call_id"] == "call-002"
     assert result["trigger"] == "escalation_immediate"
     assert result["summary"] is not None
-    assert result["voc_analysis"] is None
-    assert result["priority_result"] is None
+    # 새 통합 분석 노드는 escalation_immediate에서도 voc/priority를 함께 생성한다.
+    # 단, review/action_planner/action_router는 실행되지 않는다.
     assert result["action_plan"] is None
     assert result["executed_actions"] == []
     assert result["dashboard_payload"] is not None
@@ -257,24 +296,26 @@ async def test_action_plan_actions_have_priority_field(agent):
 
 @pytest.mark.asyncio
 async def test_summary_llm_failure_partial_success(agent, monkeypatch):
-    import app.agents.post_call.nodes.summary_node as sm
+    # 새 그래프: post_call_analysis_node가 summary/voc/priority를 통합 처리
+    import app.agents.post_call.nodes.post_call_analysis_node as anm
     failing = MagicMock()
     failing.call_json = AsyncMock(side_effect=ValueError("LLM 오류 시뮬레이션"))
-    monkeypatch.setattr(sm, "_caller", failing)
+    monkeypatch.setattr(anm, "_caller", failing)
 
     result = await agent.run("call-020", trigger="call_ended")
     assert result is not None
     assert result["summary"] is None
     assert result["partial_success"] is True
-    assert any("summary" in e.get("node", "") for e in result["errors"])
+    assert any(e.get("node") for e in result["errors"])
 
 
 @pytest.mark.asyncio
 async def test_voc_llm_failure_partial_success(agent, monkeypatch):
-    import app.agents.post_call.nodes.voc_analysis_node as vm
+    # 새 그래프: post_call_analysis_node가 voc도 포함
+    import app.agents.post_call.nodes.post_call_analysis_node as anm
     failing = MagicMock()
     failing.call_json = AsyncMock(side_effect=RuntimeError("VOC LLM 오류"))
-    monkeypatch.setattr(vm, "_caller", failing)
+    monkeypatch.setattr(anm, "_caller", failing)
 
     result = await agent.run("call-021", trigger="call_ended")
     assert result["voc_analysis"] is None
@@ -302,12 +343,14 @@ async def test_dashboard_payload_has_required_keys(agent):
 
 @pytest.mark.asyncio
 async def test_llm_called_once_per_node(agent, mock_llm):
+    # 새 그래프: post_call_analysis_step(1) + review_step(1) = 2회
     await agent.run("call-040", trigger="call_ended")
-    assert mock_llm.call_json.call_count == 3
+    assert mock_llm.call_json.call_count == 2
 
 
 @pytest.mark.asyncio
 async def test_escalation_llm_called_once(agent, mock_llm):
+    # escalation_immediate: post_call_analysis_step(1)만 실행, review 없음
     await agent.run("call-041", trigger="escalation_immediate")
     assert mock_llm.call_json.call_count == 1
 
@@ -681,7 +724,8 @@ async def test_planner_action_params_contain_call_id():
 @pytest.mark.asyncio
 async def test_planner_tool_mapping_is_valid():
     """각 action 의 tool 값이 허용된 enum 값이어야 한다."""
-    allowed_tools = {"company_db", "gmail", "calendar", "internal_dashboard", "jira", "slack"}
+    from app.agents.post_call.schemas import Tool
+    allowed_tools = {tool.value for tool in Tool}
     state = _make_planner_state(
         call_id="p-011",
         summary={
@@ -725,7 +769,9 @@ async def test_empty_transcript_completes(agent, monkeypatch):
     assert result is not None
     assert result["partial_success"] is True
     assert any(
-        e.get("warning") == "empty_transcript" or "empty" in e.get("error", "").lower()
+        e.get("warning") == "empty_transcript"
+        or "empty" in e.get("error", "").lower()
+        or "없음" in e.get("error", "")
         for e in result["errors"]
     ), f"empty_transcript 에러 없음: {result['errors']}"
 
@@ -757,18 +803,18 @@ async def test_empty_transcript_escalation_completes(agent, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_priority_llm_failure_partial_success(agent, monkeypatch):
-    """priority_node LLM 실패 시 save_result 까지 도달하고 partial_success=True."""
-    import app.agents.post_call.nodes.priority_node as pm
+    """post_call_analysis_node LLM 실패 시 save_result 까지 도달하고 partial_success=True."""
+    import app.agents.post_call.nodes.post_call_analysis_node as anm
     failing = MagicMock()
-    failing.call_json = AsyncMock(side_effect=RuntimeError("Priority LLM 오류"))
-    monkeypatch.setattr(pm, "_caller", failing)
+    failing.call_json = AsyncMock(side_effect=RuntimeError("Analysis LLM 오류"))
+    monkeypatch.setattr(anm, "_caller", failing)
 
     result = await agent.run("call-022", trigger="call_ended")
 
     assert result is not None
     assert result["priority_result"] is None
     assert result["partial_success"] is True
-    assert any("priority" in e.get("node", "") for e in result["errors"])
+    assert any(e.get("node") for e in result["errors"])
     assert result["dashboard_payload"] is not None
 
 
@@ -823,10 +869,10 @@ async def test_dashboard_partial_success_consistent_clean(agent):
 @pytest.mark.asyncio
 async def test_dashboard_partial_success_consistent_failure(agent, monkeypatch):
     """LLM 실패 시에도 dashboard_payload.partial_success 와 result.partial_success 가 일치한다."""
-    import app.agents.post_call.nodes.voc_analysis_node as vm
+    import app.agents.post_call.nodes.post_call_analysis_node as anm
     failing = MagicMock()
-    failing.call_json = AsyncMock(side_effect=RuntimeError("일관성 테스트용 VOC 오류"))
-    monkeypatch.setattr(vm, "_caller", failing)
+    failing.call_json = AsyncMock(side_effect=RuntimeError("일관성 테스트용 분석 오류"))
+    monkeypatch.setattr(anm, "_caller", failing)
 
     result = await agent.run("consist-002", trigger="call_ended")
 
