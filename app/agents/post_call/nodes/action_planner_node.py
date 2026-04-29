@@ -94,8 +94,8 @@ def _build_plan(
         _add("create_voc_issue", "company_db", {},
              "angry+에스컬레이션 → VOC 등록")
         _add("send_manager_email", "gmail",
-             {"subject": f"[긴급 에스컬레이션] {call_id}", "to": "manager@example.com"},
-             "angry+에스컬레이션 → 팀장 이메일")
+            {"subject": f"[긴급 에스컬레이션] {call_id}"},
+            "angry+에스컬레이션 → 팀장 이메일")
         _add("add_priority_queue", "internal_dashboard", {},
              "angry+에스컬레이션 → 우선순위 큐")
         _add("send_slack_alert", "slack",
@@ -114,8 +114,8 @@ def _build_plan(
     # ── Rule 5: critical priority → 필수 액션 ─────────────────────────────────
     if priority_level == "critical":
         _add("send_manager_email", "gmail",
-             {"subject": f"[CRITICAL] {call_id}", "to": "manager@example.com"},
-             "critical priority → 팀장 이메일 필수")
+            {"subject": f"[CRITICAL] {call_id}"},
+            "critical priority → 팀장 이메일 필수")
         _add("send_slack_alert", "slack",
             {"channel_type": "critical", "message": f"[CRITICAL] {call_id}: {summary_short}"},
             "critical priority → Slack 알림 필수")
@@ -138,6 +138,24 @@ def _build_plan(
         _add("mark_faq_candidate", "internal_dashboard",
              {"question": primary_category},
              "faq_candidate=True → FAQ 후보 등록")
+
+    # ── Rule J1: JIRA_MCP_REAL=true → Jira 이슈 생성 ────────────────────────────
+    if os.getenv("JIRA_MCP_REAL", "").lower() in ("1", "true"):
+        jira_triggered = (
+            (priority_level in ("high", "critical") and action_required)
+            or (is_angry and is_unresolved)
+        )
+        if jira_triggered:
+            _add(
+                "create_jira_issue",
+                "jira",
+                {
+                    "summary": f"[{priority_level.upper()}] {summary_short or call_id}",
+                    "description": priority_reason or summary_short or suggested_action or "",
+                    "labels": ["sisicallcall", "post-call", priority_level],
+                },
+                "JIRA_MCP_REAL=true → Jira 이슈 생성",
+            )
 
     # ── Rule N4: POST_CALL_ENABLE_NOTION_RECORD=true → 통화 1건 = Notion row 1개 ─
     if os.getenv("POST_CALL_ENABLE_NOTION_RECORD", "").lower() in ("1", "true"):

@@ -163,17 +163,17 @@ async def test_gmail_connector_real_mode_config_missing_returns_skipped(monkeypa
 
 @pytest.mark.asyncio
 async def test_jira_connector_real_mode_config_missing_returns_skipped(monkeypatch):
+    # real mode + tenant OAuth 미설정 → tenant_oauth_required
     monkeypatch.setenv("JIRA_MCP_REAL", "true")
-    monkeypatch.delenv("JIRA_PROJECT_KEY", raising=False)
-    monkeypatch.delenv("JIRA_ISSUE_TYPE", raising=False)
+    monkeypatch.delenv("MCP_USE_TENANT_OAUTH", raising=False)
 
     connector = JiraConnector()
     result = await connector.execute(
         "create_jira_issue", {}, call_id="conn-006b",
     )
 
-    assert result["status"] in ("skipped", "failed")
-    assert result["error"] == "jira_mcp_connector_not_configured"
+    assert result["status"] == "skipped"
+    assert result["error"] == "tenant_oauth_required"
 
 
 @pytest.mark.asyncio
@@ -305,55 +305,67 @@ async def test_calendar_connector_real_mode_config_ok_returns_skipped(monkeypatc
     assert result["status"] in ("skipped", "failed")
 
 
-# ── 14. tenant OAuth: 연동된 테넌트 → not_implemented skipped ────────────────
+# ── 14. Gmail: tenant token 있을 때 Gmail API messages.send 성공 ───────────────
 
 @pytest.mark.asyncio
 async def test_gmail_connector_tenant_oauth_connected(monkeypatch):
     from cryptography.fernet import Fernet
+    import httpx
     from app.models.tenant_integration import TenantIntegration, IntegrationStatus
     from app.repositories.tenant_integration_repo import (
         tenant_integration_repo, upsert_integration,
     )
-    from app.services.oauth.token_crypto import reset_fernet_cache
+    from app.services.oauth.token_crypto import reset_fernet_cache, encrypt_token
 
+    plaintext_token = "ya29.fake-google-access-token"
     key = Fernet.generate_key()
     monkeypatch.setenv("TOKEN_ENCRYPTION_KEY", key.decode())
+    monkeypatch.setenv("GMAIL_MCP_REAL", "true")
     monkeypatch.setenv("MCP_USE_TENANT_OAUTH", "true")
+    monkeypatch.setenv("GMAIL_MANAGER_TO", "manager@example.com")
     reset_fernet_cache()
     tenant_integration_repo.clear_integrations()
 
-    from app.services.oauth.token_crypto import encrypt_token
-    enc_token = encrypt_token("fake-access-token")
-
+    enc_token = encrypt_token(plaintext_token)
     upsert_integration(TenantIntegration(
-        tenant_id="tenant-oauth-001",
+        tenant_id="gmail-tenant-001",
         provider="google_gmail",
         status=IntegrationStatus.connected,
         access_token_encrypted=enc_token,
     ))
 
+    api_response = {"id": "msg-abc123", "threadId": "thread-001", "labelIds": ["SENT"]}
+    mock_client = _make_mock_gmail_client(200, api_response)
+    monkeypatch.setattr(httpx, "AsyncClient", lambda: mock_client)
+
     connector = GmailConnector()
     result = await connector.execute(
-        "send_manager_email", {},
-        call_id="oauth-001",
-        tenant_id="tenant-oauth-001",
+        "send_manager_email",
+        {"to": "manager@example.com", "subject": "VOC 알림", "body": "내용입니다."},
+        call_id="gmail-001",
+        tenant_id="gmail-tenant-001",
     )
 
-    assert result["status"] == "skipped"
-    assert result["error"] == "tenant_token_found_but_real_execute_not_implemented"
+    assert result["status"] == "success"
+    assert result["external_id"] == "msg-abc123"
+    assert result["result"]["message_id"] == "msg-abc123"
+    assert result["result"]["to"] == "manager@example.com"
+    assert plaintext_token not in str(result)
 
     tenant_integration_repo.clear_integrations()
     reset_fernet_cache()
+    monkeypatch.delenv("GMAIL_MCP_REAL", raising=False)
     monkeypatch.delenv("MCP_USE_TENANT_OAUTH", raising=False)
     monkeypatch.delenv("TOKEN_ENCRYPTION_KEY", raising=False)
 
 
-# ── 15. tenant OAuth: 미연동 테넌트 → not_connected skipped ─────────────────
+# ── 15. Gmail real mode: tenant integration 없음 → not_connected skipped ─────
 
 @pytest.mark.asyncio
 async def test_gmail_connector_tenant_oauth_not_connected(monkeypatch):
     from app.repositories.tenant_integration_repo import tenant_integration_repo
 
+    monkeypatch.setenv("GMAIL_MCP_REAL", "true")
     monkeypatch.setenv("MCP_USE_TENANT_OAUTH", "true")
     tenant_integration_repo.clear_integrations()
 
@@ -367,18 +379,16 @@ async def test_gmail_connector_tenant_oauth_not_connected(monkeypatch):
     assert result["status"] == "skipped"
     assert result["error"] == "tenant_integration_not_connected"
 
+    monkeypatch.delenv("GMAIL_MCP_REAL", raising=False)
     monkeypatch.delenv("MCP_USE_TENANT_OAUTH", raising=False)
 
 
-# ── 16. tenant OAuth: MCP_ALLOW_ENV_FALLBACK 없음 → not_connected 반환 ───────
+# ── 16. Gmail real mode: MCP_USE_TENANT_OAUTH=false → tenant_oauth_required ──
 
 @pytest.mark.asyncio
 async def test_gmail_connector_tenant_oauth_no_fallback(monkeypatch):
-    from app.repositories.tenant_integration_repo import tenant_integration_repo
-
-    monkeypatch.setenv("MCP_USE_TENANT_OAUTH", "true")
-    monkeypatch.delenv("MCP_ALLOW_ENV_FALLBACK", raising=False)
-    tenant_integration_repo.clear_integrations()
+    monkeypatch.setenv("GMAIL_MCP_REAL", "true")
+    monkeypatch.delenv("MCP_USE_TENANT_OAUTH", raising=False)
 
     connector = GmailConnector()
     result = await connector.execute(
@@ -387,38 +397,36 @@ async def test_gmail_connector_tenant_oauth_no_fallback(monkeypatch):
         tenant_id="no-such-tenant",
     )
 
-    # fallback 없으므로 not_connected skipped 반환 (mock으로 내려가지 않음)
+    # tenant OAuth 미설정 → tenant_oauth_required
     assert result["status"] == "skipped"
-    assert result["error"] == "tenant_integration_not_connected"
+    assert result["error"] == "tenant_oauth_required"
 
-    monkeypatch.delenv("MCP_USE_TENANT_OAUTH", raising=False)
+    monkeypatch.delenv("GMAIL_MCP_REAL", raising=False)
 
 
-# ── 17. tenant OAuth: MCP_ALLOW_ENV_FALLBACK=true + 미연동 → mock 반환 ───────
+# ── 17. Gmail GMAIL_MCP_REAL=false → mock 반환 (MCP_USE_TENANT_OAUTH 무관) ────
 
 @pytest.mark.asyncio
 async def test_gmail_connector_tenant_oauth_with_env_fallback(monkeypatch):
     from app.repositories.tenant_integration_repo import tenant_integration_repo
 
     monkeypatch.setenv("MCP_USE_TENANT_OAUTH", "true")
-    monkeypatch.setenv("MCP_ALLOW_ENV_FALLBACK", "true")
     monkeypatch.delenv("GMAIL_MCP_REAL", raising=False)
     tenant_integration_repo.clear_integrations()
 
     connector = GmailConnector()
     result = await connector.execute(
         "send_manager_email",
-        {"to": "manager@example.com", "subject": "fallback test"},
+        {"to": "manager@example.com", "subject": "mock test"},
         call_id="oauth-004",
         tenant_id="no-such-tenant",
     )
 
-    # 미연동 + fallback 허용 → mock 결과
+    # GMAIL_MCP_REAL=false → mock 반환 (real_mode 판단이 먼저)
     assert result["status"] == "success"
     assert result["result"]["mock"] is True
 
     monkeypatch.delenv("MCP_USE_TENANT_OAUTH", raising=False)
-    monkeypatch.delenv("MCP_ALLOW_ENV_FALLBACK", raising=False)
 
 
 # ── 18. tenant OAuth: _oauth_provider_name 설정 확인 ─────────────────────────
@@ -429,6 +437,380 @@ def test_connectors_have_oauth_provider_name():
     assert SlackConnector._oauth_provider_name == "slack"
     assert JiraConnector._oauth_provider_name == "jira"
     assert CompanyDBConnector._oauth_provider_name == ""  # OAuth 불필요
+
+
+# ── Gmail/Jira 실제 API 테스트 공통 fixture ──────────────────────────────────
+
+def _make_mock_gmail_client(status_code: int, json_data: dict):
+    from unittest.mock import MagicMock, AsyncMock
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = status_code
+    mock_resp.json.return_value = json_data
+    mock_resp.text = str(json_data)
+
+    mock_client = AsyncMock()
+    mock_client.post = AsyncMock(return_value=mock_resp)
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+    return mock_client
+
+
+def _setup_gmail_tenant(monkeypatch, enc_token: str, tenant_id: str = "gmail-tenant") -> None:
+    from app.models.tenant_integration import TenantIntegration, IntegrationStatus
+    from app.repositories.tenant_integration_repo import tenant_integration_repo, upsert_integration
+    tenant_integration_repo.clear_integrations()
+    upsert_integration(TenantIntegration(
+        tenant_id=tenant_id,
+        provider="google_gmail",
+        status=IntegrationStatus.connected,
+        access_token_encrypted=enc_token,
+    ))
+
+
+def _make_mock_jira_client(status_code: int, json_data: dict):
+    from unittest.mock import MagicMock, AsyncMock
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = status_code
+    mock_resp.json.return_value = json_data
+    mock_resp.text = str(json_data)
+
+    mock_client = AsyncMock()
+    mock_client.post = AsyncMock(return_value=mock_resp)
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+    return mock_client
+
+
+def _setup_jira_tenant(
+    monkeypatch,
+    enc_token: str,
+    tenant_id: str = "jira-tenant",
+    cloud_id: str = "",
+    external_workspace_id: str = "",
+) -> None:
+    from app.models.tenant_integration import TenantIntegration, IntegrationStatus
+    from app.repositories.tenant_integration_repo import tenant_integration_repo, upsert_integration
+    tenant_integration_repo.clear_integrations()
+    metadata = {}
+    if cloud_id:
+        metadata["cloud_id"] = cloud_id
+    upsert_integration(TenantIntegration(
+        tenant_id=tenant_id,
+        provider="jira",
+        status=IntegrationStatus.connected,
+        access_token_encrypted=enc_token,
+        metadata=metadata,
+        external_workspace_id=external_workspace_id or None,
+    ))
+
+
+# ── Gmail real API 테스트 ──────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_gmail_real_api_success(monkeypatch):
+    """Gmail real mode + tenant token → Gmail messages.send 성공."""
+    from cryptography.fernet import Fernet
+    import httpx
+    from app.services.oauth.token_crypto import reset_fernet_cache, encrypt_token
+
+    plaintext_token = "ya29.fake-google-token"
+    key = Fernet.generate_key()
+    monkeypatch.setenv("TOKEN_ENCRYPTION_KEY", key.decode())
+    monkeypatch.setenv("GMAIL_MCP_REAL", "true")
+    monkeypatch.setenv("MCP_USE_TENANT_OAUTH", "true")
+    monkeypatch.setenv("GMAIL_MANAGER_TO", "manager@example.com")
+    reset_fernet_cache()
+
+    enc = encrypt_token(plaintext_token)
+    _setup_gmail_tenant(monkeypatch, enc)
+
+    api_response = {"id": "msg-xyz999", "threadId": "t1", "labelIds": ["SENT"]}
+    mock_client = _make_mock_gmail_client(200, api_response)
+    monkeypatch.setattr(httpx, "AsyncClient", lambda: mock_client)
+
+    connector = GmailConnector()
+    result = await connector.execute(
+        "send_manager_email",
+        {"subject": "VOC 알림", "body": "처리 요청입니다."},
+        call_id="gmail-real-001",
+        tenant_id="gmail-tenant",
+    )
+
+    assert result["status"] == "success"
+    assert result["external_id"] == "msg-xyz999"
+    assert result["result"]["message_id"] == "msg-xyz999"
+    assert result["result"]["to"] == "manager@example.com"
+    assert plaintext_token not in str(result)
+
+    from app.repositories.tenant_integration_repo import tenant_integration_repo
+    tenant_integration_repo.clear_integrations()
+    reset_fernet_cache()
+    monkeypatch.delenv("GMAIL_MCP_REAL", raising=False)
+    monkeypatch.delenv("MCP_USE_TENANT_OAUTH", raising=False)
+    monkeypatch.delenv("TOKEN_ENCRYPTION_KEY", raising=False)
+
+
+@pytest.mark.asyncio
+async def test_gmail_real_api_http_error(monkeypatch):
+    """Gmail real mode + tenant token + 401 → failed."""
+    from cryptography.fernet import Fernet
+    import httpx
+    from app.services.oauth.token_crypto import reset_fernet_cache, encrypt_token
+
+    key = Fernet.generate_key()
+    monkeypatch.setenv("TOKEN_ENCRYPTION_KEY", key.decode())
+    monkeypatch.setenv("GMAIL_MCP_REAL", "true")
+    monkeypatch.setenv("MCP_USE_TENANT_OAUTH", "true")
+    monkeypatch.setenv("GMAIL_MANAGER_TO", "manager@example.com")
+    reset_fernet_cache()
+
+    enc = encrypt_token("ya29.fake-token")
+    _setup_gmail_tenant(monkeypatch, enc)
+
+    mock_client = _make_mock_gmail_client(401, {"error": "invalid_credentials"})
+    monkeypatch.setattr(httpx, "AsyncClient", lambda: mock_client)
+
+    connector = GmailConnector()
+    result = await connector.execute(
+        "send_manager_email", {},
+        call_id="gmail-real-002",
+        tenant_id="gmail-tenant",
+    )
+
+    assert result["status"] == "failed"
+    assert "401" in result["error"]
+
+    from app.repositories.tenant_integration_repo import tenant_integration_repo
+    tenant_integration_repo.clear_integrations()
+    reset_fernet_cache()
+    monkeypatch.delenv("GMAIL_MCP_REAL", raising=False)
+    monkeypatch.delenv("MCP_USE_TENANT_OAUTH", raising=False)
+    monkeypatch.delenv("TOKEN_ENCRYPTION_KEY", raising=False)
+
+
+@pytest.mark.asyncio
+async def test_gmail_real_mode_no_tenant_oauth_skipped(monkeypatch):
+    """Gmail real mode + MCP_USE_TENANT_OAUTH=false → tenant_oauth_required."""
+    monkeypatch.setenv("GMAIL_MCP_REAL", "true")
+    monkeypatch.delenv("MCP_USE_TENANT_OAUTH", raising=False)
+
+    connector = GmailConnector()
+    result = await connector.execute(
+        "send_manager_email", {},
+        call_id="gmail-real-003",
+        tenant_id="some-tenant",
+    )
+
+    assert result["status"] == "skipped"
+    assert result["error"] == "tenant_oauth_required"
+    monkeypatch.delenv("GMAIL_MCP_REAL", raising=False)
+
+
+@pytest.mark.asyncio
+async def test_gmail_real_mode_no_integration_skipped(monkeypatch):
+    """Gmail real mode + tenant integration 없음 → tenant_integration_not_connected."""
+    from app.repositories.tenant_integration_repo import tenant_integration_repo
+
+    monkeypatch.setenv("GMAIL_MCP_REAL", "true")
+    monkeypatch.setenv("MCP_USE_TENANT_OAUTH", "true")
+    tenant_integration_repo.clear_integrations()
+
+    connector = GmailConnector()
+    result = await connector.execute(
+        "send_manager_email", {},
+        call_id="gmail-real-004",
+        tenant_id="no-such-tenant",
+    )
+
+    assert result["status"] == "skipped"
+    assert result["error"] == "tenant_integration_not_connected"
+    monkeypatch.delenv("GMAIL_MCP_REAL", raising=False)
+    monkeypatch.delenv("MCP_USE_TENANT_OAUTH", raising=False)
+
+
+# ── Jira real API 테스트 ──────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_jira_real_api_success_with_cloud_id(monkeypatch):
+    """Jira real mode + tenant token + cloud_id → Jira issue create 성공."""
+    from cryptography.fernet import Fernet
+    import httpx
+    from app.services.oauth.token_crypto import reset_fernet_cache, encrypt_token
+
+    plaintext_token = "atlassian-fake-oauth-token"
+    key = Fernet.generate_key()
+    monkeypatch.setenv("TOKEN_ENCRYPTION_KEY", key.decode())
+    monkeypatch.setenv("JIRA_MCP_REAL", "true")
+    monkeypatch.setenv("MCP_USE_TENANT_OAUTH", "true")
+    monkeypatch.setenv("JIRA_PROJECT_KEY", "VOC")
+    monkeypatch.setenv("JIRA_ISSUE_TYPE", "Task")
+    reset_fernet_cache()
+
+    enc = encrypt_token(plaintext_token)
+    _setup_jira_tenant(monkeypatch, enc, cloud_id="fake-cloud-id-123")
+
+    api_response = {
+        "id": "10001",
+        "key": "VOC-42",
+        "self": "https://api.atlassian.com/ex/jira/fake-cloud-id-123/rest/api/3/issue/10001",
+    }
+    mock_client = _make_mock_jira_client(201, api_response)
+    monkeypatch.setattr(httpx, "AsyncClient", lambda: mock_client)
+
+    connector = JiraConnector()
+    result = await connector.execute(
+        "create_jira_issue",
+        {"summary_short": "VOC 건", "reason": "청구 오류"},
+        call_id="jira-real-001",
+        tenant_id="jira-tenant",
+    )
+
+    assert result["status"] == "success"
+    assert result["external_id"] == "VOC-42"
+    assert result["result"]["issue_key"] == "VOC-42"
+    assert plaintext_token not in str(result)
+
+    from app.repositories.tenant_integration_repo import tenant_integration_repo
+    tenant_integration_repo.clear_integrations()
+    reset_fernet_cache()
+    monkeypatch.delenv("JIRA_MCP_REAL", raising=False)
+    monkeypatch.delenv("MCP_USE_TENANT_OAUTH", raising=False)
+    monkeypatch.delenv("TOKEN_ENCRYPTION_KEY", raising=False)
+
+
+@pytest.mark.asyncio
+async def test_jira_real_api_no_site_skipped(monkeypatch):
+    """Jira real mode + tenant token + cloud_id/base_url 없음 → jira_site_not_configured."""
+    from cryptography.fernet import Fernet
+    from app.services.oauth.token_crypto import reset_fernet_cache, encrypt_token
+
+    key = Fernet.generate_key()
+    monkeypatch.setenv("TOKEN_ENCRYPTION_KEY", key.decode())
+    monkeypatch.setenv("JIRA_MCP_REAL", "true")
+    monkeypatch.setenv("MCP_USE_TENANT_OAUTH", "true")
+    monkeypatch.delenv("JIRA_BASE_URL", raising=False)
+    reset_fernet_cache()
+
+    enc = encrypt_token("atlassian-fake-oauth-token")
+    _setup_jira_tenant(monkeypatch, enc, cloud_id="")  # cloud_id 없음, metadata에도 없음
+
+    connector = JiraConnector()
+    result = await connector.execute(
+        "create_jira_issue", {},
+        call_id="jira-real-002",
+        tenant_id="jira-tenant",
+    )
+
+    assert result["status"] == "skipped"
+    assert result["error"] == "jira_site_not_configured"
+
+    from app.repositories.tenant_integration_repo import tenant_integration_repo
+    tenant_integration_repo.clear_integrations()
+    reset_fernet_cache()
+    monkeypatch.delenv("JIRA_MCP_REAL", raising=False)
+    monkeypatch.delenv("MCP_USE_TENANT_OAUTH", raising=False)
+    monkeypatch.delenv("TOKEN_ENCRYPTION_KEY", raising=False)
+
+
+@pytest.mark.asyncio
+async def test_jira_real_api_success_with_external_workspace_id(monkeypatch):
+    """metadata가 비어 있고 external_workspace_id만 있어도 cloud_id로 사용하여 Jira API 호출 성공."""
+    from cryptography.fernet import Fernet
+    import httpx
+    from app.services.oauth.token_crypto import reset_fernet_cache, encrypt_token
+
+    plaintext_token = "atlassian-fake-oauth-token"
+    key = Fernet.generate_key()
+    monkeypatch.setenv("TOKEN_ENCRYPTION_KEY", key.decode())
+    monkeypatch.setenv("JIRA_MCP_REAL", "true")
+    monkeypatch.setenv("MCP_USE_TENANT_OAUTH", "true")
+    monkeypatch.setenv("JIRA_PROJECT_KEY", "VOC")
+    monkeypatch.setenv("JIRA_ISSUE_TYPE", "Task")
+    monkeypatch.delenv("JIRA_BASE_URL", raising=False)
+    reset_fernet_cache()
+
+    enc = encrypt_token(plaintext_token)
+    # metadata는 비어 있고, external_workspace_id에 Atlassian cloud_id가 저장된 실제 케이스
+    _setup_jira_tenant(
+        monkeypatch, enc,
+        cloud_id="",                                    # metadata에 cloud_id 없음
+        external_workspace_id="fake-workspace-uuid",   # external_workspace_id가 cloud_id 역할
+    )
+
+    api_response = {
+        "id": "10002",
+        "key": "VOC-99",
+        "self": "https://api.atlassian.com/ex/jira/fake-workspace-uuid/rest/api/3/issue/10002",
+    }
+    mock_client = _make_mock_jira_client(201, api_response)
+    monkeypatch.setattr(httpx, "AsyncClient", lambda: mock_client)
+
+    connector = JiraConnector()
+    result = await connector.execute(
+        "create_jira_issue",
+        {"summary_short": "결제 오류", "reason": "중복 청구"},
+        call_id="jira-workspace-001",
+        tenant_id="jira-tenant",
+    )
+
+    assert result["status"] == "success"
+    assert result["external_id"] == "VOC-99"
+    assert result["result"]["issue_key"] == "VOC-99"
+    assert plaintext_token not in str(result)
+
+    # httpx.AsyncClient.post 호출 URL에 external_workspace_id가 cloud_id로 사용됐는지 확인
+    call_args = mock_client.post.call_args
+    called_url = call_args[0][0] if call_args.args else call_args[1].get("url", "") or str(call_args)
+    assert "fake-workspace-uuid" in called_url or "fake-workspace-uuid" in str(call_args)
+
+    from app.repositories.tenant_integration_repo import tenant_integration_repo
+    tenant_integration_repo.clear_integrations()
+    reset_fernet_cache()
+    monkeypatch.delenv("JIRA_MCP_REAL", raising=False)
+    monkeypatch.delenv("MCP_USE_TENANT_OAUTH", raising=False)
+    monkeypatch.delenv("TOKEN_ENCRYPTION_KEY", raising=False)
+
+
+@pytest.mark.asyncio
+async def test_jira_real_mode_no_tenant_oauth_skipped(monkeypatch):
+    """Jira real mode + MCP_USE_TENANT_OAUTH=false → tenant_oauth_required."""
+    monkeypatch.setenv("JIRA_MCP_REAL", "true")
+    monkeypatch.delenv("MCP_USE_TENANT_OAUTH", raising=False)
+
+    connector = JiraConnector()
+    result = await connector.execute(
+        "create_jira_issue", {},
+        call_id="jira-real-003",
+        tenant_id="some-tenant",
+    )
+
+    assert result["status"] == "skipped"
+    assert result["error"] == "tenant_oauth_required"
+    monkeypatch.delenv("JIRA_MCP_REAL", raising=False)
+
+
+@pytest.mark.asyncio
+async def test_jira_real_mode_no_integration_skipped(monkeypatch):
+    """Jira real mode + tenant integration 없음 → tenant_integration_not_connected."""
+    from app.repositories.tenant_integration_repo import tenant_integration_repo
+
+    monkeypatch.setenv("JIRA_MCP_REAL", "true")
+    monkeypatch.setenv("MCP_USE_TENANT_OAUTH", "true")
+    tenant_integration_repo.clear_integrations()
+
+    connector = JiraConnector()
+    result = await connector.execute(
+        "create_jira_issue", {},
+        call_id="jira-real-004",
+        tenant_id="no-such-tenant",
+    )
+
+    assert result["status"] == "skipped"
+    assert result["error"] == "tenant_integration_not_connected"
+    monkeypatch.delenv("JIRA_MCP_REAL", raising=False)
+    monkeypatch.delenv("MCP_USE_TENANT_OAUTH", raising=False)
 
 
 # ── Calendar 실제 API 테스트 공통 fixture ─────────────────────────────────────

@@ -5,27 +5,47 @@ Jira MCP Connector.
   - create_jira_issue
   - create_voc_issue  (Jira 백로그 생성으로 처리)
 
-── real mode env ─────────────────────────────────────────────────────────────
-  JIRA_MCP_REAL=true    real mode 활성화
-  JIRA_PROJECT_KEY      Jira 프로젝트 키 (필수, 예: VOC)
-  JIRA_ISSUE_TYPE       이슈 타입 (필수, 예: Bug)
-  JIRA_BASE_URL         Jira 인스턴스 URL (선택)
-  JIRA_EMAIL            인증 이메일 (선택)
-  JIRA_API_TOKEN        API 토큰 (선택)
-  JIRA_MCP_SERVER_URL   MCP 서버 URL (선택)
+── 실행 정책 ─────────────────────────────────────────────────────────────────
+  JIRA_MCP_REAL=false (기본) → 항상 mock 반환  (MCP_USE_TENANT_OAUTH 값 무관)
+  JIRA_MCP_REAL=true  + MCP_USE_TENANT_OAUTH=false → skipped("tenant_oauth_required")
+  JIRA_MCP_REAL=true  + MCP_USE_TENANT_OAUTH=true + tenant_id 없음 → skipped("tenant_oauth_required")
+  JIRA_MCP_REAL=true  + MCP_USE_TENANT_OAUTH=true + integration 없음 → skipped("tenant_integration_not_connected")
+  JIRA_MCP_REAL=true  + MCP_USE_TENANT_OAUTH=true + cloud_id/base_url 없음 → skipped("jira_site_not_configured")
+  JIRA_MCP_REAL=true  + MCP_USE_TENANT_OAUTH=true + integration 있음 → Jira API 호출
+
+── env API token fallback 없음 ─────────────────────────────────────────────
+  Jira real mode는 tenant OAuth 전용이다.
+  JIRA_EMAIL / JIRA_API_TOKEN / Basic Auth / MCP_ALLOW_ENV_FALLBACK 사용 금지.
+
+── API endpoint 결정 ──────────────────────────────────────────────────────
+  cloud_id 탐색 순서:
+    1) integration.metadata["cloud_id"]
+    2) integration.metadata["cloudId"]
+    3) integration.external_workspace_id   ← Atlassian OAuth 저장 시 cloud_id
+
+  base_url 탐색 순서 (cloud_id 없을 때):
+    1) integration.metadata["base_url"]
+    2) integration.metadata["site_url"]
+    3) integration.metadata["url"]
+    4) JIRA_BASE_URL env
+
+  cloud_id → https://api.atlassian.com/ex/jira/{cloud_id}/rest/api/3/issue
+  base_url → {base_url}/rest/api/3/issue
+  없으면  → skipped("jira_site_not_configured")
+
+── 필수 env ──────────────────────────────────────────────────────────────
+  JIRA_PROJECT_KEY  — 이슈 생성 프로젝트 키 (기본값 "VOC")
+  JIRA_ISSUE_TYPE   — 이슈 타입 (기본값 "Task")
 
 ── mock mode ─────────────────────────────────────────────────────────────────
   status: success
   external_id: jira-mock-{call_id}
   result: {project_key, issue_type, summary, description, labels, mock}
-
-── real mode 설정 부족 ────────────────────────────────────────────────────────
-  status: skipped
-  error: "jira_mcp_connector_not_configured"
 """
 from __future__ import annotations
 
 import os
+from datetime import datetime
 
 from app.services.mcp.connectors.base import BaseMCPConnector
 from app.utils.logger import get_logger
@@ -52,21 +72,189 @@ class JiraConnector(BaseMCPConnector):
             call_id, action_type, self.is_real_mode(), self._use_tenant_oauth(),
         )
 
-        # tenant OAuth 우선 시도
-        if self._use_tenant_oauth() and tenant_id:
-            result = await self._try_tenant_token(tenant_id)
-            if result["error"] != "tenant_integration_not_connected" or not self._allow_env_fallback():
-                return result
-
+        # mock 판단이 항상 먼저 — JIRA_MCP_REAL=false이면 무조건 mock
         if not self.is_real_mode():
             return self._mock(params, call_id)
 
-        ok, err = self.validate_config()
-        if not ok:
-            logger.warning("JiraConnector: config 부족 call_id=%s err=%s", call_id, err)
-            return self._skipped("jira_mcp_connector_not_configured")
+        # real mode: tenant OAuth 필수 (env API token fallback 없음)
+        if not self._use_tenant_oauth() or not tenant_id:
+            logger.warning(
+                "JiraConnector: tenant OAuth required call_id=%s tenant_id=%r",
+                call_id, tenant_id,
+            )
+            return self._skipped("tenant_oauth_required")
 
-        return await self._execute_real(action_type, params, call_id=call_id)
+        return await self._oauth_execute(action_type, params, call_id=call_id, tenant_id=tenant_id)
+
+    # ── tenant OAuth 실행 ─────────────────────────────────────────────────────
+
+    async def _oauth_execute(
+        self,
+        action_type: str,
+        params: dict,
+        *,
+        call_id: str,
+        tenant_id: str,
+    ) -> dict:
+        from app.models.tenant_integration import IntegrationStatus
+        from app.repositories.tenant_integration_repo import get_integration
+        from app.services.oauth.token_crypto import decrypt_token
+
+        integration = get_integration(tenant_id, self._oauth_provider_name)
+
+        if integration is None or integration.status == IntegrationStatus.disconnected:
+            return self._skipped("tenant_integration_not_connected")
+
+        # 만료 체크
+        if integration.expires_at and integration.expires_at < datetime.utcnow():
+            if integration.refresh_token_encrypted:
+                refreshed = await self._refresh_tenant_token(integration)
+                if refreshed:
+                    integration = refreshed
+                else:
+                    return self._skipped("tenant_token_expired_refresh_failed")
+            else:
+                return self._skipped("tenant_token_expired_no_refresh")
+
+        try:
+            access_token = decrypt_token(integration.access_token_encrypted or "")
+        except Exception:
+            logger.error(
+                "JiraConnector: token 복호화 실패 call_id=%s tenant_id=%s",
+                call_id, tenant_id,
+            )
+            return self._failed("tenant_token_decryption_failed")
+
+        # API endpoint 결정
+        meta: dict = getattr(integration, "metadata", None) or {}
+        cloud_id = (
+            meta.get("cloud_id")
+            or meta.get("cloudId")
+            or getattr(integration, "external_workspace_id", None)
+            or ""
+        )
+        base_url = (
+            meta.get("base_url")
+            or meta.get("site_url")
+            or meta.get("url")
+            or os.getenv("JIRA_BASE_URL", "")
+        )
+
+        if cloud_id:
+            api_url = f"https://api.atlassian.com/ex/jira/{cloud_id}/rest/api/3/issue"
+        elif base_url:
+            api_url = f"{base_url.rstrip('/')}/rest/api/3/issue"
+        else:
+            logger.warning(
+                "JiraConnector: Jira site 설정 없음 call_id=%s tenant_id=%s",
+                call_id, tenant_id,
+            )
+            return self._skipped("jira_site_not_configured")
+
+        project_key = os.getenv("JIRA_PROJECT_KEY", "VOC")
+        issue_type = os.getenv("JIRA_ISSUE_TYPE", "Task")
+        summary = (
+            params.get("summary")
+            or params.get("title")
+            or params.get("summary_short")
+            or "[시시콜콜] VOC 후속 이슈"
+        )
+        description_text = (
+            params.get("description")
+            or params.get("reason")
+            or params.get("summary_short")
+            or ""
+        )
+        labels = params.get("labels") or ["sisicallcall", "post-call"]
+
+        return await self._create_issue(
+            access_token,
+            api_url=api_url,
+            project_key=project_key,
+            issue_type=issue_type,
+            summary=summary,
+            description_text=description_text,
+            labels=labels,
+            call_id=call_id,
+        )
+
+    # ── Jira issue create ────────────────────────────────────────────────────
+
+    async def _create_issue(
+        self,
+        token: str,
+        *,
+        api_url: str,
+        project_key: str,
+        issue_type: str,
+        summary: str,
+        description_text: str,
+        labels: list,
+        call_id: str,
+    ) -> dict:
+        """Jira Cloud REST API v3 issue create를 호출한다. token은 로그에 출력하지 않는다."""
+        import httpx
+
+        body = {
+            "fields": {
+                "project": {"key": project_key},
+                "issuetype": {"name": issue_type},
+                "summary": summary,
+                "description": {
+                    "type": "doc",
+                    "version": 1,
+                    "content": [
+                        {
+                            "type": "paragraph",
+                            "content": [{"type": "text", "text": description_text}],
+                        }
+                    ],
+                },
+                "labels": labels,
+            }
+        }
+
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(
+                    api_url,
+                    json=body,
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Accept": "application/json",
+                        "Content-Type": "application/json",
+                    },
+                    timeout=15.0,
+                )
+
+            if resp.status_code not in (200, 201):
+                logger.error(
+                    "JiraConnector: HTTP 오류 call_id=%s status=%d",
+                    call_id, resp.status_code,
+                )
+                return self._failed(f"jira_http_error:{resp.status_code}")
+
+            data = resp.json()
+            issue_key = data.get("key", "")
+            issue_id = data.get("id", "")
+            issue_self = data.get("self", "")
+            logger.info(
+                "JiraConnector: 이슈 생성 완료 call_id=%s issue_key=%s",
+                call_id, issue_key,
+            )
+            return self._success(
+                external_id=issue_key,
+                result={"issue_key": issue_key, "issue_id": issue_id, "self": issue_self},
+            )
+
+        except Exception as exc:
+            logger.error(
+                "JiraConnector: 예외 call_id=%s err=%s",
+                call_id, type(exc).__name__,
+            )
+            return self._failed(f"jira_exception:{type(exc).__name__}")
+
+    # ── mock ─────────────────────────────────────────────────────────────────
 
     def _mock(self, params: dict, call_id: str) -> dict:
         project_key = params.get("project_key", "VOC")
@@ -82,23 +270,3 @@ class JiraConnector(BaseMCPConnector):
                 "mock": True,
             },
         )
-
-    async def _execute_real(
-        self,
-        action_type: str,
-        params: dict,
-        *,
-        call_id: str,
-    ) -> dict:
-        # TODO: 실제 Jira API / MCP 서버 연동 구현
-        # project_key = os.getenv("JIRA_PROJECT_KEY")
-        # issue_type = os.getenv("JIRA_ISSUE_TYPE")
-        # base_url = os.getenv("JIRA_BASE_URL")
-        # email = os.getenv("JIRA_EMAIL")
-        # token = os.getenv("JIRA_API_TOKEN")
-        # server_url = os.getenv("JIRA_MCP_SERVER_URL")
-        logger.warning(
-            "JiraConnector: real mode TODO — skipped call_id=%s action_type=%s",
-            call_id, action_type,
-        )
-        return self._skipped("jira_mcp_real_not_implemented")
