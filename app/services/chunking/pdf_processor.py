@@ -1,21 +1,17 @@
-"""PDF 청킹 파이프라인 — pymupdf4llm + RecursiveCharacterTextSplitter.
-
-변경 이력:
-  2026-04-24: pdfplumber → pymupdf4llm. 외부 chunker 주입 + LLM 분류 제거.
-              RecursiveCharacterTextSplitter 내장 + 헤더 기반 메타데이터 자동 추출.
-  2026-04-27: chunk 별 LLM 메타데이터 보강 (title/summary/keywords/topic) +
-              tenant 가용 카테고리 LLM 정제 후 Redis 캐시 (faq_branch RAG miss 안내용).
+"""PDF 청킹 파이프라인 — opendataloader-pdf (Java) + pymupdf4llm fallback.
 
 청킹 전략:
-    1차: ## N. 또는 ## ▶ 헤더 기준 섹션 분할 (문서 의미 단위 보존)
-    2차: 섹션이 MAX_SECTION_CHARS 초과 시 RCS 추가 분할 (크기 제한)
-    3차: chunk 별 GPT-4o-mini batch 호출 → metadata 보강
-    4차: tenant 전체 raw topic → 자연어 카테고리 5~7개 정제 → Redis write
+    1차: ## 헤더 기준 섹션 분할 → 짧은 섹션 merge → 700자 초과 시 RCS 분할
+    2차: chunk 본문 LLM polish (BGE-M3 임베딩 친화 자연어화)
+    3차: chunk 별 LLM 메타데이터 (title/summary/keywords/topic) 추출
+    4차: tenant raw topic → 음성 안내용 카테고리 5~7개 정제 → Redis write
 """
 import asyncio
 import json
 import re
+import tempfile
 import uuid
+from pathlib import Path
 from typing import Optional
 
 import asyncpg
@@ -31,11 +27,12 @@ from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-_SECTION_SPLIT_RE = re.compile(r'(?=\n## )')   # 모든 ## 헤더를 섹션 경계로
+_SECTION_SPLIT_RE = re.compile(r'(?=\n## )')
 _BOLD_RE = re.compile(r'\*\*([^*]+)\*\*')
-_HEADER_META_RE = re.compile(r'^##\s+(?:\d+\.\s*)?(▶\s*|■\s*)?(.+?)$')
 
-MAX_SECTION_CHARS = 1000
+# MIN=200 / MAX=700: 짧은 음성 query 매칭 정밀도 회복용 (PoC 195111.log).
+MAX_SECTION_CHARS = 700
+MIN_CHUNK_CHARS = 200
 
 _RCS = RecursiveCharacterTextSplitter(
     separators=["\n\n", "\n■", "\n▶", "\n☑", "\n※", "\n", " "],
@@ -45,9 +42,24 @@ _RCS = RecursiveCharacterTextSplitter(
 
 
 def _extract_text(pdf_path: str) -> str:
-    """pymupdf4llm 로 PDF → 마크다운 텍스트 추출."""
+    """PDF → 마크다운. opendataloader-pdf 우선, 실패(JVM 미설치 등) 시 pymupdf4llm fallback."""
+    try:
+        from opendataloader_pdf import convert
+        with tempfile.TemporaryDirectory(prefix="odl_") as tmp:
+            convert(input_path=pdf_path, output_dir=tmp, format="markdown", quiet=True)
+            md_files = list(Path(tmp).rglob("*.md"))
+            if not md_files:
+                raise RuntimeError("opendataloader produced no markdown output")
+            text = md_files[0].read_text(encoding="utf-8")
+        logger.info("pdf parsed by opendataloader len=%d path=%s", len(text), pdf_path)
+        return text
+    except Exception as e:
+        logger.warning("opendataloader failed (%s) — fallback to pymupdf4llm: %s", e, pdf_path)
+
     import pymupdf4llm
-    return pymupdf4llm.to_markdown(pdf_path)
+    text = pymupdf4llm.to_markdown(pdf_path)
+    logger.info("pdf parsed by pymupdf4llm len=%d path=%s", len(text), pdf_path)
+    return text
 
 
 def _clean(text: str) -> str:
@@ -72,14 +84,37 @@ def _clean(text: str) -> str:
     return _BOLD_RE.sub(r'\1', cleaned)
 
 
-def _split_sections(text: str) -> list[str]:
-    """헤더 기준 섹션 분할 → 긴 섹션은 RCS 추가 분할."""
-    raw = _SECTION_SPLIT_RE.split(text)
-    chunks = []
-    for section in raw:
-        section = section.strip()
-        if not section:
+def _merge_short_sections(sections: list[str]) -> list[str]:
+    """`MIN_CHUNK_CHARS` 미만 섹션을 다음 섹션 머리에 prepend 해 헤더-only
+    chunk 양산을 막는다. 마지막에 짧은 섹션이 남으면 직전 섹션 끝에 append.
+    """
+    if not sections:
+        return []
+    merged: list[str] = []
+    pending = ""
+    for section in sections:
+        if pending:
+            section = pending + "\n\n" + section
+            pending = ""
+        if len(section) < MIN_CHUNK_CHARS:
+            pending = section
             continue
+        merged.append(section)
+    if pending:
+        if merged:
+            merged[-1] = merged[-1] + "\n\n" + pending
+        else:
+            merged.append(pending)
+    return merged
+
+
+def _split_sections(text: str) -> list[str]:
+    """헤더 기준 섹션 분할 → 짧은 섹션 merge → 긴 섹션은 RCS 추가 분할."""
+    raw = _SECTION_SPLIT_RE.split(text)
+    sections = _merge_short_sections([s.strip() for s in raw if s.strip()])
+
+    chunks: list[str] = []
+    for section in sections:
         if len(section) <= MAX_SECTION_CHARS:
             chunks.append(section)
         else:
@@ -88,37 +123,70 @@ def _split_sections(text: str) -> list[str]:
     return chunks
 
 
-def _metadata_from_chunk(chunk: str) -> dict:
-    """청크 상단 헤더에서 category / product_name 자동 추출."""
-    for line in chunk.split('\n')[:5]:
-        m = _HEADER_META_RE.match(line.strip())
-        if m:
-            title = m.group(2).strip()
-            return {"category": title, "product_name": title}
-    first = next(
-        (l.strip() for l in chunk.split('\n') if l.strip() and not l.startswith('#')),
-        "",
-    )
-    return {"category": "기타", "product_name": first[:60]}
-
-
 # ── LLM 메타데이터 보강 (Phase 2) ─────────────────────────────────
 
 _CHUNK_ENRICH_BATCH = 10  # batch 10 청크/호출 — 비용/시간/정확도 균형
 _JSON_ARRAY_RE = re.compile(r'\[.*\]', re.DOTALL)
+
+# polish 결과 silent 압축/숫자 누락 방어 — 위반 시 원본 chunk fallback.
+_MIN_POLISH_RATIO = 0.7
+_NUMBER_RE = re.compile(r'\d+')
+
+
+def _validate_polish(orig: str, polished: str) -> tuple[bool, str]:
+    """polish 결과가 원본 정보를 보존했는지 검증. (ok, reason)."""
+    if len(polished) < len(orig) * _MIN_POLISH_RATIO:
+        ratio = len(polished) / max(len(orig), 1)
+        return False, f"shrink ratio={ratio:.2f}"
+    orig_nums = _NUMBER_RE.findall(orig)
+    missing = [n for n in orig_nums if n not in polished]
+    if missing:
+        return False, f"missing digits={missing[:5]}"
+    return True, ""
 
 _CHUNK_ENRICH_SYSTEM_PROMPT = """당신은 PDF 청크의 메타데이터 추출기입니다.
 입력: 청크 N 개 (인덱스 1~N).
 출력: JSON 배열, 원소 N 개. 각 원소 필드:
   - title: 청크 핵심 주제 한 줄 (10~25자, 한국어)
   - summary: 청크 요약 1~2문장 (50자 이내)
-  - keywords: 검색 키워드 3~5개 (한국어 배열)
+  - keywords: 사용자가 음성 전화로 짧게 물어볼 때 쓸 법한 한국어 단어 3~5개 (배열)
   - topic: 카테고리 한 단어 또는 짧은 구 (예: "위치", "예약", "진료시간", "주차", "응급실")
 
-규칙:
-- 청크 내용에만 의존. 없는 정보 추측 절대 금지.
+★ keywords 규칙 (음성 query substring 매칭에 직접 사용 — 운영 핵심):
+- 단일 명사 우선. 복합어 ("메뉴 종류", "주차장 이용") 금지.
+  → "메뉴", "종류", "주차" 처럼 1~3자 짧은 단일 명사로 분리.
+- 일반인 음성 표현 우선. 문서 표기 그대로 옮기지 말 것:
+  → 청크가 "주차장" 만 언급해도 keywords 에 "주차" 포함.
+  → "진료시간" → "진료", "시간" 으로 분리.
+- 청크에 명시되지 않은 동의어 1~2개 추가 허용 (사용자가 같은 의미로 쓸 단어).
+
+일반 규칙:
+- 청크 내용에만 의존. 없는 정보 추측 절대 금지 (단, keywords 동의어 1~2개는 예외).
 - 청크가 모호하거나 짧으면 모든 필드를 짧게 유지.
 - 출력은 JSON 배열만, 다른 설명 텍스트 절대 포함하지 않는다."""
+
+_CHUNK_POLISH_SYSTEM_PROMPT = """당신은 RAG 임베딩용 청크 정제기입니다.
+입력: PDF 추출 마크다운 chunk N 개 (헤더 / 표 / 리스트 / 줄바꿈 raw 포함).
+출력: JSON 배열, 원소 N 개 — 각 원소는 정제된 자연어 본문 (string, plain Korean).
+
+목적: BGE-M3 임베딩이 짧은 음성 질문 (예: "메뉴가 뭐가 있어요", "주차 가능?") 와 매칭
+정확도를 높이도록 chunk 본문을 자연어 형태로 다듬는 것.
+
+정제 규칙:
+- 마크다운 마커 제거: ##, ###, ####, ■, ▶, ☑, ※, **, `, 표 파이프 |, 리스트 -
+- 표 raw → 자연어로 풀어 쓰기 (예: "|코스명|가격|\\n|화담|8만원|\\n|사담|12만원|" → "한정식 코스는 화담 8만원, 사담 12만원으로 구성된다")
+- 줄바꿈 \\n 제거 → 자연스러운 단락 / 마침표로 연결
+- 헤더 (예: "## 5. 메뉴 구성 및 코스 안내") → 본문 첫 문장에 자연스럽게 흡수 (예: "한밭식당의 메뉴 구성 및 코스 안내. ...")
+
+★ 절대 규칙 (위반 시 후처리에서 원본으로 자동 폴백):
+- 입력에 있는 모든 사실/정보 보존. 재요약·압축 금지. 표현만 자연어로 변환.
+- 출력 길이는 입력 길이의 70% 이상 유지 (마크다운 마커 제거로 약간 짧아지는 정도만 허용).
+- 숫자 (가격, 시간, 전화번호, 주소, 면적, 인원 수 등) 는 입력에 등장한 모든 숫자열을
+  출력에 한 글자도 변형 없이 그대로 포함. 누락 시 원본으로 폴백 처리됨.
+- 입력에 없는 정보 추측·추가 금지.
+- 같은 의미의 chunk 가 N 개 중 여러 개여도 각각 독립 정제. 합치지 마라.
+
+출력 형식: JSON 배열 [\"정제본1\", \"정제본2\", ...]. 다른 텍스트 절대 금지."""
 
 _CATEGORY_REFINE_SYSTEM_PROMPT = """당신은 음성 안내용 카테고리 정제기입니다.
 입력: chunk 별 raw topic 문자열 list.
@@ -199,6 +267,72 @@ async def _enrich_chunks_with_llm(
     return results
 
 
+async def _polish_chunks_for_embedding(
+    chunks: list[str], llm: BaseLLMService
+) -> list[str]:
+    """chunks 를 BGE-M3 임베딩 친화 자연어로 정제. 정보·숫자 보존, 마크다운 마커 제거.
+
+    호출자 책임:
+      - 검색 매칭은 정제본 임베딩 사용
+      - LLM 응답 input (ChromaDB document) 은 원본 chunk 유지
+    실패한 batch 는 원본 chunk 그대로 사용 (안전 fallback).
+    """
+    POLISH_BATCH = 5  # polish 출력은 메타보다 길어 batch 작게
+    results: list[str] = []
+    for start in range(0, len(chunks), POLISH_BATCH):
+        batch = chunks[start : start + POLISH_BATCH]
+        user_msg = "\n\n".join(f"[{j + 1}]\n{c}" for j, c in enumerate(batch))
+        try:
+            raw = await llm.generate(
+                system_prompt=_CHUNK_POLISH_SYSTEM_PROMPT,
+                user_message=user_msg,
+                temperature=0.1,
+                max_tokens=4500,
+            )
+        except Exception as e:
+            logger.error("chunk polish LLM call failed batch=%d: %s", start // POLISH_BATCH, e)
+            results.extend(batch)  # fallback: 원본
+            continue
+
+        match = _JSON_ARRAY_RE.search(raw or "")
+        if not match:
+            logger.warning(
+                "chunk polish JSON not found batch=%d raw=%r",
+                start // POLISH_BATCH, (raw or "")[:200],
+            )
+            results.extend(batch)
+            continue
+        try:
+            parsed = json.loads(match.group(0))
+        except Exception as e:
+            logger.error("chunk polish JSON parse failed batch=%d: %s", start // POLISH_BATCH, e)
+            results.extend(batch)
+            continue
+
+        if not isinstance(parsed, list):
+            results.extend(batch)
+            continue
+
+        # 길이 맞추기 + 빈/None 항목 + 검증 실패는 원본 fallback
+        normalized: list[str] = []
+        for j, item in enumerate(parsed[: len(batch)]):
+            polished = item.strip() if isinstance(item, str) and item.strip() else ""
+            if polished:
+                ok, reason = _validate_polish(batch[j], polished)
+                if not ok:
+                    logger.warning(
+                        "polish suspicious batch=%d j=%d %s — fallback to orig",
+                        start // POLISH_BATCH, j, reason,
+                    )
+                    polished = ""
+            normalized.append(polished or batch[j])
+        while len(normalized) < len(batch):
+            normalized.append(batch[len(normalized)])
+        results.extend(normalized)
+
+    return results
+
+
 async def _refine_categories(topics: list[str], llm: BaseLLMService) -> list[str]:
     """raw topic list → 자연스러운 5~7개 카테고리. LLM 1회 호출."""
     distinct = sorted({t.strip() for t in topics if t and t.strip() and t != "기타"})
@@ -241,9 +375,7 @@ class PDFProcessor:
     ):
         self._embedder = embedder
         self._rag = rag
-        # LLM 메타데이터 보강용 — 미주입 시 GPT-4o-mini default
         self._llm = llm or GPT4OMiniService()
-        # tenant rag_categories Redis write 용 — 미주입 시 default 인스턴스
         self._session = session or RedisSessionService()
 
     async def process(
@@ -272,37 +404,45 @@ class PDFProcessor:
             chunks = _split_sections(text)
             logger.info("chunked count=%d file=%s", len(chunks), file_name)
 
-            embeddings = await self._embedder.embed_batch(chunks)
+            # chunk 본문 임베딩-친화 정제 (Phase 4) — 마크다운 마커/표/줄바꿈 제거 + 자연어화.
+            # 검색 매칭은 정제본 임베딩으로 수행, ChromaDB document 는 원본 유지 (LLM 응답 input).
+            polished_chunks = await _polish_chunks_for_embedding(chunks, self._llm)
+            logger.info(
+                "polish done doc_id=%s polished=%d (orig avg=%d → polished avg=%d chars)",
+                document_id, len(polished_chunks),
+                int(sum(len(c) for c in chunks) / max(len(chunks), 1)),
+                int(sum(len(c) for c in polished_chunks) / max(len(polished_chunks), 1)),
+            )
 
-            # LLM 메타데이터 보강 — chunk 별 title/summary/keywords/topic
+            embeddings = await self._embedder.embed_batch(polished_chunks)
+
+            # LLM 메타데이터 보강 — chunk 별 title/summary/keywords/topic (원본 chunk 사용)
             llm_metas = await _enrich_chunks_with_llm(chunks, self._llm)
             logger.info("llm enrich done doc_id=%s metas=%d", document_id, len(llm_metas))
 
             collection_name = self._rag._collection_name(tenant_id)
-            for i, (chunk, embedding, llm_meta) in enumerate(
-                zip(chunks, embeddings, llm_metas)
+            for i, (chunk, polished, embedding, llm_meta) in enumerate(
+                zip(chunks, polished_chunks, embeddings, llm_metas)
             ):
-                meta = _metadata_from_chunk(chunk)
                 # ChromaDB metadata 는 primitive 만 → keywords list 는 콤마 join
                 keywords_str = ", ".join(llm_meta.get("keywords") or [])[:200]
                 await self._rag.upsert(
                     doc_id=f"{document_id}_chunk_{i}",
-                    content=chunk,
-                    embedding=embedding,
+                    content=chunk,            # 원본 (LLM 응답 input)
+                    embedding=embedding,      # 정제본 임베딩 (검색 매칭)
                     tenant_id=tenant_id,
                     metadata={
                         "tenant_id": tenant_id,
                         "document_id": str(document_id),
                         "file_name": file_name,
                         "chunk_index": i,
-                        "product_name": meta["product_name"],
-                        "category": meta["category"],
                         "industry": industry,
-                        # LLM 보강 메타데이터 (Phase 2)
                         "llm_title": llm_meta.get("title", ""),
                         "llm_summary": llm_meta.get("summary", ""),
                         "llm_keywords": keywords_str,
                         "llm_topic": llm_meta.get("topic", "기타"),
+                        # 디버그/검증용 — ChromaDB metadata 1KB 제한 회피로 800자 컷.
+                        "polished_text": polished[:800],
                     },
                 )
 

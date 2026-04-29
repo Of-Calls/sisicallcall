@@ -30,6 +30,7 @@ async def cache_node(state: CallState) -> dict:
         return {"query_embedding": query_embedding, "cache_hit": False}
 
     if result:
+        logger.info("cache hit call_id=%s tenant_id=%s", state["call_id"], state["tenant_id"])
         return {
             "query_embedding": query_embedding,
             "cache_hit": True,

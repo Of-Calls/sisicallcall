@@ -1,0 +1,141 @@
+"""transcripts 테이블 INSERT — 발화 단위 기록.
+
+CLAUDE.md 규약: transcripts 에는 tenant_id 컬럼 없음 — calls JOIN 으로 격리.
+
+스키마 제약 주의 (db/init/03_transcripts.sql):
+- speaker CHECK ('customer','agent')
+- response_path CHECK ('cache','faq','task','auth','escalation') — 'clarify','repeat'
+  같은 신규 path 는 미허용. 본 모듈은 허용 외 값을 받으면 NULL 로 INSERT 한다.
+  (스키마 갱신은 _OPEN_ISSUES.md 의 별건)
+- reviewer_verdict CHECK ('pass','revise')
+
+best-effort: asyncpg 예외 흡수 + WARNING. 통화 흐름 차단 안 함.
+
+asyncpg 모듈 레벨 connection pool 사용 — 매 INSERT 마다 connect/close 안 함.
+첫 INSERT 시 lazy 초기화. 종료 시 close_pool() 명시 호출 권장(미호출도 OS 정리).
+"""
+import asyncio
+import re
+
+import asyncpg
+
+from app.utils.config import settings
+from app.utils.logger import get_logger
+
+logger = get_logger(__name__)
+
+_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+
+# transcripts.response_path CHECK 제약과 동일. 외 값은 NULL 로 INSERT.
+_ALLOWED_RESPONSE_PATHS = {"cache", "faq", "task", "auth", "escalation"}
+
+# transcripts.reviewer_verdict CHECK 제약과 동일.
+_ALLOWED_REVIEWER_VERDICTS = {"pass", "revise"}
+
+# Pool 설정 — 통화 응대 best-effort. 동시 통화 + 턴 빈도 고려해 작게 유지.
+_POOL_MIN_SIZE = 1
+_POOL_MAX_SIZE = 5
+_POOL_COMMAND_TIMEOUT = 5.0  # seconds — 통화 응대 5초 절대 제약 안 넘김
+
+_pool: asyncpg.Pool | None = None
+_pool_lock = asyncio.Lock()
+
+
+async def _get_pool() -> asyncpg.Pool:
+    """모듈 레벨 풀 lazy 초기화. 동시 첫 호출은 Lock 으로 직렬화."""
+    global _pool
+    if _pool is not None:
+        return _pool
+    async with _pool_lock:
+        if _pool is None:
+            _pool = await asyncpg.create_pool(
+                dsn=settings.database_url,
+                min_size=_POOL_MIN_SIZE,
+                max_size=_POOL_MAX_SIZE,
+                command_timeout=_POOL_COMMAND_TIMEOUT,
+            )
+    return _pool
+
+
+async def close_pool() -> None:
+    """프로세스 종료 / 테스트 격리용. 미호출 시에도 OS 가 정리."""
+    global _pool
+    if _pool is None:
+        return
+    try:
+        await _pool.close()
+    finally:
+        _pool = None
+
+
+def _is_uuid(value: str) -> bool:
+    return bool(value and _UUID_RE.match(value))
+
+
+def _normalize_response_path(path: str | None) -> str | None:
+    if not path:
+        return None
+    return path if path in _ALLOWED_RESPONSE_PATHS else None
+
+
+def _normalize_reviewer_verdict(verdict: str | None) -> str | None:
+    if not verdict:
+        return None
+    return verdict if verdict in _ALLOWED_REVIEWER_VERDICTS else None
+
+
+async def insert_transcript(
+    db_call_id: str,
+    turn_index: int,
+    speaker: str,
+    text: str,
+    response_path: str | None = None,
+    reviewer_applied: bool = False,
+    reviewer_verdict: str | None = None,
+    is_barge_in: bool = False,
+) -> None:
+    """transcripts 에 발화 1건 INSERT.
+
+    speaker: 'customer' | 'agent'
+    response_path: agent 발화에만 의미 있음. customer 발화는 None.
+    """
+    if not text:
+        return
+    if not _is_uuid(db_call_id):
+        logger.warning(
+            "insert_transcript skip — invalid db_call_id=%s turn=%s speaker=%s",
+            db_call_id, turn_index, speaker,
+        )
+        return
+    if speaker not in ("customer", "agent"):
+        logger.warning("insert_transcript skip — invalid speaker=%s", speaker)
+        return
+
+    try:
+        pool = await _get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO transcripts (
+                    call_id, turn_index, speaker, text,
+                    response_path, reviewer_applied, reviewer_verdict, is_barge_in
+                )
+                VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8)
+                """,
+                db_call_id,
+                turn_index,
+                speaker,
+                text,
+                _normalize_response_path(response_path),
+                bool(reviewer_applied),
+                _normalize_reviewer_verdict(reviewer_verdict),
+                bool(is_barge_in),
+            )
+    except Exception as e:
+        logger.warning(
+            "insert_transcript failed db_call_id=%s turn=%s speaker=%s err=%s",
+            db_call_id, turn_index, speaker, e,
+        )

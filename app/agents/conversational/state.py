@@ -24,8 +24,6 @@ class CallState(TypedDict):
 
     # 라우팅
     primary_intent: Optional[str]       # "intent_faq" | "intent_task" | "intent_auth" | "intent_clarify" | "intent_escalation"
-    secondary_intents: list[str]
-    routing_reason: Optional[str]
 
     # 세션 view (Redis 에서 로드한 당 턴 관점 정보)
     session_view: dict
@@ -41,9 +39,8 @@ class CallState(TypedDict):
     reviewer_applied: bool
     reviewer_verdict: Optional[str]     # "pass" | "revise"
 
-    # 에러 / 타임아웃
+    # 타임아웃
     is_timeout: bool
-    error: Optional[str]
 
     # 대기 멘트 (RFC 001 v0.2) — run_turn 진입 시 tenant settings 에서 pre-load
     # 노드는 .get() 로 안전 접근. 키 부재 시 _run_with_stall 이 하드코딩 기본값 사용.
@@ -83,3 +80,10 @@ class CallState(TypedDict):
     # 매 turn state 에 주입. faq_branch_node 의 LLM 이 rag_miss_count >= 2 일 때 안내 멘트 생성.
     # 빈 list 면 LLM 이 일반 옵션 ("위치, 진료시간, 예약 등") 으로 fallback.
     available_categories: NotRequired[list[str]]
+
+    # RAG probe 신호 (cache miss → rag_probe_node 가 채움 → intent_router_llm 이 활용).
+    # dict 또는 None. dict 일 때 키:
+    #   top_distance(float), matched_keywords(list[str]), top_topic(str),
+    #   top_title(str), top_chunk_id(str)
+    # 임베딩 미보유·검색 오류·결과 0 시 None.
+    rag_probe: NotRequired[Optional[dict]]

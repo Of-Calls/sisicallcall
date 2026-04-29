@@ -140,3 +140,50 @@ class RedisSessionService:
             merged.update(value or {})
             return merged
         return value
+
+    # ── stall 사전 음원 lazy cache ────────────────────────────
+    # Redis Hash: tenant:{tenant_id_no_hyphens}:stall_audio_cache
+    # 필드: audio_field (general/faq/task/auth), 값: base64(μ-law 8kHz bytes).
+    # decode_responses=True 클라이언트 사용으로 raw bytes 보관 불가 → base64 로 우회.
+
+    async def get_stall_audio(self, tenant_id: str, audio_field: str) -> Optional[bytes]:
+        """대기 멘트 사전 합성 음원 조회. 부재/에러/decode 실패 시 None."""
+        import base64
+        key = self._tenant_key(tenant_id, "stall_audio_cache")
+        try:
+            encoded = await self._redis.hget(key, audio_field)
+        except Exception as e:
+            logger.error(
+                "redis stall_audio_cache lookup failed tenant=%s field=%s: %s",
+                tenant_id, audio_field, e,
+            )
+            return None
+        if not encoded:
+            return None
+        try:
+            return base64.b64decode(encoded)
+        except Exception as e:
+            logger.error(
+                "stall_audio_cache decode failed tenant=%s field=%s: %s",
+                tenant_id, audio_field, e,
+            )
+            return None
+
+    async def set_stall_audio(
+        self, tenant_id: str, audio_field: str, audio: bytes
+    ) -> None:
+        """대기 멘트 사전 합성 음원 저장. lazy write-back 용. TTL 없음."""
+        import base64
+        key = self._tenant_key(tenant_id, "stall_audio_cache")
+        try:
+            encoded = base64.b64encode(audio).decode("ascii")
+            await self._redis.hset(key, audio_field, encoded)
+            logger.info(
+                "stall_audio_cache saved tenant=%s field=%s bytes=%d",
+                tenant_id, audio_field, len(audio),
+            )
+        except Exception as e:
+            logger.error(
+                "redis stall_audio_cache save failed tenant=%s field=%s: %s",
+                tenant_id, audio_field, e,
+            )

@@ -17,7 +17,12 @@ from app.api.v1._tenant_helpers import (
     resolve_tenant_id,
 )
 from app.core.events import CALL_ENDED, CALL_STARTED
+from app.repositories.call_repo import finalize_call, insert_call
+from app.repositories.transcript_repo import insert_transcript
 from app.services.session.redis_session import RedisSessionService
+from app.agents.conversational.nodes.enrollment_node.enrollment_node import (
+    cleanup as cleanup_enrollment_state,
+)
 from app.services.speaker_verify.titanet import get_titanet_service
 from app.services.stt.deepgram_streaming import DeepgramStreamingSTTService
 from app.services.tts.channel import tts_channel
@@ -60,6 +65,34 @@ _KO_TTS_CHARS_PER_SEC = 3.0
 _GREETING_PLAY_BUFFER_SEC = 13.0
 _MSG_SILENCE_CHECK = "통화 중이십니까? 불편한 점이 있으시면 말씀해 주세요."
 _MSG_SILENCE_ESCALATION = "전화 연결이 원활하지 않은 것 같습니다. 상담원에게 연결해 드리겠습니다."
+
+# stall ("잠시만요") 발화 트리거 — graph 진입 후 이 시간 안에 응답 emit 안 되면 발화.
+# faq_branch LLM Phase2 (8초) 가 아니라 graph 진입 직후로 이동 (2026-04-28 개정).
+_STALL_DELAY_SEC = 1.5
+_STALL_DEFAULT_TEXT = "잠시만요, 확인해 드리겠습니다."
+
+
+async def _schedule_stall_task(
+    call_id: str,
+    stall_messages: dict,
+    delay: float = _STALL_DELAY_SEC,
+) -> None:
+    """graph 진입 후 delay 초 동안 응답 없으면 stall 발화. _run_turn finally 에서 cancel."""
+    try:
+        await asyncio.sleep(delay)
+    except asyncio.CancelledError:
+        return
+    text = (stall_messages or {}).get("general") or _STALL_DEFAULT_TEXT
+    try:
+        await tts_channel.push_stall(
+            call_id=call_id,
+            text=text,
+            audio_field="general",
+        )
+    except asyncio.CancelledError:
+        return
+    except Exception as exc:  # noqa: BLE001 — best-effort, stall 실패가 통화 흐름 차단 안 함
+        logger.warning("stall scheduler push 실패 call_id=%s: %s", call_id, exc)
 
 
 @router.post("/incoming")
@@ -110,7 +143,7 @@ async def call_websocket(
     logger.info(f"WebSocket 연결 수락 call_id={call_id}")
 
     turn_index = 0
-    utterance_buffer = bytearray()
+    pcm_buffer = bytearray()
     silence_chunk_count = 0
     in_speech = False
     stall_messages: dict = {}   # "start" 이벤트에서 로드
@@ -134,8 +167,13 @@ async def call_websocket(
     # Barge-in 상태 — 메인 루프 + _run_turn 공유
     turn_task: Optional[asyncio.Task] = None
     interrupted_response_text: str = ""
-    # 한 발화당 verify 1회 가드 — utterance_buffer 0.8초 도달 시 verify, 발화 종료 시 reset
+    # 한 발화당 verify 1회 가드 — pcm_buffer 0.8초 도달 시 verify, 발화 종료 시 reset
     bargein_verify_attempted: bool = False
+
+    # PostgreSQL 영구 기록 — calls.id (UUID, RETURNING 으로 채움). insert 실패 시 None 유지.
+    # transcripts INSERT 는 db_call_id 가 채워졌을 때만 시도.
+    db_call_id: Optional[str] = None
+    call_started_at_monotonic: Optional[float] = None
 
     async def _run_turn(state: CallState, streaming_transcript: str) -> None:
         """그래프 실행 + 결과 후처리. 백그라운드 task 로 메인 루프와 분리.
@@ -144,16 +182,30 @@ async def call_websocket(
         session_view dict 를 직접 갱신. asyncio 단일 이벤트 루프이므로 race 없음.
         barge-in 시 cancel 되면 갱신 자체가 일어나지 않아 다음 turn 의
         session_view 가 안전하게 유지된다.
+
+        Stall scheduler: graph 진입 후 _STALL_DELAY_SEC 안에 응답 없으면 "잠시만요"
+        발화. ainvoke 종료(정상/cancel/예외) 시 finally 에서 cancel.
         """
         nonlocal empty_stt_count, silence_alert_count, last_activity_at
+        stall_task: Optional[asyncio.Task] = None
+        if channel_opened:
+            # state["stall_delay_sec"] 우선, 부재 시 모듈 상수 fallback. (Phase D)
+            stall_delay = state.get("stall_delay_sec", _STALL_DELAY_SEC)
+            stall_task = asyncio.create_task(
+                _schedule_stall_task(call_id, stall_messages, delay=stall_delay)
+            )
         try:
-            result = await _graph.ainvoke(state)
-        except asyncio.CancelledError:
-            logger.info("call_id=%s turn cancelled (barge-in)", call_id)
-            raise
-        except Exception as e:
-            logger.error("call_id=%s turn 실행 오류: %s", call_id, e)
-            return
+            try:
+                result = await _graph.ainvoke(state)
+            except asyncio.CancelledError:
+                logger.info("call_id=%s turn cancelled (barge-in)", call_id)
+                raise
+            except Exception as e:
+                logger.error("call_id=%s turn 실행 오류: %s", call_id, e)
+                return
+        finally:
+            if stall_task is not None and not stall_task.done():
+                stall_task.cancel()
 
         _result = result if isinstance(result, dict) else {}
         if _result.get("raw_transcript"):
@@ -165,6 +217,30 @@ async def call_websocket(
         _resp_text = _result.get("response_text") or ""
         _play_buffer = len(_resp_text) / _KO_TTS_CHARS_PER_SEC
         last_activity_at = time.monotonic() + _play_buffer
+
+        # PostgreSQL transcripts 영구 기록 — best-effort, 통화 흐름 차단 안 함.
+        # barge-in cancel 시 ainvoke 가 CancelledError 로 빠져 이 블록 자체가 실행 안 됨.
+        if db_call_id:
+            customer_text = _result.get("normalized_text") or streaming_transcript
+            if customer_text:
+                await insert_transcript(
+                    db_call_id=db_call_id,
+                    turn_index=state["turn_index"],
+                    speaker="customer",
+                    text=customer_text,
+                    is_barge_in=bool(state.get("is_bargein")),
+                )
+            if _resp_text:
+                await insert_transcript(
+                    db_call_id=db_call_id,
+                    turn_index=state["turn_index"],
+                    speaker="agent",
+                    text=_resp_text,
+                    response_path=_result.get("response_path"),
+                    reviewer_applied=bool(_result.get("reviewer_applied")),
+                    reviewer_verdict=_result.get("reviewer_verdict"),
+                    is_barge_in=False,
+                )
 
         # 다음 턴의 Intent Router 가 사용할 맥락 누적
         _new_intent = _result.get("primary_intent")
@@ -198,9 +274,9 @@ async def call_websocket(
         turn_task = None
 
     async def _attempt_bargein_verify() -> None:
-        """utterance_buffer 가 0.8초 채웠을 때 VAD + TitaNet 으로 BARGE-IN 검증.
+        """pcm_buffer 가 0.8초 채웠을 때 VAD + TitaNet 으로 BARGE-IN 검증.
 
-        통과 시: 끊긴 응답 보존, TTS cancel, turn cancel, grace 적용. utterance_buffer 와
+        통과 시: 끊긴 응답 보존, TTS cancel, turn cancel, grace 적용. pcm_buffer 와
         STT 누적은 보존 (현재 발화가 다음 turn 의 입력이 됨).
         미통과 시: 무시. 일반 발화 처리는 그대로 진행 (echo / 타인이면 STT 결과로도 자연 차단).
         한 발화당 1회 시도 — bargein_verify_attempted 플래그로 가드.
@@ -212,7 +288,7 @@ async def call_websocket(
             return
 
         bargein_verify_attempted = True
-        chunk = bytes(utterance_buffer[: settings.bargein_verify_chunk_bytes])
+        chunk = bytes(pcm_buffer[: settings.bargein_verify_chunk_bytes])
 
         # VAD 1차 — 음성 청크 여부 (잡음/정적 차단, GPU 호출 절약)
         try:
@@ -248,7 +324,7 @@ async def call_websocket(
         await _cancel_turn_task()
         last_activity_at = time.monotonic() + _BARGEIN_GRACE_SEC
         silence_alert_count = 0
-        # utterance_buffer / STT 누적은 보존 — 발화 종료 (800ms 묵음) 시 정상 turn invoke 가
+        # pcm_buffer / STT 누적은 보존 — 발화 종료 (800ms 묵음) 시 정상 turn invoke 가
         # 현재 발화 PCM + STT transcript 로 다음 응답 생성
 
     try:
@@ -313,6 +389,15 @@ async def call_websocket(
                 # greeting 재생 완료 후부터 침묵 타이머 시작
                 last_activity_at = time.monotonic() + _GREETING_PLAY_BUFFER_SEC
 
+                # PostgreSQL calls 영구 기록 — best-effort. 실패 시 db_call_id 는 None
+                # 으로 남고 transcripts INSERT 는 자연스럽게 skip 됨. 통화 흐름은 그대로.
+                db_call_id = await insert_call(
+                    tenant_id=tenant_id,
+                    twilio_call_sid=call_id,
+                    caller_number=None,
+                )
+                call_started_at_monotonic = time.monotonic()
+
             elif event == "media":
                 track = msg["media"].get("track", "inbound")
                 if track != "inbound":
@@ -323,28 +408,28 @@ async def call_websocket(
                 rms = audioop.rms(pcm_bytes, 2)
 
                 # ── 일반 발화 처리 ────────────────────────────
-                # Phase B: BARGE-IN 검증은 utterance_buffer 가 0.8초 채운 시점에
+                # Phase B: BARGE-IN 검증은 pcm_buffer 가 0.8초 채운 시점에
                 # _attempt_bargein_verify() 가 VAD + TitaNet 게이트로 판단 (이 분기 끝).
                 # 즉시 cancel 분기는 제거 — echo / 타인 목소리에 false-positive 차단.
                 await _streaming_stt.send(call_id, pcm_bytes)
 
                 if rms >= _SPEECH_RMS_THRESHOLD:
                     # 발화 구간 — 버퍼에 누적, 묵음 카운터 초기화
-                    utterance_buffer.extend(pcm_bytes)
+                    pcm_buffer.extend(pcm_bytes)
                     silence_chunk_count = 0
                     in_speech = True
                 elif in_speech:
                     # 발화 직후 묵음 — trailing silence 포함 누적
-                    utterance_buffer.extend(pcm_bytes)
+                    pcm_buffer.extend(pcm_bytes)
                     silence_chunk_count += 1
 
                     trigger = (
                         silence_chunk_count >= _SILENCE_CHUNKS_TO_END
-                        or len(utterance_buffer) >= _MAX_UTTERANCE_BYTES
+                        or len(pcm_buffer) >= _MAX_UTTERANCE_BYTES
                     )
                     if trigger:
-                        if len(utterance_buffer) >= _MIN_UTTERANCE_BYTES:
-                            chunk = bytes(utterance_buffer)
+                        if len(pcm_buffer) >= _MIN_UTTERANCE_BYTES:
+                            chunk = bytes(pcm_buffer)
                             logger.info(
                                 f"call_id={call_id} | 발화 완성 "
                                 f"{len(chunk)} bytes ({len(chunk)/32000:.1f}s) → 그래프 실행"
@@ -362,8 +447,6 @@ async def call_websocket(
                                 "query_embedding": [],
                                 "cache_hit": False,
                                 "primary_intent": None,
-                                "secondary_intents": [],
-                                "routing_reason": None,
                                 "session_view": session_view,
                                 "rag_results": [],
                                 "response_text": "",
@@ -371,9 +454,8 @@ async def call_websocket(
                                 "reviewer_applied": False,
                                 "reviewer_verdict": None,
                                 "is_timeout": False,
-                                "error": None,
                                 "stall_messages": stall_messages,
-                                "stall_delay_sec": 1.0,
+                                "stall_delay_sec": _STALL_DELAY_SEC,  # 모듈 상수와 통일 (Phase D)
                                 "empty_stt_count": empty_stt_count,
                             }
                             if interrupted_response_text:
@@ -385,8 +467,10 @@ async def call_websocket(
                             # tenant 가용 카테고리 주입 — Redis 에서 미리 fetch (start 이벤트)
                             state["available_categories"] = session_view.get("rag_categories", [])
 
-                            # 이전 turn task 가 아직 살아있으면 정리 (정상 흐름에선 거의 없음)
-                            await _cancel_turn_task()
+                            # barge-in 단순 모델 (architect 감사) — turn cancel 은 오직
+                            # `_attempt_bargein_verify` (TitaNet 통과 시) 만 책임진다.
+                            # 새 발화 완성 자체로는 이전 turn 을 cancel 하지 않음 — verify 실패한
+                            # noise (호흡·바람소리 등) 가 응답을 끊는 것을 차단.
                             # 백그라운드 실행 — 송신 동안에도 메인 루프가 inbound 처리
                             turn_task = asyncio.create_task(
                                 _run_turn(state, streaming_transcript)
@@ -395,10 +479,10 @@ async def call_websocket(
                         else:
                             logger.debug(
                                 f"call_id={call_id} | 발화 무시 "
-                                f"(too short: {len(utterance_buffer)} bytes)"
+                                f"(too short: {len(pcm_buffer)} bytes)"
                             )
 
-                        utterance_buffer.clear()
+                        pcm_buffer.clear()
                         silence_chunk_count = 0
                         in_speech = False
                         bargein_verify_attempted = False  # 다음 발화부터 verify 1회 다시 가능
@@ -442,15 +526,15 @@ async def call_websocket(
                             last_activity_at = now
 
                 # ── BARGE-IN verify trigger (per utterance, 1회) ──
-                # TTS 재생 중(또는 turn 진행 중) + utterance_buffer 가 0.8초 채워졌을 때
+                # TTS 재생 중(또는 turn 진행 중) + pcm_buffer 가 0.8초 채워졌을 때
                 # _attempt_bargein_verify() 가 VAD + TitaNet 게이트로 cancel 여부 결정.
-                # 결과(통과/미통과) 와 무관하게 발화 종료까지 utterance_buffer 는 누적 계속.
+                # 결과(통과/미통과) 와 무관하게 발화 종료까지 pcm_buffer 는 누적 계속.
                 channel_speaking = channel_opened and tts_channel.is_speaking(call_id)
                 turn_running = turn_task is not None and not turn_task.done()
                 if (
                     (channel_speaking or turn_running)
                     and not bargein_verify_attempted
-                    and len(utterance_buffer) >= settings.bargein_verify_chunk_bytes
+                    and len(pcm_buffer) >= settings.bargein_verify_chunk_bytes
                 ):
                     await _attempt_bargein_verify()
 
@@ -461,16 +545,12 @@ async def call_websocket(
                 await _streaming_stt.close(call_id)
                 if channel_opened:
                     await tts_channel.flush(call_id)
-                # Post-call Agent 비동기 실행 — 통화 종료 흐름을 blocking하지 않는다.
-                # 예외는 run_post_call_agent_safely 내부에서 전부 처리하므로
-                # create_task 실패가 WebSocket 종료에 영향을 주지 않는다.
-                asyncio.create_task(
-                    run_post_call_agent_safely(
-                        call_id=call_id,
-                        trigger="call_ended",
-                        tenant_id=tenant_id,
+                if db_call_id:
+                    _duration = (
+                        int(time.monotonic() - call_started_at_monotonic)
+                        if call_started_at_monotonic else None
                     )
-                )
+                    await finalize_call(db_call_id, status="completed", duration_sec=_duration)
                 break
 
     except WebSocketDisconnect:
@@ -480,6 +560,12 @@ async def call_websocket(
         await _streaming_stt.close(call_id)
         if channel_opened:
             await tts_channel.flush(call_id)
+        if db_call_id:
+            _duration = (
+                int(time.monotonic() - call_started_at_monotonic)
+                if call_started_at_monotonic else None
+            )
+            await finalize_call(db_call_id, status="abandoned", duration_sec=_duration)
     except Exception as e:
         logger.error(f"call_id={call_id} WebSocket 오류: {e}")
         await _cancel_turn_task()
@@ -487,3 +573,17 @@ async def call_websocket(
         await _streaming_stt.close(call_id)
         if channel_opened:
             await tts_channel.flush(call_id)
+        if db_call_id:
+            _duration = (
+                int(time.monotonic() - call_started_at_monotonic)
+                if call_started_at_monotonic else None
+            )
+            await finalize_call(db_call_id, status="error", duration_sec=_duration)
+    finally:
+        # per-call 메모리 해제 — enrollment 모듈 전역 dict + titanet voiceprint.
+        # 종료 경로(stop / WebSocketDisconnect / Exception) 무엇이든 항상 정리.
+        try:
+            cleanup_enrollment_state(call_id)
+            get_titanet_service().cleanup(call_id)
+        except Exception as e:  # noqa: BLE001 — cleanup 실패가 통화 종료 흐름 차단 안 함
+            logger.warning("call_id=%s 종료 cleanup 실패: %s", call_id, e)

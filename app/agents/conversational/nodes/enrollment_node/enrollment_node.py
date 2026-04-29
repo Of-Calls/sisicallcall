@@ -52,3 +52,16 @@ async def enrollment_node(state: CallState) -> dict:
             _enrollment_done[call_id] = False
 
     return {"enrollment_done": _enrollment_done.get(call_id, False)}
+
+
+def cleanup(call_id: str) -> None:
+    """통화 종료 시 per-call 모듈 전역 dict 메모리 해제.
+
+    `_enrollment_buffers` 는 enrollment 완료 시 pop 되지만 미완료(짧은 통화/빈 STT)
+    케이스에선 잔존. `_enrollment_done` 은 한 번 채워지면 절대 안 지워졌었음.
+    `app/api/v1/call.py` 의 통화 종료 finally 에서 호출.
+    """
+    buf_removed = _enrollment_buffers.pop(call_id, None) is not None
+    done_removed = _enrollment_done.pop(call_id, None) is not None
+    if buf_removed or done_removed:
+        logger.info("enrollment 상태 삭제 call_id=%s", call_id)

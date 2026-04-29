@@ -96,7 +96,7 @@ class SemanticCacheService:
             await self._redis.srem(idx_key, *stale_hashes)
 
         if best_score >= SIMILARITY_THRESHOLD:
-            logger.debug("cache semantic hit similarity=%.4f", best_score)
+            logger.info("cache semantic hit similarity=%.4f", best_score)
             return {
                 "embedding": best_embedding,
                 "response_text": best_response,
