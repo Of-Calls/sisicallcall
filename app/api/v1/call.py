@@ -142,7 +142,7 @@ async def call_websocket(
     logger.info(f"WebSocket 연결 수락 call_id={call_id}")
 
     turn_index = 0
-    utterance_buffer = bytearray()
+    pcm_buffer = bytearray()
     silence_chunk_count = 0
     in_speech = False
     stall_messages: dict = {}   # "start" 이벤트에서 로드
@@ -166,7 +166,7 @@ async def call_websocket(
     # Barge-in 상태 — 메인 루프 + _run_turn 공유
     turn_task: Optional[asyncio.Task] = None
     interrupted_response_text: str = ""
-    # 한 발화당 verify 1회 가드 — utterance_buffer 0.8초 도달 시 verify, 발화 종료 시 reset
+    # 한 발화당 verify 1회 가드 — pcm_buffer 0.8초 도달 시 verify, 발화 종료 시 reset
     bargein_verify_attempted: bool = False
 
     # PostgreSQL 영구 기록 — calls.id (UUID, RETURNING 으로 채움). insert 실패 시 None 유지.
@@ -273,9 +273,9 @@ async def call_websocket(
         turn_task = None
 
     async def _attempt_bargein_verify() -> None:
-        """utterance_buffer 가 0.8초 채웠을 때 VAD + TitaNet 으로 BARGE-IN 검증.
+        """pcm_buffer 가 0.8초 채웠을 때 VAD + TitaNet 으로 BARGE-IN 검증.
 
-        통과 시: 끊긴 응답 보존, TTS cancel, turn cancel, grace 적용. utterance_buffer 와
+        통과 시: 끊긴 응답 보존, TTS cancel, turn cancel, grace 적용. pcm_buffer 와
         STT 누적은 보존 (현재 발화가 다음 turn 의 입력이 됨).
         미통과 시: 무시. 일반 발화 처리는 그대로 진행 (echo / 타인이면 STT 결과로도 자연 차단).
         한 발화당 1회 시도 — bargein_verify_attempted 플래그로 가드.
@@ -287,7 +287,7 @@ async def call_websocket(
             return
 
         bargein_verify_attempted = True
-        chunk = bytes(utterance_buffer[: settings.bargein_verify_chunk_bytes])
+        chunk = bytes(pcm_buffer[: settings.bargein_verify_chunk_bytes])
 
         # VAD 1차 — 음성 청크 여부 (잡음/정적 차단, GPU 호출 절약)
         try:
@@ -323,7 +323,7 @@ async def call_websocket(
         await _cancel_turn_task()
         last_activity_at = time.monotonic() + _BARGEIN_GRACE_SEC
         silence_alert_count = 0
-        # utterance_buffer / STT 누적은 보존 — 발화 종료 (800ms 묵음) 시 정상 turn invoke 가
+        # pcm_buffer / STT 누적은 보존 — 발화 종료 (800ms 묵음) 시 정상 turn invoke 가
         # 현재 발화 PCM + STT transcript 로 다음 응답 생성
 
     try:
@@ -407,28 +407,28 @@ async def call_websocket(
                 rms = audioop.rms(pcm_bytes, 2)
 
                 # ── 일반 발화 처리 ────────────────────────────
-                # Phase B: BARGE-IN 검증은 utterance_buffer 가 0.8초 채운 시점에
+                # Phase B: BARGE-IN 검증은 pcm_buffer 가 0.8초 채운 시점에
                 # _attempt_bargein_verify() 가 VAD + TitaNet 게이트로 판단 (이 분기 끝).
                 # 즉시 cancel 분기는 제거 — echo / 타인 목소리에 false-positive 차단.
                 await _streaming_stt.send(call_id, pcm_bytes)
 
                 if rms >= _SPEECH_RMS_THRESHOLD:
                     # 발화 구간 — 버퍼에 누적, 묵음 카운터 초기화
-                    utterance_buffer.extend(pcm_bytes)
+                    pcm_buffer.extend(pcm_bytes)
                     silence_chunk_count = 0
                     in_speech = True
                 elif in_speech:
                     # 발화 직후 묵음 — trailing silence 포함 누적
-                    utterance_buffer.extend(pcm_bytes)
+                    pcm_buffer.extend(pcm_bytes)
                     silence_chunk_count += 1
 
                     trigger = (
                         silence_chunk_count >= _SILENCE_CHUNKS_TO_END
-                        or len(utterance_buffer) >= _MAX_UTTERANCE_BYTES
+                        or len(pcm_buffer) >= _MAX_UTTERANCE_BYTES
                     )
                     if trigger:
-                        if len(utterance_buffer) >= _MIN_UTTERANCE_BYTES:
-                            chunk = bytes(utterance_buffer)
+                        if len(pcm_buffer) >= _MIN_UTTERANCE_BYTES:
+                            chunk = bytes(pcm_buffer)
                             logger.info(
                                 f"call_id={call_id} | 발화 완성 "
                                 f"{len(chunk)} bytes ({len(chunk)/32000:.1f}s) → 그래프 실행"
@@ -466,8 +466,10 @@ async def call_websocket(
                             # tenant 가용 카테고리 주입 — Redis 에서 미리 fetch (start 이벤트)
                             state["available_categories"] = session_view.get("rag_categories", [])
 
-                            # 이전 turn task 가 아직 살아있으면 정리 (정상 흐름에선 거의 없음)
-                            await _cancel_turn_task()
+                            # barge-in 단순 모델 (architect 감사) — turn cancel 은 오직
+                            # `_attempt_bargein_verify` (TitaNet 통과 시) 만 책임진다.
+                            # 새 발화 완성 자체로는 이전 turn 을 cancel 하지 않음 — verify 실패한
+                            # noise (호흡·바람소리 등) 가 응답을 끊는 것을 차단.
                             # 백그라운드 실행 — 송신 동안에도 메인 루프가 inbound 처리
                             turn_task = asyncio.create_task(
                                 _run_turn(state, streaming_transcript)
@@ -476,10 +478,10 @@ async def call_websocket(
                         else:
                             logger.debug(
                                 f"call_id={call_id} | 발화 무시 "
-                                f"(too short: {len(utterance_buffer)} bytes)"
+                                f"(too short: {len(pcm_buffer)} bytes)"
                             )
 
-                        utterance_buffer.clear()
+                        pcm_buffer.clear()
                         silence_chunk_count = 0
                         in_speech = False
                         bargein_verify_attempted = False  # 다음 발화부터 verify 1회 다시 가능
@@ -523,15 +525,15 @@ async def call_websocket(
                             last_activity_at = now
 
                 # ── BARGE-IN verify trigger (per utterance, 1회) ──
-                # TTS 재생 중(또는 turn 진행 중) + utterance_buffer 가 0.8초 채워졌을 때
+                # TTS 재생 중(또는 turn 진행 중) + pcm_buffer 가 0.8초 채워졌을 때
                 # _attempt_bargein_verify() 가 VAD + TitaNet 게이트로 cancel 여부 결정.
-                # 결과(통과/미통과) 와 무관하게 발화 종료까지 utterance_buffer 는 누적 계속.
+                # 결과(통과/미통과) 와 무관하게 발화 종료까지 pcm_buffer 는 누적 계속.
                 channel_speaking = channel_opened and tts_channel.is_speaking(call_id)
                 turn_running = turn_task is not None and not turn_task.done()
                 if (
                     (channel_speaking or turn_running)
                     and not bargein_verify_attempted
-                    and len(utterance_buffer) >= settings.bargein_verify_chunk_bytes
+                    and len(pcm_buffer) >= settings.bargein_verify_chunk_bytes
                 ):
                     await _attempt_bargein_verify()
 
