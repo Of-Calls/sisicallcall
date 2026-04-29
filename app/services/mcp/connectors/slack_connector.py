@@ -4,15 +4,23 @@ Slack MCP Connector.
 지원 action_type:
   - send_slack_alert
 
+── token 우선순위 (real mode) ──────────────────────────────────────────────
+  1. tenant integration token  (MCP_USE_TENANT_OAUTH=true + tenant_id 제공)
+     - integration.metadata["bot"]["bot_access_token"]  (Slack OAuth v1 bot token)
+     - integration.metadata["access_token"]             (xoxb- 시작 시)
+     - decrypt(integration.access_token_encrypted)      (Slack OAuth v2 표준)
+  2. SLACK_BOT_TOKEN env                                (local/dev fallback only)
+  3. skipped: slack_bot_token_not_configured
+
 ── tenant OAuth mode (MCP_USE_TENANT_OAUTH=true) ───────────────────────────
-  slack integration token을 사용해 Slack Web API chat.postMessage를 호출.
-  tenant_id 기준으로 TenantIntegration을 조회하고 Fernet 복호화한 access_token으로
-  Authorization: Bearer 헤더를 구성한다.
-  token이 없으면 skipped, API ok=false 시 failed, HTTP 오류 시 failed, 성공 시 success.
-  access_token 원문은 로그에 출력하지 않는다.
+  tenant_id 기준 provider="slack" TenantIntegration 조회 → Fernet 복호화 token 사용.
+  tenant_id 없거나 integration 없고 MCP_ALLOW_ENV_FALLBACK=false
+    → skipped("tenant_integration_not_connected")
+  MCP_ALLOW_ENV_FALLBACK=true → SLACK_BOT_TOKEN fallback 시도
 
 ── real mode env (.env SLACK_BOT_TOKEN) ────────────────────────────────────
-  SLACK_MCP_REAL=true + SLACK_BOT_TOKEN 설정 시 사용.
+  SaaS 방식: Slack OAuth tenant token 사용 (위 참조).
+  시연/로컬 방식: SLACK_BOT_TOKEN 설정.
 
 ── mock mode ─────────────────────────────────────────────────────────────────
   status: success
@@ -112,7 +120,9 @@ class SlackConnector(BaseMCPConnector):
             )
             return self._failed("tenant_token_decryption_failed")
 
-        return await self._post_message(access_token, params, call_id=call_id)
+        # metadata에서 bot token 우선 추출 (v1 bot_access_token / v2 raw access_token)
+        bot_token = self._extract_bot_token(integration, access_token)
+        return await self._post_message(bot_token, params, call_id=call_id)
 
     # ── .env BOT_TOKEN 실행 ───────────────────────────────────────────────────
 
@@ -123,11 +133,34 @@ class SlackConnector(BaseMCPConnector):
         *,
         call_id: str,
     ) -> dict:
+        """SLACK_BOT_TOKEN env 기반 실행. token 없으면 skipped."""
         bot_token = os.getenv("SLACK_BOT_TOKEN")
         if not bot_token:
             logger.warning("SlackConnector: SLACK_BOT_TOKEN 없음 call_id=%s", call_id)
             return self._skipped("slack_bot_token_not_configured")
         return await self._post_message(bot_token, params, call_id=call_id)
+
+    # ── bot token 추출 헬퍼 ──────────────────────────────────────────────────
+
+    @staticmethod
+    def _extract_bot_token(integration, decrypted: str) -> str:
+        """integration.metadata에서 Slack bot token을 우선 추출한다.
+
+        우선순위:
+          1. metadata["bot"]["bot_access_token"]  — Slack OAuth v1 response
+          2. metadata["access_token"] (xoxb- 시작) — v2 raw 저장 시
+          3. decrypted                             — access_token_encrypted 복호화 값
+
+        token 원문은 이 함수 내부에서도 로그에 출력하지 않는다.
+        """
+        meta: dict = getattr(integration, "metadata", None) or {}
+        v1_bot = meta.get("bot", {}).get("bot_access_token") or ""
+        if v1_bot:
+            return v1_bot
+        meta_access = meta.get("access_token") or ""
+        if meta_access.startswith("xoxb-"):
+            return meta_access
+        return decrypted
 
     # ── Slack chat.postMessage ────────────────────────────────────────────────
 

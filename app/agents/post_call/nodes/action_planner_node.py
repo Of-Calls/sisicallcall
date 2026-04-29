@@ -104,9 +104,6 @@ def _build_plan(
         _add("send_voc_receipt_sms", "sms",
              {"customer_phone": customer_phone},
              "angry+에스컬레이션 → SMS VOC 접수 안내")
-        _add("create_notion_voc_record", "notion",
-             {"customer_phone": customer_phone},
-             "angry+에스컬레이션 → Notion VOC 기록")
 
     # ── Rule 4: negative + repeated issue ─────────────────────────────────────
     is_negative: bool = sentiment in ("negative", "angry") or emotion in ("negative", "angry")
@@ -122,9 +119,6 @@ def _build_plan(
         _add("send_slack_alert", "slack",
              {"channel": "#alerts", "message": f"[CRITICAL] {call_id}: {summary_short}"},
              "critical priority → Slack 알림 필수")
-        _add("create_notion_voc_record", "notion",
-             {"customer_phone": customer_phone},
-             "critical priority → Notion VOC 기록")
         _add("send_voc_receipt_sms", "sms",
              {"customer_phone": customer_phone},
              "critical priority → SMS VOC 접수 안내")
@@ -145,10 +139,15 @@ def _build_plan(
              {"question": primary_category},
              "faq_candidate=True → FAQ 후보 등록")
 
-    # ── Rule N4: POST_CALL_ENABLE_NOTION_RECORD=true → 모든 통화 Notion 저장 ──
+    # ── Rule N4: POST_CALL_ENABLE_NOTION_RECORD=true → 통화 1건 = Notion row 1개 ─
     if os.getenv("POST_CALL_ENABLE_NOTION_RECORD", "").lower() in ("1", "true"):
         _add("create_notion_call_record", "notion",
-             {"customer_phone": customer_phone},
+             {
+                 "customer_phone": customer_phone,
+                 "customer_emotion": emotion,
+                 "resolution_status": resolution,
+                 "action_required": action_required,
+             },
              "POST_CALL_ENABLE_NOTION_RECORD=true → Notion 통화 기록")
 
     # ── 기본 폴백: high/critical + action_required 이면 VOC 등록 보장 ──────────

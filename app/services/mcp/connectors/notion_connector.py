@@ -4,9 +4,14 @@ Notion MCP Connector — Internal Integration Token 방식.
 시연용 Internal Integration Token + Database ID 방식을 사용한다.
 OAuth 방식은 이번 범위에서 제외한다.
 
+Notion 저장 정책: 통화 1건 = Notion row 1개.
+  action_planner_node는 POST_CALL_ENABLE_NOTION_RECORD=true일 때
+  create_notion_call_record 하나만 생성한다.
+  VOC 정보(감정·카테고리·우선순위 등)는 해당 record의 params에 포함된다.
+
 지원 action_type:
-  - create_notion_call_record   통화 요약/결과 저장
-  - create_notion_voc_record    VOC/에스컬레이션 기록 저장
+  - create_notion_call_record   통화 요약/VOC/결과 통합 저장 (기본)
+  - create_notion_voc_record    하위 호환용 — action_planner에서 자동 생성하지 않음
 
 ── real mode (NOTION_MCP_REAL=true) ─────────────────────────────────────────
   POST https://api.notion.com/v1/pages

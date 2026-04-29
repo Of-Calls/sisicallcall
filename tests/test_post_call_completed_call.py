@@ -464,6 +464,8 @@ async def test_demo_context_generates_required_action_plan(monkeypatch):
     )
     from app.agents.post_call.nodes.action_planner_node import _build_plan
 
+    monkeypatch.setenv("POST_CALL_ENABLE_NOTION_RECORD", "true")
+
     plan = _build_plan(
         call_id=DEMO_POST_CALL_CONTEXT["metadata"]["call_id"],
         tenant_id=DEMO_POST_CALL_CONTEXT["metadata"]["tenant_id"],
@@ -483,9 +485,13 @@ async def test_demo_context_generates_required_action_plan(monkeypatch):
     # SMS: 콜백 → send_callback_sms 또는 VOC → send_voc_receipt_sms
     sms_types = {"send_callback_sms", "send_voc_receipt_sms"}
     assert action_types & sms_types, f"SMS 액션 없음: {action_types}"
-    # Notion: critical + angry+escalated
-    notion_types = {"create_notion_call_record", "create_notion_voc_record"}
-    assert action_types & notion_types, f"Notion 액션 없음: {action_types}"
+    # Notion: 통화 1건 = row 1개 — create_notion_call_record 하나만 생성
+    assert "create_notion_call_record" in action_types, f"create_notion_call_record 없음: {action_types}"
+    assert "create_notion_voc_record" not in action_types, f"create_notion_voc_record가 자동 생성되면 안 됨: {action_types}"
+    notion_action_count = sum(1 for a in plan["actions"] if a["tool"] == "notion")
+    assert notion_action_count == 1, f"Notion action은 1개여야 함, 실제: {notion_action_count}"
+
+    monkeypatch.delenv("POST_CALL_ENABLE_NOTION_RECORD", raising=False)
 
 
 @pytest.mark.asyncio

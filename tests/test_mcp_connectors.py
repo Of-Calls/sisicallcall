@@ -1040,6 +1040,127 @@ async def test_slack_access_token_not_in_result(monkeypatch):
     monkeypatch.delenv("TOKEN_ENCRYPTION_KEY", raising=False)
 
 
+# ── 34-pre. Slack: _extract_bot_token 단위 테스트 ────────────────────────────
+
+def test_extract_bot_token_v1_priority():
+    """metadata["bot"]["bot_access_token"]이 있으면 최우선으로 반환한다."""
+    from app.services.mcp.connectors.slack_connector import SlackConnector
+    from app.models.tenant_integration import TenantIntegration
+
+    connector = SlackConnector()
+    integration = TenantIntegration(
+        tenant_id="t", provider="slack",
+        metadata={"bot": {"bot_access_token": "xoxb-v1-bot"}},
+        access_token_encrypted="placeholder",
+    )
+    assert connector._extract_bot_token(integration, "xoxb-regular") == "xoxb-v1-bot"
+
+
+def test_extract_bot_token_v2_metadata_access_token():
+    """metadata["access_token"]이 xoxb-로 시작하면 v1 없을 때 사용한다."""
+    from app.services.mcp.connectors.slack_connector import SlackConnector
+    from app.models.tenant_integration import TenantIntegration
+
+    connector = SlackConnector()
+    integration = TenantIntegration(
+        tenant_id="t", provider="slack",
+        metadata={"access_token": "xoxb-v2-meta"},
+        access_token_encrypted="placeholder",
+    )
+    assert connector._extract_bot_token(integration, "xoxb-regular") == "xoxb-v2-meta"
+
+
+def test_extract_bot_token_non_bot_meta_access_token_ignored():
+    """metadata["access_token"]이 xoxp-로 시작하면 (user token) fallback 사용."""
+    from app.services.mcp.connectors.slack_connector import SlackConnector
+    from app.models.tenant_integration import TenantIntegration
+
+    connector = SlackConnector()
+    integration = TenantIntegration(
+        tenant_id="t", provider="slack",
+        metadata={"access_token": "xoxp-user-token"},
+        access_token_encrypted="placeholder",
+    )
+    assert connector._extract_bot_token(integration, "xoxb-decrypted") == "xoxb-decrypted"
+
+
+def test_extract_bot_token_empty_metadata_fallback():
+    """metadata가 없으면 decrypted access_token을 반환한다."""
+    from app.services.mcp.connectors.slack_connector import SlackConnector
+    from app.models.tenant_integration import TenantIntegration
+
+    connector = SlackConnector()
+    integration = TenantIntegration(
+        tenant_id="t", provider="slack",
+        metadata={},
+        access_token_encrypted="placeholder",
+    )
+    assert connector._extract_bot_token(integration, "xoxb-from-decrypt") == "xoxb-from-decrypt"
+
+
+# ── 34-pre-b. Slack: env fallback (MCP_ALLOW_ENV_FALLBACK + SLACK_BOT_TOKEN) ──
+
+@pytest.mark.asyncio
+async def test_slack_env_fallback_bot_token_success(monkeypatch):
+    """MCP_ALLOW_ENV_FALLBACK=true + 미연동 + SLACK_BOT_TOKEN → success."""
+    import httpx
+    from app.services.mcp.connectors.slack_connector import SlackConnector
+    from app.repositories.tenant_integration_repo import tenant_integration_repo
+
+    monkeypatch.setenv("MCP_USE_TENANT_OAUTH", "true")
+    monkeypatch.setenv("MCP_ALLOW_ENV_FALLBACK", "true")
+    monkeypatch.setenv("SLACK_MCP_REAL", "true")
+    monkeypatch.setenv("SLACK_ALERT_CHANNEL", "#alerts")
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-fallback-bot-token")
+    tenant_integration_repo.clear_integrations()
+
+    api_response = {"ok": True, "channel": "C123", "ts": "1.0", "message": {}}
+    mock_client = _make_mock_slack_client(200, api_response)
+    monkeypatch.setattr(httpx, "AsyncClient", lambda: mock_client)
+
+    connector = SlackConnector()
+    result = await connector.execute(
+        "send_slack_alert",
+        {"channel": "#alerts", "message": "fallback test"},
+        call_id="fallback-001",
+        tenant_id="no-such-tenant",
+    )
+
+    assert result["status"] == "success"
+    assert "xoxb-fallback-bot-token" not in str(result)
+
+    monkeypatch.delenv("MCP_USE_TENANT_OAUTH", raising=False)
+    monkeypatch.delenv("MCP_ALLOW_ENV_FALLBACK", raising=False)
+    monkeypatch.delenv("SLACK_BOT_TOKEN", raising=False)
+
+
+@pytest.mark.asyncio
+async def test_slack_env_fallback_no_bot_token_skipped(monkeypatch):
+    """MCP_ALLOW_ENV_FALLBACK=true + 미연동 + SLACK_BOT_TOKEN 없음 → skipped."""
+    from app.services.mcp.connectors.slack_connector import SlackConnector
+    from app.repositories.tenant_integration_repo import tenant_integration_repo
+
+    monkeypatch.setenv("MCP_USE_TENANT_OAUTH", "true")
+    monkeypatch.setenv("MCP_ALLOW_ENV_FALLBACK", "true")
+    monkeypatch.setenv("SLACK_MCP_REAL", "true")
+    monkeypatch.setenv("SLACK_ALERT_CHANNEL", "#alerts")
+    monkeypatch.delenv("SLACK_BOT_TOKEN", raising=False)
+    tenant_integration_repo.clear_integrations()
+
+    connector = SlackConnector()
+    result = await connector.execute(
+        "send_slack_alert", {},
+        call_id="fallback-002",
+        tenant_id="no-such-tenant",
+    )
+
+    assert result["status"] == "skipped"
+    assert result["error"] == "slack_bot_token_not_configured"
+
+    monkeypatch.delenv("MCP_USE_TENANT_OAUTH", raising=False)
+    monkeypatch.delenv("MCP_ALLOW_ENV_FALLBACK", raising=False)
+
+
 # ── 34. SMSConnector: mock success ──────────────────────────────────────────
 
 @pytest.mark.asyncio
