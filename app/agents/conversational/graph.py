@@ -10,6 +10,7 @@ from app.agents.conversational.nodes.stt_node.stt_node import stt_node
 from app.agents.conversational.nodes.enrollment_node.enrollment_node import enrollment_node
 from app.agents.conversational.nodes.cache_node.cache_node import cache_node
 from app.agents.conversational.nodes.cache_store_node.cache_store_node import cache_store_node
+from app.agents.conversational.nodes.rag_probe_node.rag_probe_node import rag_probe_node
 from app.agents.conversational.nodes.intent_router_llm_node.intent_router_llm_node import intent_router_llm_node
 from app.agents.conversational.nodes.faq_branch_node.faq_branch_node import faq_branch_node
 from app.agents.conversational.nodes.task_branch_node.task_branch_node import task_branch_node
@@ -101,6 +102,8 @@ def build_call_graph():
     graph.add_node("stt",               _timed("stt")(stt_node))
     graph.add_node("enrollment",        _timed("enrollment")(enrollment_node))
     graph.add_node("cache",             _timed("cache")(cache_node))
+    # 노드명 != state key ("rag_probe" 는 CallState 키이므로 노드명에 _step 접미)
+    graph.add_node("rag_probe_step",    _timed("rag_probe")(rag_probe_node))
     graph.add_node("intent_router_llm", _timed("intent_router_llm")(intent_router_llm_node))
     graph.add_node("faq_branch",        _timed("faq_branch")(faq_branch_node))
     graph.add_node("task_branch",       _timed("task_branch")(task_branch_node))
@@ -126,10 +129,11 @@ def build_call_graph():
     # 별도 노드는 no-op. stt_node 가 normalized_text 도 동시 set 하도록 통합.
     graph.add_edge("enrollment", "cache")
 
-    # Gate 1 분기 — cache miss 는 IntentRouterLLM 으로 직결
+    # Gate 1 분기 — cache miss 시 rag_probe_step (top_k=3 신호 채집) → IntentRouterLLM
     # (이전 KNN Router 단계는 stub 이라 영구 보류 결정 후 2026-04-27 제거 — CLAUDE.md 참조)
     graph.add_conditional_edges("cache", route_after_cache,
-        {"hit": "tts", "miss": "intent_router_llm"})
+        {"hit": "tts", "miss": "rag_probe_step"})
+    graph.add_edge("rag_probe_step", "intent_router_llm")
 
     # IntentRouterLLM → 브랜치 (clarify 포함 5개)
     graph.add_conditional_edges("intent_router_llm", route_to_branch, {

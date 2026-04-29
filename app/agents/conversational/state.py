@@ -80,3 +80,10 @@ class CallState(TypedDict):
     # 매 turn state 에 주입. faq_branch_node 의 LLM 이 rag_miss_count >= 2 일 때 안내 멘트 생성.
     # 빈 list 면 LLM 이 일반 옵션 ("위치, 진료시간, 예약 등") 으로 fallback.
     available_categories: NotRequired[list[str]]
+
+    # RAG probe 신호 (cache miss → rag_probe_node 가 채움 → intent_router_llm 이 활용).
+    # dict 또는 None. dict 일 때 키:
+    #   top_distance(float), matched_keywords(list[str]), top_topic(str),
+    #   top_title(str), top_chunk_id(str)
+    # 임베딩 미보유·검색 오류·결과 0 시 None.
+    rag_probe: NotRequired[Optional[dict]]
