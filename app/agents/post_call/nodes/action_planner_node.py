@@ -99,8 +99,8 @@ def _build_plan(
         _add("add_priority_queue", "internal_dashboard", {},
              "angry+에스컬레이션 → 우선순위 큐")
         _add("send_slack_alert", "slack",
-             {"channel": "#alerts", "message": f"[긴급] {call_id}: {summary_short}"},
-             "angry+에스컬레이션 → Slack 긴급 알림")
+            {"channel_type": "critical", "message": f"[긴급] {call_id}: {summary_short}"},
+            "angry+에스컬레이션 → Slack 긴급 알림")
         _add("send_voc_receipt_sms", "sms",
              {"customer_phone": customer_phone},
              "angry+에스컬레이션 → SMS VOC 접수 안내")
@@ -117,8 +117,8 @@ def _build_plan(
              {"subject": f"[CRITICAL] {call_id}", "to": "manager@example.com"},
              "critical priority → 팀장 이메일 필수")
         _add("send_slack_alert", "slack",
-             {"channel": "#alerts", "message": f"[CRITICAL] {call_id}: {summary_short}"},
-             "critical priority → Slack 알림 필수")
+            {"channel_type": "critical", "message": f"[CRITICAL] {call_id}: {summary_short}"},
+            "critical priority → Slack 알림 필수")
         _add("send_voc_receipt_sms", "sms",
              {"customer_phone": customer_phone},
              "critical priority → SMS VOC 접수 안내")
