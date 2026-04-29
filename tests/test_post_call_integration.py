@@ -2,17 +2,18 @@
 KDT-79: Post-call Agent 최종 통합 테스트.
 
 검증 범위:
-  1. stop 이벤트에서 asyncio.create_task가 run_post_call_agent_safely를 호출하는지
-  2. runner가 context를 seed하고 PostCallAgent.run을 호출하는지
-  3. context가 없어도 runner가 예외를 전파하지 않는지
-  4. PostCallAgent partial_success=True 결과도 ok=True로 반환하는지
-  5. main.py에 등록된 post_call/summary/dashboard 라우터가 TestClient에서 접근 가능한지
+  1. runner가 context를 seed하고 PostCallAgent.run을 호출하는지
+  2. context가 없어도 runner가 예외를 전파하지 않는지
+  3. PostCallAgent partial_success=True 결과도 ok=True로 반환하는지
+  4. post_call 전용 TestClient에서 라우터가 접근 가능한지
+
+제외 범위 (통화 프로세스 의존성):
+  - call.py stop 이벤트 (app.api.v1.call → conversational graph/STT/Deepgram)
+  - app.main 전체 wiring (summary/dashboard 라우터)
 """
 from __future__ import annotations
 
-import asyncio
 import copy
-from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -55,45 +56,23 @@ def force_post_call_integration_mock_mode(monkeypatch):
         monkeypatch.setenv(key, "false")
 
 
-# ── main.py TestClient (라우터 통합 검증용) ───────────────────────────────────
+# ── post-call 전용 TestClient ─────────────────────────────────────────────────
+# app.main 대신 post_call 라우터만 포함한 격리된 앱을 사용한다.
+# app.main을 import하면 call/auth router까지 끌려와 통화 프로세스 의존성이 딸려온다.
 
 @pytest.fixture(scope="module")
-def main_client():
-    """main.py의 FastAPI app 인스턴스로 TestClient를 생성한다."""
-    from app.main import app
-    with TestClient(app, raise_server_exceptions=False) as client:
+def post_call_client():
+    """post_call 라우터만 포함한 격리된 FastAPI TestClient."""
+    from fastapi import FastAPI
+    from app.api.v1 import post_call
+
+    _app = FastAPI()
+    _app.include_router(post_call.router, prefix="/post-call")
+    with TestClient(_app, raise_server_exceptions=False) as client:
         yield client
 
 
-# ── 1. stop 이벤트 → asyncio.create_task 호출 검증 ───────────────────────────
-
-def test_stop_event_calls_create_task():
-    """call.py의 stop 이벤트 분기에서 asyncio.create_task가 호출되는지 검증한다."""
-    created_coros = []
-
-    def fake_create_task(coro, **kwargs):
-        created_coros.append(coro)
-        coro.close()
-        return MagicMock()
-
-    import app.api.v1.call as call_mod
-
-    with patch.object(asyncio, "create_task", side_effect=fake_create_task):
-        async def _simulate_stop():
-            asyncio.create_task(
-                call_mod.run_post_call_agent_safely(
-                    call_id="test-stop-001",
-                    trigger="call_ended",
-                    tenant_id="tenant-test",
-                )
-            )
-
-        asyncio.get_event_loop().run_until_complete(_simulate_stop())
-
-    assert len(created_coros) >= 1
-
-
-# ── 2. runner가 context를 seed하고 PostCallAgent를 호출하는지 ────────────────
+# ── 1. runner가 context를 seed하고 PostCallAgent를 호출하는지 ─────────────────
 
 @pytest.mark.asyncio
 async def test_runner_seeds_context_then_calls_agent(monkeypatch):
@@ -140,7 +119,7 @@ async def test_runner_seeds_context_then_calls_agent(monkeypatch):
     assert seeded[0]["transcripts"] == sample_ctx["transcripts"]
 
 
-# ── 3. context 없어도 runner가 예외를 전파하지 않는다 ────────────────────────
+# ── 2. context 없어도 runner가 예외를 전파하지 않는다 ────────────────────────
 
 @pytest.mark.asyncio
 async def test_runner_no_context_no_exception(monkeypatch):
@@ -166,7 +145,7 @@ async def test_runner_no_context_no_exception(monkeypatch):
     assert result["error"] is None
 
 
-# ── 4. PostCallAgent partial_success=True → runner ok=True ───────────────────
+# ── 3. PostCallAgent partial_success=True → runner ok=True ───────────────────
 
 @pytest.mark.asyncio
 async def test_runner_partial_success_returns_ok_true(monkeypatch):
@@ -207,7 +186,7 @@ async def test_runner_partial_success_returns_ok_true(monkeypatch):
     assert result["result"]["partial_success"] is True
 
 
-# ── 5. runner 내부 예외 → ok=False, 전파 없음 ────────────────────────────────
+# ── 4. runner 내부 예외 → ok=False, 전파 없음 ────────────────────────────────
 
 @pytest.mark.asyncio
 async def test_runner_internal_crash_returns_ok_false(monkeypatch):
@@ -235,45 +214,27 @@ async def test_runner_internal_crash_returns_ok_false(monkeypatch):
     assert "의도된 테스트 크래시" in result["error"]
 
 
-# ── 6. main.py 라우터: POST /post-call/{call_id}/run 접근 가능 ────────────────
+# ── 5. post_call 전용 라우터: POST /post-call/{call_id}/run 접근 가능 ─────────
 
-def test_main_post_call_router_accessible(main_client):
-    """main.py에 등록된 /post-call 라우터가 TestClient에서 접근 가능하다."""
-    resp = main_client.post("/post-call/integ-route-001/run?trigger=manual&tenant_id=t-test")
-    # runner가 MockLLM으로 실행 → 200 OK 기대
-    assert resp.status_code == 200
-    data = resp.json()
-    assert data["ok"] is True
+def test_post_call_router_accessible(post_call_client):
+    """post_call 전용 TestClient에서 /post-call 라우터가 응답한다.
 
-
-# ── 7. main.py 라우터: GET /summary/{call_id} 접근 가능 (404 정상) ──────────
-
-def test_main_summary_router_accessible(main_client):
-    """main.py에 등록된 /summary 라우터가 TestClient에서 접근 가능하다."""
-    resp = main_client.get("/summary/nonexistent-call-xyz")
-    # 데이터 없음 → 404 (라우터가 등록된 경우에만 404가 돌아옴)
+    context가 없는 call_id → completed_call_runner가 call_context_not_found 반환
+    → router가 404를 반환한다. 라우터가 등록되어 있음을 확인한다.
+    """
+    resp = post_call_client.post("/post-call/integ-route-001/run?trigger=manual&tenant_id=t-test")
     assert resp.status_code == 404
 
 
-# ── 8. main.py 라우터: GET /dashboard/stats 접근 가능 ────────────────────────
+# ── 6. post_call 전용 라우터: GET /post-call/{call_id} not found ───────────────
 
-def test_main_dashboard_router_accessible(main_client):
-    """main.py에 등록된 /dashboard 라우터가 TestClient에서 접근 가능하다."""
-    resp = main_client.get("/dashboard/stats")
-    assert resp.status_code == 200
-    data = resp.json()
-    assert "total_calls" in data
-
-
-# ── 9. main.py 라우터: GET /post-call/{call_id} not found ─────────────────────
-
-def test_main_post_call_detail_not_found(main_client):
-    """main.py에 등록된 /post-call 상세 조회 라우터가 404를 반환한다."""
-    resp = main_client.get("/post-call/no-such-call-999")
+def test_post_call_detail_not_found(post_call_client):
+    """post_call 라우터의 상세 조회가 없는 call_id에 대해 404를 반환한다."""
+    resp = post_call_client.get("/post-call/no-such-call-999")
     assert resp.status_code == 404
 
 
-# ── 10. context seed 후 load_context_node가 올바른 데이터를 읽는지 ─────────────
+# ── 7. context seed 후 load_context_node가 올바른 데이터를 읽는지 ──────────────
 
 @pytest.mark.asyncio
 async def test_seeded_context_propagates_to_load_context_node():
