@@ -88,7 +88,10 @@ async def test_calendar_connector_mock_success(monkeypatch):
 # ── 3. Jira connector mock success ───────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_jira_connector_mock_success():
+async def test_jira_connector_mock_success(monkeypatch):
+    monkeypatch.setenv("JIRA_MCP_REAL", "false")
+    monkeypatch.delenv("MCP_USE_TENANT_OAUTH", raising=False)
+
     connector = JiraConnector()
     result = await connector.execute(
         "create_jira_issue",
@@ -108,7 +111,10 @@ async def test_jira_connector_mock_success():
 # ── 4. Slack connector mock success ──────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_slack_connector_mock_success():
+async def test_slack_connector_mock_success(monkeypatch):
+    monkeypatch.setenv("SLACK_MCP_REAL", "false")
+    monkeypatch.delenv("MCP_USE_TENANT_OAUTH", raising=False)
+
     connector = SlackConnector()
     result = await connector.execute(
         "send_slack_alert",
@@ -251,8 +257,24 @@ async def test_mcp_client_connector_exception_returns_failed():
 
 # ── 10. connector 결과가 4개 표준 키를 포함 ──────────────────────────────────
 
+def _force_all_connectors_mock(monkeypatch):
+    for key in (
+        "GMAIL_MCP_REAL",
+        "CALENDAR_MCP_REAL",
+        "JIRA_MCP_REAL",
+        "SLACK_MCP_REAL",
+        "SMS_MCP_REAL",
+        "NOTION_MCP_REAL",
+        "COMPANY_DB_MCP_REAL",
+        "MCP_COMPANY_DB_REAL",
+        "MCP_USE_TENANT_OAUTH",
+    ):
+        monkeypatch.setenv(key, "false")
+
+
 @pytest.mark.asyncio
-async def test_connector_result_has_standard_keys():
+async def test_connector_result_has_standard_keys(monkeypatch):
+    _force_all_connectors_mock(monkeypatch)
     connectors = [
         ("gmail", GmailConnector(), "send_manager_email", {}),
         ("calendar", CalendarConnector(), "schedule_callback", {}),

@@ -46,6 +46,23 @@ def reset_stores():
     summary_mod._context_store.clear()
 
 
+@pytest.fixture(autouse=True)
+def force_post_call_tests_mock_mode(monkeypatch):
+    for key in (
+        "GMAIL_MCP_REAL",
+        "CALENDAR_MCP_REAL",
+        "JIRA_MCP_REAL",
+        "SLACK_MCP_REAL",
+        "SMS_MCP_REAL",
+        "NOTION_MCP_REAL",
+        "COMPANY_DB_MCP_REAL",
+        "MCP_COMPANY_DB_REAL",
+        "MCP_USE_TENANT_OAUTH",
+        "POST_CALL_ENABLE_NOTION_RECORD",
+    ):
+        monkeypatch.setenv(key, "false")
+
+
 # ── API 테스트용 미니 앱 ──────────────────────────────────────────────────────
 
 @pytest.fixture(scope="module")
