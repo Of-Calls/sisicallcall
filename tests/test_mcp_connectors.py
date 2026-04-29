@@ -178,16 +178,17 @@ async def test_jira_connector_real_mode_config_missing_returns_skipped(monkeypat
 
 @pytest.mark.asyncio
 async def test_slack_connector_real_mode_config_missing_returns_skipped(monkeypatch):
+    # real mode + tenant OAuth 미설정 → tenant_oauth_required
     monkeypatch.setenv("SLACK_MCP_REAL", "true")
-    monkeypatch.delenv("SLACK_ALERT_CHANNEL", raising=False)
+    monkeypatch.delenv("MCP_USE_TENANT_OAUTH", raising=False)
 
     connector = SlackConnector()
     result = await connector.execute(
         "send_slack_alert", {}, call_id="conn-006c",
     )
 
-    assert result["status"] in ("skipped", "failed")
-    assert result["error"] == "slack_mcp_connector_not_configured"
+    assert result["status"] == "skipped"
+    assert result["error"] == "tenant_oauth_required"
 
 
 # ── 7. MCPClient가 tool_name으로 connector를 찾아 실행 ────────────────────────
@@ -769,6 +770,7 @@ async def test_slack_real_api_success(monkeypatch):
     plaintext_token = "xoxb-fake-slack-bot-token"
     key = Fernet.generate_key()
     monkeypatch.setenv("TOKEN_ENCRYPTION_KEY", key.decode())
+    monkeypatch.setenv("SLACK_MCP_REAL", "true")
     monkeypatch.setenv("MCP_USE_TENANT_OAUTH", "true")
     monkeypatch.setenv("SLACK_ALERT_CHANNEL", "#alerts")
     reset_fernet_cache()
@@ -798,6 +800,7 @@ async def test_slack_real_api_success(monkeypatch):
     from app.repositories.tenant_integration_repo import tenant_integration_repo
     tenant_integration_repo.clear_integrations()
     reset_fernet_cache()
+    monkeypatch.delenv("SLACK_MCP_REAL", raising=False)
     monkeypatch.delenv("MCP_USE_TENANT_OAUTH", raising=False)
     monkeypatch.delenv("TOKEN_ENCRYPTION_KEY", raising=False)
 
@@ -813,6 +816,7 @@ async def test_slack_real_api_ok_false(monkeypatch):
 
     key = Fernet.generate_key()
     monkeypatch.setenv("TOKEN_ENCRYPTION_KEY", key.decode())
+    monkeypatch.setenv("SLACK_MCP_REAL", "true")
     monkeypatch.setenv("MCP_USE_TENANT_OAUTH", "true")
     monkeypatch.setenv("SLACK_ALERT_CHANNEL", "#alerts")
     reset_fernet_cache()
@@ -831,6 +835,7 @@ async def test_slack_real_api_ok_false(monkeypatch):
     from app.repositories.tenant_integration_repo import tenant_integration_repo
     tenant_integration_repo.clear_integrations()
     reset_fernet_cache()
+    monkeypatch.delenv("SLACK_MCP_REAL", raising=False)
     monkeypatch.delenv("MCP_USE_TENANT_OAUTH", raising=False)
     monkeypatch.delenv("TOKEN_ENCRYPTION_KEY", raising=False)
 
@@ -846,6 +851,7 @@ async def test_slack_real_api_http_failure(monkeypatch):
 
     key = Fernet.generate_key()
     monkeypatch.setenv("TOKEN_ENCRYPTION_KEY", key.decode())
+    monkeypatch.setenv("SLACK_MCP_REAL", "true")
     monkeypatch.setenv("MCP_USE_TENANT_OAUTH", "true")
     monkeypatch.setenv("SLACK_ALERT_CHANNEL", "#alerts")
     reset_fernet_cache()
@@ -864,6 +870,7 @@ async def test_slack_real_api_http_failure(monkeypatch):
     from app.repositories.tenant_integration_repo import tenant_integration_repo
     tenant_integration_repo.clear_integrations()
     reset_fernet_cache()
+    monkeypatch.delenv("SLACK_MCP_REAL", raising=False)
     monkeypatch.delenv("MCP_USE_TENANT_OAUTH", raising=False)
     monkeypatch.delenv("TOKEN_ENCRYPTION_KEY", raising=False)
 
@@ -880,6 +887,7 @@ async def test_slack_channel_priority(monkeypatch):
 
     key = Fernet.generate_key()
     monkeypatch.setenv("TOKEN_ENCRYPTION_KEY", key.decode())
+    monkeypatch.setenv("SLACK_MCP_REAL", "true")
     monkeypatch.setenv("MCP_USE_TENANT_OAUTH", "true")
     monkeypatch.setenv("SLACK_ALERT_CHANNEL", "#env-alerts")
     monkeypatch.setenv("SLACK_CRITICAL_CHANNEL", "#critical-channel")
@@ -920,6 +928,7 @@ async def test_slack_channel_priority(monkeypatch):
     from app.repositories.tenant_integration_repo import tenant_integration_repo
     tenant_integration_repo.clear_integrations()
     reset_fernet_cache()
+    monkeypatch.delenv("SLACK_MCP_REAL", raising=False)
     monkeypatch.delenv("MCP_USE_TENANT_OAUTH", raising=False)
     monkeypatch.delenv("TOKEN_ENCRYPTION_KEY", raising=False)
 
@@ -936,6 +945,7 @@ async def test_slack_message_priority(monkeypatch):
 
     key = Fernet.generate_key()
     monkeypatch.setenv("TOKEN_ENCRYPTION_KEY", key.decode())
+    monkeypatch.setenv("SLACK_MCP_REAL", "true")
     monkeypatch.setenv("MCP_USE_TENANT_OAUTH", "true")
     monkeypatch.setenv("SLACK_ALERT_CHANNEL", "#alerts")
     reset_fernet_cache()
@@ -979,6 +989,7 @@ async def test_slack_message_priority(monkeypatch):
     from app.repositories.tenant_integration_repo import tenant_integration_repo
     tenant_integration_repo.clear_integrations()
     reset_fernet_cache()
+    monkeypatch.delenv("SLACK_MCP_REAL", raising=False)
     monkeypatch.delenv("MCP_USE_TENANT_OAUTH", raising=False)
     monkeypatch.delenv("TOKEN_ENCRYPTION_KEY", raising=False)
 
@@ -990,6 +1001,7 @@ async def test_slack_no_tenant_integration_skipped(monkeypatch):
     from app.repositories.tenant_integration_repo import tenant_integration_repo
     from app.services.mcp.connectors.slack_connector import SlackConnector
 
+    monkeypatch.setenv("SLACK_MCP_REAL", "true")
     monkeypatch.setenv("MCP_USE_TENANT_OAUTH", "true")
     monkeypatch.delenv("MCP_ALLOW_ENV_FALLBACK", raising=False)
     tenant_integration_repo.clear_integrations()
@@ -1003,6 +1015,7 @@ async def test_slack_no_tenant_integration_skipped(monkeypatch):
 
     assert result["status"] == "skipped"
     assert result["error"] == "tenant_integration_not_connected"
+    monkeypatch.delenv("SLACK_MCP_REAL", raising=False)
     monkeypatch.delenv("MCP_USE_TENANT_OAUTH", raising=False)
 
 
@@ -1018,6 +1031,7 @@ async def test_slack_access_token_not_in_result(monkeypatch):
     plaintext_token = "xoxb-super-secret-do-not-leak-slack-token"
     key = Fernet.generate_key()
     monkeypatch.setenv("TOKEN_ENCRYPTION_KEY", key.decode())
+    monkeypatch.setenv("SLACK_MCP_REAL", "true")
     monkeypatch.setenv("MCP_USE_TENANT_OAUTH", "true")
     monkeypatch.setenv("SLACK_ALERT_CHANNEL", "#alerts")
     reset_fernet_cache()
@@ -1036,6 +1050,7 @@ async def test_slack_access_token_not_in_result(monkeypatch):
     from app.repositories.tenant_integration_repo import tenant_integration_repo
     tenant_integration_repo.clear_integrations()
     reset_fernet_cache()
+    monkeypatch.delenv("SLACK_MCP_REAL", raising=False)
     monkeypatch.delenv("MCP_USE_TENANT_OAUTH", raising=False)
     monkeypatch.delenv("TOKEN_ENCRYPTION_KEY", raising=False)
 
@@ -1102,21 +1117,16 @@ def test_extract_bot_token_empty_metadata_fallback():
 
 @pytest.mark.asyncio
 async def test_slack_env_fallback_bot_token_success(monkeypatch):
-    """MCP_ALLOW_ENV_FALLBACK=true + 미연동 + SLACK_BOT_TOKEN → success."""
-    import httpx
+    """Slack env fallback 제거 — MCP_ALLOW_ENV_FALLBACK=true여도 tenant integration 없으면 skipped."""
     from app.services.mcp.connectors.slack_connector import SlackConnector
     from app.repositories.tenant_integration_repo import tenant_integration_repo
 
+    monkeypatch.setenv("SLACK_MCP_REAL", "true")
     monkeypatch.setenv("MCP_USE_TENANT_OAUTH", "true")
     monkeypatch.setenv("MCP_ALLOW_ENV_FALLBACK", "true")
-    monkeypatch.setenv("SLACK_MCP_REAL", "true")
     monkeypatch.setenv("SLACK_ALERT_CHANNEL", "#alerts")
-    monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-fallback-bot-token")
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-fake-token")
     tenant_integration_repo.clear_integrations()
-
-    api_response = {"ok": True, "channel": "C123", "ts": "1.0", "message": {}}
-    mock_client = _make_mock_slack_client(200, api_response)
-    monkeypatch.setattr(httpx, "AsyncClient", lambda: mock_client)
 
     connector = SlackConnector()
     result = await connector.execute(
@@ -1126,9 +1136,10 @@ async def test_slack_env_fallback_bot_token_success(monkeypatch):
         tenant_id="no-such-tenant",
     )
 
-    assert result["status"] == "success"
-    assert "xoxb-fallback-bot-token" not in str(result)
+    assert result["status"] == "skipped"
+    assert result["error"] == "tenant_integration_not_connected"
 
+    monkeypatch.delenv("SLACK_MCP_REAL", raising=False)
     monkeypatch.delenv("MCP_USE_TENANT_OAUTH", raising=False)
     monkeypatch.delenv("MCP_ALLOW_ENV_FALLBACK", raising=False)
     monkeypatch.delenv("SLACK_BOT_TOKEN", raising=False)
@@ -1136,16 +1147,12 @@ async def test_slack_env_fallback_bot_token_success(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_slack_env_fallback_no_bot_token_skipped(monkeypatch):
-    """MCP_ALLOW_ENV_FALLBACK=true + 미연동 + SLACK_BOT_TOKEN 없음 → skipped."""
+    """Slack real mode + tenant OAuth 필수 — MCP_USE_TENANT_OAUTH=false이면 tenant_oauth_required."""
     from app.services.mcp.connectors.slack_connector import SlackConnector
-    from app.repositories.tenant_integration_repo import tenant_integration_repo
 
-    monkeypatch.setenv("MCP_USE_TENANT_OAUTH", "true")
-    monkeypatch.setenv("MCP_ALLOW_ENV_FALLBACK", "true")
     monkeypatch.setenv("SLACK_MCP_REAL", "true")
-    monkeypatch.setenv("SLACK_ALERT_CHANNEL", "#alerts")
+    monkeypatch.delenv("MCP_USE_TENANT_OAUTH", raising=False)
     monkeypatch.delenv("SLACK_BOT_TOKEN", raising=False)
-    tenant_integration_repo.clear_integrations()
 
     connector = SlackConnector()
     result = await connector.execute(
@@ -1155,10 +1162,9 @@ async def test_slack_env_fallback_no_bot_token_skipped(monkeypatch):
     )
 
     assert result["status"] == "skipped"
-    assert result["error"] == "slack_bot_token_not_configured"
+    assert result["error"] == "tenant_oauth_required"
 
-    monkeypatch.delenv("MCP_USE_TENANT_OAUTH", raising=False)
-    monkeypatch.delenv("MCP_ALLOW_ENV_FALLBACK", raising=False)
+    monkeypatch.delenv("SLACK_MCP_REAL", raising=False)
 
 
 # ── 34. SMSConnector: mock success ──────────────────────────────────────────

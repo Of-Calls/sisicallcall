@@ -4,23 +4,21 @@ Slack MCP Connector.
 지원 action_type:
   - send_slack_alert
 
-── token 우선순위 (real mode) ──────────────────────────────────────────────
-  1. tenant integration token  (MCP_USE_TENANT_OAUTH=true + tenant_id 제공)
-     - integration.metadata["bot"]["bot_access_token"]  (Slack OAuth v1 bot token)
-     - integration.metadata["access_token"]             (xoxb- 시작 시)
-     - decrypt(integration.access_token_encrypted)      (Slack OAuth v2 표준)
-  2. SLACK_BOT_TOKEN env                                (local/dev fallback only)
-  3. skipped: slack_bot_token_not_configured
+── 실행 정책 ─────────────────────────────────────────────────────────────────
+  SLACK_MCP_REAL=false (기본) → 항상 mock 반환  (MCP_USE_TENANT_OAUTH 값 무관)
+  SLACK_MCP_REAL=true  + MCP_USE_TENANT_OAUTH=false → skipped("tenant_oauth_required")
+  SLACK_MCP_REAL=true  + MCP_USE_TENANT_OAUTH=true + tenant_id 없음 → skipped("tenant_oauth_required")
+  SLACK_MCP_REAL=true  + MCP_USE_TENANT_OAUTH=true + integration 없음 → skipped("tenant_integration_not_connected")
+  SLACK_MCP_REAL=true  + MCP_USE_TENANT_OAUTH=true + integration 있음 → chat.postMessage 호출
 
-── tenant OAuth mode (MCP_USE_TENANT_OAUTH=true) ───────────────────────────
-  tenant_id 기준 provider="slack" TenantIntegration 조회 → Fernet 복호화 token 사용.
-  tenant_id 없거나 integration 없고 MCP_ALLOW_ENV_FALLBACK=false
-    → skipped("tenant_integration_not_connected")
-  MCP_ALLOW_ENV_FALLBACK=true → SLACK_BOT_TOKEN fallback 시도
+── SLACK_BOT_TOKEN env fallback 없음 ─────────────────────────────────────────
+  Slack real mode는 tenant OAuth 전용이다.
+  MCP_ALLOW_ENV_FALLBACK, SLACK_BOT_TOKEN은 Slack 실제 전송에 사용하지 않는다.
 
-── real mode env (.env SLACK_BOT_TOKEN) ────────────────────────────────────
-  SaaS 방식: Slack OAuth tenant token 사용 (위 참조).
-  시연/로컬 방식: SLACK_BOT_TOKEN 설정.
+── token 우선순위 (real mode) ────────────────────────────────────────────────
+  1. metadata["bot"]["bot_access_token"]  — Slack OAuth v1 bot token
+  2. metadata["access_token"] (xoxb- 시작) — v2 raw 저장 형식
+  3. decrypt(integration.access_token_encrypted) — 표준 v2 OAuth bot token
 
 ── mock mode ─────────────────────────────────────────────────────────────────
   status: success
@@ -65,19 +63,19 @@ class SlackConnector(BaseMCPConnector):
             call_id, action_type, self.is_real_mode(), self._use_tenant_oauth(),
         )
 
-        # tenant OAuth 우선 처리 (CalendarConnector 패턴)
-        if self._use_tenant_oauth() and tenant_id:
-            return await self._oauth_execute(action_type, params, call_id=call_id, tenant_id=tenant_id)
-
+        # mock 판단이 항상 먼저 — SLACK_MCP_REAL=false이면 무조건 mock
         if not self.is_real_mode():
             return self._mock(params, call_id)
 
-        ok, err = self.validate_config()
-        if not ok:
-            logger.warning("SlackConnector: config 부족 call_id=%s err=%s", call_id, err)
-            return self._skipped("slack_mcp_connector_not_configured")
+        # real mode: tenant OAuth 필수 (SLACK_BOT_TOKEN env fallback 없음)
+        if not self._use_tenant_oauth() or not tenant_id:
+            logger.warning(
+                "SlackConnector: tenant OAuth required call_id=%s tenant_id=%r",
+                call_id, tenant_id,
+            )
+            return self._skipped("tenant_oauth_required")
 
-        return await self._execute_env_real(action_type, params, call_id=call_id)
+        return await self._oauth_execute(action_type, params, call_id=call_id, tenant_id=tenant_id)
 
     # ── tenant OAuth 실행 ─────────────────────────────────────────────────────
 
@@ -96,8 +94,6 @@ class SlackConnector(BaseMCPConnector):
         integration = get_integration(tenant_id, self._oauth_provider_name)
 
         if integration is None or integration.status == IntegrationStatus.disconnected:
-            if self._allow_env_fallback():
-                return self._mock(params, call_id) if not self.is_real_mode() else await self._execute_env_real(action_type, params, call_id=call_id)
             return self._skipped("tenant_integration_not_connected")
 
         # 만료 체크
@@ -124,7 +120,7 @@ class SlackConnector(BaseMCPConnector):
         bot_token = self._extract_bot_token(integration, access_token)
         return await self._post_message(bot_token, params, call_id=call_id)
 
-    # ── .env BOT_TOKEN 실행 ───────────────────────────────────────────────────
+    # ── .env BOT_TOKEN 실행 (미사용 — 하위 호환 보존용) ──────────────────────────
 
     async def _execute_env_real(
         self,
@@ -133,7 +129,7 @@ class SlackConnector(BaseMCPConnector):
         *,
         call_id: str,
     ) -> dict:
-        """SLACK_BOT_TOKEN env 기반 실행. token 없으면 skipped."""
+        """SLACK_BOT_TOKEN env 기반 실행. execute()에서 호출하지 않는다."""
         bot_token = os.getenv("SLACK_BOT_TOKEN")
         if not bot_token:
             logger.warning("SlackConnector: SLACK_BOT_TOKEN 없음 call_id=%s", call_id)
