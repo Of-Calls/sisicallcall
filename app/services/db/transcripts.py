@@ -3,43 +3,78 @@ DB transcript adapter.
 
 calls / transcripts 테이블에서 종료된 통화 context를 조회한다.
 
-── 현재 상태 ──────────────────────────────────────────────────────────────────
-실제 DB ORM/테이블 구조가 확정되지 않아 skeleton 구현이다.
-함수는 항상 None을 반환한다.
-테스트에서 monkeypatch로 반환값을 주입해 동작을 검증한다.
+── DB 접근 방식 ───────────────────────────────────────────────────────────────
+asyncpg per-call connect (call_repo.py / _tenant_helpers.py 와 동일 방식).
+import 시점에 DB 연결을 만들지 않는다.
+함수 호출 시점에만 asyncpg.connect()를 호출한다.
 
-── TODO: DB ORM 확정 후 채울 내용 ────────────────────────────────────────────
-- DB 세션 팩토리(asyncpg / SQLAlchemy async) 연결
-- calls 테이블에서 call_id 기준 metadata 조회
-- transcripts 테이블에서 call_id 기준 row 조회 (role / text / timestamp)
-- branch_stats: calls 테이블 컬럼 또는 별도 집계
+── call_id 조회 기준 ──────────────────────────────────────────────────────────
+UUID 형식  → calls.id = $1::uuid OR calls.twilio_call_sid = $1
+그 외 형식 → calls.twilio_call_sid = $1  (Twilio SID: CAxxxx...)
+
+── calls 테이블 주요 컬럼 (db/init/02_calls.sql 기준) ─────────────────────────
+  id, tenant_id, twilio_call_sid, caller_number,
+  status, started_at, ended_at, branch_stats (JSONB)
+
+── transcripts 테이블 주요 컬럼 (db/init/03_transcripts.sql 기준) ──────────────
+  call_id, turn_index, speaker ('customer'|'agent'), text, spoken_at
+  — tenant_id 컬럼 없음 (calls JOIN으로 tenant 격리)
 
 ── 반환 형식 ──────────────────────────────────────────────────────────────────
 {
   "metadata": {
-    "call_id": "...",
-    "tenant_id": "...",
-    "start_time": "ISO8601",
-    "end_time": "ISO8601",
-    "status": "completed"
+    "call_id":       "...",
+    "tenant_id":     "...",
+    "start_time":    "ISO8601 | None",
+    "end_time":      "ISO8601 | None",
+    "status":        "completed | ...",
+    "customer_phone": "... | None"
   },
   "transcripts": [
-    {"role": "customer", "text": "...", "timestamp": "ISO8601"},
-    {"role": "agent",    "text": "...", "timestamp": "ISO8601"}
+    {"role": "customer", "text": "...", "timestamp": "ISO8601 | None"},
+    ...
   ],
-  "branch_stats": {"faq": int, "task": int, "escalation": int}
+  "branch_stats": {"faq": int, "task": int, "escalation": int, ...}
 }
 
-── 주의 ───────────────────────────────────────────────────────────────────────
-- import 시점에 DB 연결을 만들지 않는다.
-- sample transcript를 절대 반환하지 않는다.
-- DB 조회 실패 시 예외를 전파하지 않고 logger.warning 후 None을 반환한다.
+── 예외 정책 ──────────────────────────────────────────────────────────────────
+- call_id 해당 row 없음 → None
+- tenant_id 제공 & DB tenant_id 불일치 → None
+- DB 연결/쿼리 실패 → logger.warning 후 None (예외 전파 금지)
+- sample transcript 절대 반환 안 함
 """
 from __future__ import annotations
 
+import json
+import re
+
+import asyncpg
+
+from app.utils.config import settings
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+
+
+def _is_uuid(value: str) -> bool:
+    return bool(value and _UUID_RE.match(value))
+
+
+def _parse_jsonb(value) -> dict:
+    """asyncpg JSONB 반환값 → dict. 문자열 / dict / None 모두 처리."""
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return value
+    try:
+        return json.loads(value)
+    except Exception:
+        return {}
 
 
 async def get_completed_call_context_from_db(
@@ -48,48 +83,97 @@ async def get_completed_call_context_from_db(
 ) -> dict | None:
     """DB에서 종료된 통화 context를 조회한다.
 
-    TODO: 실제 DB ORM 연결 후 아래 구조로 구현한다.
+    Args:
+        call_id:   calls.id (UUID) 또는 calls.twilio_call_sid.
+        tenant_id: 제공 시 calls.tenant_id 와 일치 여부를 검증한다.
 
-    # from app.db.session import get_async_session
-    # from app.db.models import Call, Transcript
-    # from sqlalchemy import select
-    #
-    # try:
-    #     async with get_async_session() as session:
-    #         call = await session.get(Call, call_id)
-    #         if call is None:
-    #             return None
-    #         result = await session.execute(
-    #             select(Transcript)
-    #             .where(Transcript.call_id == call_id)
-    #             .order_by(Transcript.created_at)
-    #         )
-    #         rows = result.scalars().all()
-    #         return {
-    #             "metadata": {
-    #                 "call_id":   call_id,
-    #                 "tenant_id": call.tenant_id,
-    #                 "start_time": call.start_time.isoformat() if call.start_time else None,
-    #                 "end_time":   call.end_time.isoformat()   if call.end_time   else None,
-    #                 "status":    "completed",
-    #             },
-    #             "transcripts": [
-    #                 {"role": r.role, "text": r.text,
-    #                  "timestamp": r.created_at.isoformat() if r.created_at else None}
-    #                 for r in rows
-    #             ],
-    #             "branch_stats": {
-    #                 "faq":       call.faq_count       or 0,
-    #                 "task":      call.task_count      or 0,
-    #                 "escalation": call.escalation_count or 0,
-    #             },
-    #         }
-    # except Exception as exc:
-    #     logger.warning("DB 조회 실패 call_id=%s err=%s — None 반환", call_id, exc)
-    #     return None
+    Returns:
+        context dict 또는 None (row 없음 / tenant mismatch / DB 오류).
     """
-    logger.debug(
-        "DB adapter skeleton: call_id=%s tenant_id=%s — None 반환 (미구현)",
-        call_id, tenant_id,
-    )
-    return None
+    try:
+        conn = await asyncpg.connect(settings.database_url)
+        try:
+            # UUID 여부에 따라 쿼리 분기 — 잘못된 UUID 문자열로 인한 type error 방지
+            if _is_uuid(call_id):
+                call_row = await conn.fetchrow(
+                    """
+                    SELECT id, tenant_id, caller_number, status,
+                           started_at, ended_at, branch_stats
+                    FROM calls
+                    WHERE id = $1::uuid OR twilio_call_sid = $2
+                    LIMIT 1
+                    """,
+                    call_id, call_id,
+                )
+            else:
+                call_row = await conn.fetchrow(
+                    """
+                    SELECT id, tenant_id, caller_number, status,
+                           started_at, ended_at, branch_stats
+                    FROM calls
+                    WHERE twilio_call_sid = $1
+                    LIMIT 1
+                    """,
+                    call_id,
+                )
+
+            if call_row is None:
+                logger.debug("DB: call_id=%s 해당 row 없음", call_id)
+                return None
+
+            # tenant_id 검증 — 제공된 경우에만
+            if tenant_id:
+                db_tenant_id = str(call_row["tenant_id"])
+                if db_tenant_id.lower() != tenant_id.lower():
+                    logger.warning(
+                        "DB: tenant_id 불일치 call_id=%s expected=%s actual=%s",
+                        call_id, tenant_id, db_tenant_id,
+                    )
+                    return None
+
+            db_call_uuid = str(call_row["id"])
+
+            # transcripts 조회 — row 없으면 빈 리스트 반환 (예외 없음)
+            transcript_rows = await conn.fetch(
+                """
+                SELECT speaker, text, spoken_at
+                FROM transcripts
+                WHERE call_id = $1::uuid
+                ORDER BY turn_index ASC, spoken_at ASC
+                """,
+                db_call_uuid,
+            )
+
+            transcripts = [
+                {
+                    "role": row["speaker"],
+                    "text": row["text"],
+                    "timestamp": (
+                        row["spoken_at"].isoformat() if row["spoken_at"] else None
+                    ),
+                }
+                for row in transcript_rows
+            ]
+
+            started_at = call_row["started_at"]
+            ended_at = call_row["ended_at"]
+
+            return {
+                "metadata": {
+                    "call_id": call_id,
+                    "tenant_id": str(call_row["tenant_id"]),
+                    "start_time": started_at.isoformat() if started_at else None,
+                    "end_time": ended_at.isoformat() if ended_at else None,
+                    "status": call_row["status"] or "completed",
+                    "customer_phone": call_row["caller_number"],
+                },
+                "transcripts": transcripts,
+                "branch_stats": _parse_jsonb(call_row["branch_stats"]),
+            }
+
+        finally:
+            await conn.close()
+
+    except Exception as exc:
+        logger.warning("DB 조회 실패 call_id=%s err=%s — None 반환", call_id, exc)
+        return None
