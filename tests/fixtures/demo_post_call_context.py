@@ -15,7 +15,7 @@ DEMO_POST_CALL_CONTEXT: dict = {
     "metadata": {
         "call_id": "demo-call-critical",
         "tenant_id": "demo-tenant",
-        "customer_phone": "01099990000",
+        "customer_phone": "+821049460829",
         "start_time": "2026-04-28T10:00:00Z",
         "end_time": "2026-04-28T10:12:00Z",
         "status": "completed",

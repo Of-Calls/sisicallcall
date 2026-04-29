@@ -10,7 +10,7 @@ SMS MCP Connector.
 
 ── real mode (SMS_MCP_REAL=true) ────────────────────────────────────────────
   SolapiSMSService를 통해 실제 Solapi API 발송.
-  SOLAPI_API_KEY / SOLAPI_API_SECRET / SOLAPI_FROM_NUMBER 필요.
+  SOLAPI_API_KEY / SOLAPI_API_SECRET / SOLAPI_SENDER_NUMBER 필요.
 
 ── mock mode (SMS_MCP_REAL=false, 기본) ─────────────────────────────────────
   status: success
@@ -42,7 +42,7 @@ _TEMPLATES: dict[str, str] = {
 class SMSConnector(BaseMCPConnector):
     connector_name = "sms"
     _real_mode_env = "SMS_MCP_REAL"
-    _required_config = ("SOLAPI_API_KEY", "SOLAPI_API_SECRET", "SOLAPI_FROM_NUMBER")
+    _required_config = ("SOLAPI_API_KEY", "SOLAPI_API_SECRET", "SOLAPI_SENDER_NUMBER")
     _oauth_provider_name = ""
 
     async def execute(
