@@ -9,7 +9,7 @@ from fastapi import APIRouter, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response
 
 from app.agents.conversational.graph import build_call_graph
-from app.agents.post_call.runner import run_post_call_agent_safely
+from app.agents.post_call.trigger import run_completed_post_call_background
 from app.agents.conversational.state import CallState
 from app.api.v1._tenant_helpers import (
     get_greeting,
@@ -551,6 +551,17 @@ async def call_websocket(
                         if call_started_at_monotonic else None
                     )
                     await finalize_call(db_call_id, status="completed", duration_sec=_duration)
+                    asyncio.create_task(
+                        run_completed_post_call_background(
+                            call_id=call_id,
+                            tenant_id=tenant_id,
+                        )
+                    )
+                else:
+                    logger.warning(
+                        "post-call auto run skip call_id=%s reason=db_call_id_missing",
+                        call_id,
+                    )
                 break
 
     except WebSocketDisconnect:
