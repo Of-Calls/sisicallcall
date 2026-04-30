@@ -395,6 +395,8 @@ async def call_websocket(
                 session_view["rag_categories"] = rag_categories
                 session_view["is_within_hours"] = within_hours
                 session_view["tenant_name"] = tenant_name
+                # Option γ — query_refine_node 가 STT 띄어쓰기 정정 시 사용
+                session_view["tenant_keyterms"] = tenant_keyterms
                 greeting = await get_greeting(tenant_id, within_hours)
 
                 # Deepgram 스트리밍 연결 개설 — tenant keyterm 부스팅 주입

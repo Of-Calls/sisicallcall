@@ -131,6 +131,45 @@ class TwilioTTSOutputChannel(BaseTTSOutputChannel):
             name=f"stall_cache_writeback:{call_id}:{audio_field}",
         )
 
+    async def push_ack(self, call_id: str, text: str, audio_field: str) -> None:
+        """Acknowledgment 오디오 방출 — turn-once 가드 없음 (push_stall 과 동시 방출 가능).
+
+        캐시 패턴은 push_stall 과 동일 (tenant:{id}:stall_audio_cache).
+        모든 오류 best-effort — 로그 후 조용히 반환.
+        """
+        if call_id not in self._bindings:
+            logger.warning("push_ack on un-opened call_id=%s — ignored", call_id)
+            return
+
+        tenant_id = self._bindings[call_id].tenant_id
+        cached_audio = await _session.get_stall_audio(tenant_id, audio_field)
+        cache_status = "hit" if cached_audio is not None else "miss"
+        logger.info(
+            "push_ack (%s) call_id=%s field=%s text=%r",
+            cache_status, call_id, audio_field, text[:200],
+        )
+
+        if cached_audio is not None:
+            await self._send_audio_bytes(
+                call_id, cached_audio, text, tag=f"ack:{audio_field}"
+            )
+            return
+
+        try:
+            audio = await self._get_tts().synthesize(text)
+        except Exception as e:
+            logger.warning(
+                "push_ack tts synthesize failed call_id=%s field=%s: %s",
+                call_id, audio_field, e,
+            )
+            return
+        await self._send_audio_bytes(call_id, audio, text, tag=f"ack:{audio_field}")
+        # write-back fire-and-forget — 다음 호출 빠른 응답을 위해 캐시에 저장.
+        asyncio.create_task(
+            _session.set_stall_audio(tenant_id, audio_field, audio),
+            name=f"ack_cache_writeback:{call_id}:{audio_field}",
+        )
+
     async def push_response(self, call_id: str, text: str, response_path: str) -> None:
         if call_id not in self._bindings:
             logger.warning("push_response on un-opened call_id=%s — ignored", call_id)

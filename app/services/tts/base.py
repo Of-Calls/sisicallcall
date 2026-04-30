@@ -60,6 +60,20 @@ class BaseTTSOutputChannel(ABC):
     async def flush(self, call_id: str) -> None:
         """턴 종료. 내부 상태 (큐 + stall_emitted 플래그 + tenant mapping) 정리."""
 
+    @abstractmethod
+    async def push_ack(self, call_id: str, text: str, audio_field: str) -> None:
+        """Fire-and-forget acknowledgment audio (예: '사용자님 질문을 이해했어요. 잠시만요.').
+
+        push_stall 과 달리 턴당 1회 가드(stall_emitted) 를 우회한다 — 같은 턴에
+        push_stall 과 동시에 방출 가능. 사용 목적: query_refine_node 가 발화 의도가
+        명확하다고 판단한 직후 즉각적인 청각 피드백 제공.
+
+        캐시 패턴은 push_stall 과 동일:
+            tenant:{tenant_id}:stall_audio_cache (audio_field 키) 우선 조회.
+            Miss 시 TTS 합성 후 write-back.
+        모든 오류는 best-effort — 로그만 남기고 크래시하지 않음.
+        """
+
     # ── 상태 조회 (barge-in 지원) ─────────────────────────────
     # 기본 구현은 송신 상태를 추적하지 않는 채널(예: 합성/스트림 분리 안 된 mock)
     # 호환을 위해 항상 False/"" 반환. 실 구현체가 override.

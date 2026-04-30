@@ -86,6 +86,16 @@ class CallState(TypedDict):
     # 임베딩 미보유·검색 오류·결과 0 시 None.
     rag_probe: NotRequired[Optional[dict]]
 
+    # Query refinement (2026-04-30 Option γ 도입 — query_refine_node).
+    # query_refine_node 가 raw_transcript / normalized_text 를 받아 룰 기반으로 띄어쓰기
+    # 정정 + 필러 제거 후 refined_text 에 채움. is_ambiguous=True 면 clarify_author_node
+    # 로 분기 (intent_router 우회), False 면 intent_router_llm 진입. ambiguity_reason 은
+    # 디버깅용 — gate 통과 사유 ("rag_strong" / "auth_pending" 등) 또는 reject 사유
+    # ("rag_weak" / "filler_only").
+    refined_text: NotRequired[str]
+    is_ambiguous: NotRequired[bool]
+    ambiguity_reason: NotRequired[str]
+
     # 인증 브랜치 상태 — call.py 가 session_view 경유로 턴 간 유지.
     # Turn 1: auth_branch_node 가 확인 질문 발화 후 True 설정.
     # Turn 2: 사용자 응답 처리 후 False 로 리셋.

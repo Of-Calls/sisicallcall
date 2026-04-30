@@ -65,6 +65,10 @@ class MockTTSOutputChannel(BaseTTSOutputChannel):
             "metadata": {"audio_field": audio_field},
         })
 
+    async def push_ack(self, call_id: str, text: str, audio_field: str) -> None:
+        """Acknowledgment — no-op mock. turn-once 가드 없음."""
+        logger.info("push_ack call_id=%s field=%s text=%r", call_id, audio_field, text[:200])
+
     async def push_response(self, call_id: str, text: str, response_path: str) -> None:
         if call_id not in self._open_calls:
             logger.warning("push_response on un-opened call_id=%s — ignored", call_id)

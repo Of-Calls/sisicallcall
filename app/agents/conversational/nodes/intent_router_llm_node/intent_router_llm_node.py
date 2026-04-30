@@ -1,23 +1,22 @@
-"""Intent Router LLM — Cache miss 후 GPT-4o-mini 로 의도 분류.
+"""Intent Router LLM — Cache miss + query_refine 통과 후 GPT-4o-mini 로 의도 분류.
 
-분류 결과 (6개):
+2026-04-30 Option γ 리팩터로 책임 축소:
+    - 정규화 / 띄어쓰기 정정 → query_refine_node (룰 기반, deterministic)
+    - 모호성 판정 / clarify 발사 → query_refine_node (gate) + clarify_author_node (LLM)
+    - Progressive 4단계 / STT 오인식 paraphrase → clarify_author_node
+    - MAX_CLARIFY_TURNS 강제 escalation → query_refine_node
+
+본 노드는 *명확하다고 판정된 발화* 만 받아 5개 intent 중 하나로 분류:
     intent_faq        FAQ/매뉴얼 정보 조회
     intent_task       예약/조회/변경/취소/접수 등 업무 처리
     intent_auth       본인 확인/인증
-    intent_clarify    의도가 불분명해 재질문이 필요한 경우
-    intent_escalation 상담원 연결 명시 요청 / clarify 한도 도달 / AI 해결 불가
-    intent_repeat     이전 AI 응답 재요청 ("다시", "못 들었어요" 등)
+    intent_escalation 상담원 연결 명시 요청 / AI 해결 불가
+    intent_repeat     이전 AI 응답 재요청
 
-핵심 정책 (2026-04-28 재설계):
-    - 명확 키워드 발화 → 해당 intent 직접 분류
-    - 모호 발화 → intent_clarify 로 재질문 (추측 분류 금지)
-    - Progressive 4단계 (open → 객관식 → 이분법 → 단답) 으로 점진적 의도 좁힘
-    - MAX_CLARIFY_TURNS=6 도달 시 LLM 호출 전 자동 escalation
-    - 영업시간 외 처리는 escalation_branch_node 가 결정적 처리 — 본 노드 무관
+intent_clarify 는 *본 노드에서 출력하지 않음* — 모호성은 이미 upstream 에서 결정.
 
-입력 컨텍스트 (session_view 경유):
-    - tenant_name, turn_count, last_intent, last_question, last_assistant_text, clarify_count
-    - is_bargein + interrupted_response_text (barge-in 발생 시)
+성능 목표: prompt ~1400 토큰 (이전 ~3500 토큰 대비 60% 축소), hardcut 2.5s
+(이전 5.0s). server_120020.log Turn 1 timeout 사고 (4985ms) 재발 방지.
 """
 import asyncio
 import json
@@ -32,51 +31,38 @@ logger = get_logger(__name__)
 
 _llm: BaseLLMService = GPT4OMiniService()
 
-INTENT_ROUTER_TIMEOUT_SEC = 5.0  # 콜드 스타트(첫 OpenAI 호출 ~3초) 여유 포함
+INTENT_ROUTER_TIMEOUT_SEC = 2.5  # slim prompt 라 cold 도 2.5s 안에 들어옴
 VALID_INTENTS = {
     "intent_faq",
     "intent_task",
     "intent_auth",
-    "intent_clarify",
     "intent_escalation",
     "intent_repeat",
 }
 
-# clarify 누적 한도 — 이 횟수에 도달하면 LLM 호출 전 강제 escalation.
-# Progressive 전략 4단계 (open/객관식/이분법/단답) + 5~6 단계는 LLM 자유 판단 (다른 표현 반복).
-# 최대한 대화로 해결, escalation 도피 차단 목적.
-MAX_CLARIFY_TURNS = 6
-
 
 def _build_system_prompt(tenant_name: str) -> str:
-    """tenant 이름을 동적으로 끼운 시스템 프롬프트 생성."""
+    """tenant 이름을 동적으로 끼운 시스템 프롬프트 생성 (slim, ~1400 토큰)."""
     return f"""당신은 {tenant_name}의 고객 상담 AI 의도 분류기입니다.
-고객 발화 + 직전 대화 맥락을 바탕으로 다음 6개 intent 중 정확히 하나를 선택합니다.
+입력 발화는 이미 *명확하다고 판정된* 상태입니다 (모호 발화는 upstream 에서 차단됨).
+다음 5개 intent 중 정확히 하나를 선택합니다.
 
 [1. intent 정의]
 - intent_faq        : FAQ/매뉴얼 정보 조회 (위치, 운영시간, 진료과목, 가격 등)
 - intent_task       : 예약/조회/변경/취소/접수 등 업무 처리 요청
 - intent_auth       : 본인 확인 / 인증 (회원번호, 주민번호 확인 등)
-- intent_clarify    : 의도가 불분명해 재질문이 필요한 경우
-- intent_escalation : 상담원 연결 명시 요청 / clarify 한도 도달 / AI 해결 불가
+- intent_escalation : 상담원 연결 명시 요청 / AI 해결 불가
 - intent_repeat     : 이전 AI 응답을 다시 듣고 싶은 요청 ("다시", "못 들었어요" 등)
 
-[2. ★기본 분류 원칙 — 추측 금지]
-- 발화에 명확한 키워드 / 동작 표현이 있으면 해당 intent 로 분류한다.
-- 키워드가 모호하거나 단서가 부족하면 → intent_clarify 로 재질문한다.
-- **추측 분류 금지.** 확실하지 않으면 사용자에게 묻는 게 더 도움이 된다.
-- 잘못된 강제 분류는 RAG 검색 실패로 이어져 통화 흐름을 망친다.
-
-[3. ★ 최우선 인증 규칙 — 모든 키워드 분류보다 상위]
+[2. ★최우선 인증 규칙 — 모든 키워드 분류보다 상위]
 다음 조건에 해당하면 intent_auth 로 분류:
-1. **auth_pending == true** → intent_auth (이전 턴에 인증 확인 질문 발화 중, 사용자 응답 대기)
+1. **auth_pending == true** → intent_auth (이전 턴 인증 확인 발화 후 사용자 응답 대기)
 2. **rag_probe.is_auth == true AND matched_keywords 1개 이상** → intent_auth
    - is_auth=true 이어도 matched_keywords 가 비어있으면 발동하지 않음
-   - 이유: 발화 키워드와 청크가 실제로 겹쳐야 "인증 필요 서비스 요청"으로 볼 수 있음
-   - 예) "영업시간이어떻게되세요" → is_auth=true 청크가 top-1 이어도 matched=[] 이면 [4]로 넘김
    - 예) "예약하고싶어요" → is_auth=true + matched=['예약'] → intent_auth 우선
+   - 예) "영업시간이어떻게되세요" → is_auth=true 청크가 top-1 이어도 matched=[] 이면 [3]로 넘김
 
-[4. 명확 분류 신호 (직접 키워드) — [3] 조건 미해당 시 적용]
+[3. 명확 분류 신호 (직접 키워드)]
 - 위치 / 주소 / 길 / 오시는 길 / 찾아가다 / 찾아가 / 가려고 / 어디로 / 어떻게 가 / 가는 법 → intent_faq
 - 진료시간 / 운영시간 / 영업시간 / 몇 시까지 / 몇 시 → intent_faq
 - 진료과 / 진료과목 / 응급실 / 주차 / 주차장 → intent_faq
@@ -85,120 +71,56 @@ def _build_system_prompt(tenant_name: str) -> str:
 - 상담원 / 직원 / 사람 / 사람으로 / 바꿔주세요 → intent_escalation
 - 다시 / 다시 한번 / 뭐라고요 / 못 들었어요 → intent_repeat
 
-★중요: STT 결과는 띄어쓰기가 자주 빠짐 (예: "구청을찾아가려고해요").
-한 덩어리 문자열에서도 위 키워드의 부분 문자열을 찾으면 그대로 적용한다.
-(주의: "언제" 단독은 모호 — task/faq 양쪽 가능. 다른 키워드와 함께 등장할 때만 분류)
+★중요: 입력은 query_refine 가 이미 띄어쓰기 정정 + 필러 제거를 마친 상태지만, 만약을
+대비해 한 덩어리 문자열 ("구청을찾아가려고요") 에서도 위 키워드의 부분 문자열을
+찾으면 그대로 적용한다. (주의: "언제" 단독은 모호 — 다른 키워드와 함께 등장할 때만)
 
-[5. RAG 신호 활용 — 모호 발화 보강]
-입력의 `rag_probe` 가 채워져 있으면 (cache miss 직후 RAG top_k=3 검색 결과 신호) 다음과 같이 활용한다.
-본 블록은 [3] 인증 최우선 규칙 미해당 + [4] 의 명확 키워드가 부재한 모호 발화 케이스에 한해 적용.
-rag_probe 가 null 이면 본 블록 무시.
+[4. RAG 신호 활용 — 모호 발화 보강]
+입력의 `rag_probe` 가 채워져 있으면 (cache miss 직후 RAG top_k=3 검색 신호) 활용한다.
+[2] 인증 미해당 + [3] 의 명확 키워드 부재 케이스에 한해 적용. rag_probe 가 null 이면 무시.
 
 - top_distance ≤ 0.70 → **FAQ 매우 강신호**.
-  matched_keywords 가 비어있어도 (STT 띄어쓰기 부재로 substring 매칭 실패한 경우 포함)
-  intent_faq 로 자신 있게 분류한다. 거리 자체가 임베딩이 답을 가지고 있음을 보장.
+  matched_keywords 가 비어있어도 (STT 띄어쓰기 부재 케이스 포함) intent_faq 로
+  자신 있게 분류한다. 거리 자체가 임베딩이 답을 가지고 있음을 보장.
 - top_distance ≤ 0.85 + matched_keywords 1개 이상 → **FAQ 강신호**.
-  발화가 모호해도 intent_faq 로 분류 (RAG 가 답할 수 있다는 신호).
-- top_distance > 0.95 → **RAG 무신호**. intent_clarify 로 가되,
-  top_topic 이 비어있지 않으면 그 topic 으로 좁힌 유도질문을 만든다
-  (예: top_topic="주차 안내" → "혹시 주차 관련 문의이신가요?").
-- 0.85 < top_distance ≤ 0.95 → **약신호**. 강제 분류 금지, 일반 clarify.
+  intent_faq 로 분류 (RAG 가 답할 수 있다는 신호).
+- 그 외 (약신호 / 무신호) → 키워드 매핑이 부재해도 발화 의도를 *추측해서라도* 5개
+  intent 중 가장 가까운 것으로 분류. (모호 케이스는 upstream 에서 이미 차단됨.)
 
-[6. clarify 가 정답인 경우]
-- 단답 / 비언어 표현: "아", "음", "글쎄", "그게...", "어"
-- 동사·키워드 없이 정황만: "거기 갈려고", "그게 뭐예요", "어떻게 해요"
-- 정보만 나열: "내일 오후에", "55세 여자입니다"
-- 의도가 둘 이상으로 갈리는 모호한 표현
-
-[7. 직전이 clarify 였을 때 — 후속 답변 처리]
-사용자가 clarify 질문에 답한 turn 에서는 다음 우선순위로 분류한다:
-1. 답변에 [4] 의 명확 키워드가 있으면 즉시 그 intent (escalation 으로 도피 금지)
-2. 답변이 "네/맞아/응" 이고 last_assistant_text 가 **이분법** ("정보 안내인가요, 예약인가요?") 이면 첫 번째 후보의 intent
-3. 답변이 "아니요/아니" 이고 last_assistant_text 가 **이분법** 이면 두 번째 후보의 intent
-4. 위 어디에도 안 맞으면 → intent_clarify (다음 단계 Progressive)
-
-(객관식 4개 같은 비-이분법에서 "네" 만 오면 의미 없음 → 그냥 clarify 다음 단계)
-
-[8. Progressive Clarify 전략 — clarify_count 별]
-입력의 `clarify_count` 값에 따라 질문 형태를 단계적으로 좁힌다.
-객관식·단답 단계는 user_message 의 `available_categories` (현재 tenant 의 정제된
-RAG 카테고리 목록) 을 그대로 보기로 사용한다. available_categories 가 비어있을
-때만 일반적 카테고리 ("정보 안내, 예약, 기타") 로 fallback.
-- 0 (첫 시도): open question, 자연스럽게.
-  예: "어떤 도움이 필요하신가요?"
-- 1: **객관식 3~4개** — available_categories 에서 3~4개 골라 보기로 만든다.
-  예 (available_categories="메뉴 안내, 예약, 위치, 영업시간"):
-      "메뉴 안내, 예약, 위치, 영업시간 중에 비슷한 게 있나요?"
-- 2: **이분법 (binary)** 으로 단순화. available_categories 중 의도 구분이 큰
-  두 카테고리를 골라 양자택일.
-  예: "정보 안내가 필요하신가요, 아니면 예약/접수가 필요하신가요?"
-- 3: **단답 키워드 유도** — available_categories 에서 2~3개 단어만.
-  예: "키워드 한 단어만 말씀해 주세요. '메뉴'? '예약'? '위치'?"
-- 4~5: 위 4단계 후에도 모호하면 **이전과 다른 표현** 으로 다시 묻는다.
-  같은 카테고리 / 같은 단어 반복 금지. 더 짧게, 더 구체적으로.
-- 6 도달 시 시스템이 자동 escalation — LLM 호출 자체가 차단됨.
-
-[9. ★다른 표현 강제]
-last_assistant_text 와 거의 같은 문장으로 다시 묻지 말 것.
-시도마다 단어·구조·카테고리 수를 바꿔 질문한다.
-
-[10. barge-in 처리]
+[5. barge-in 처리]
 입력에 `barge-in:` 메타가 포함되면 직전 AI 응답이 사용자 발화로 끊긴 상황이다.
 끊긴 응답 원문(`interrupted_response_text`) 과 새 발화의 관계를 판단한다:
 - 끊긴 응답에 대한 후속/거부/재요청 → repeat 또는 그 응답이 유도한 intent
 - 완전히 새로운 의도 → 그 의도로 분류
 
-[11. 출력 형식 — JSON 만, 다른 텍스트 절대 금지]
-{{"reasoning":"한 줄 근거","primary_intent":"intent_xxx","clarify_question":null}}
+[6. 출력 형식 — JSON 만, 다른 텍스트 절대 금지]
+{{"reasoning":"한 줄 근거","primary_intent":"intent_xxx"}}
 
-intent_clarify 일 때 clarify_question 필드에 [8] 전략에 맞는 질문 텍스트 채우기 (필수).
-다른 intent 일 때 null.
+primary_intent 는 위 5개 중 하나여야 한다 (intent_clarify 는 출력 금지 — upstream
+에서만 결정됨). 다른 값이면 자동 escalation 처리됨.
 
-[12. STT 오인식 의심 처리]
-발화가 아래 특징을 보이면 STT 가 잘못 인식했을 가능성이 높다:
-- 실존하지 않는 기관명·지원금명·단어 조합 (예: "송년지원금", "첨부금신청", "정형외과예얀")
-- 음소가 유사한 단어들이 뒤섞인 표현 — 발음이 비슷한 다른 단어로 치환된 것처럼 보이는 경우
+[7. few-shot 예시 — 7개]
 
-이런 경우 intent_clarify 를 선택하고, clarify_question 에 LLM 이 해석한 내용을 제시하며 확인:
-패턴: "[해석한 내용]으로 들었는데, [추정 실제 의미]를 말씀하시는 건가요?"
-      또는: "[단어]라고 말씀하신 건가요?"
+입력 발화="진료시간이 어떻게 되나요" / last_intent=null
+→ {{"reasoning":"운영시간 정보 조회 키워드","primary_intent":"intent_faq"}}
 
-(단, 표준 한국어 어휘·기관명이 명확하면 적용하지 않는다. 정상 발화에 오적용 금지.)
+입력 발화="예약 좀 잡아주세요" / last_intent=null / rag_probe={{"top_distance":0.72,"matched_keywords":["예약"],"is_auth":true}}
+→ {{"reasoning":"[2] 인증 우선 — is_auth=true + matched=['예약']","primary_intent":"intent_auth"}}
 
-[13. few-shot 예시 — 10개]
+입력 발화="상담원 좀 바꿔주세요" / last_intent=null
+→ {{"reasoning":"명시적 상담원 요청","primary_intent":"intent_escalation"}}
 
-입력 발화="진료시간이 어떻게 되나요" / last_intent=null / clarify_count=0
-→ {{"reasoning":"운영시간 정보 조회 키워드","primary_intent":"intent_faq","clarify_question":null}}
+입력 발화="다시 한번 말해주세요" / last_assistant_text="평일 외래 진료는 09:00~17:30입니다."
+→ {{"reasoning":"이전 AI 응답 재요청","primary_intent":"intent_repeat"}}
 
-입력 발화="예약 좀 잡아주세요" / last_intent=null / clarify_count=0
-→ {{"reasoning":"예약 업무 요청","primary_intent":"intent_task","clarify_question":null}}
+입력 발화="강남구청을찾아가려고요" / rag_probe={{"top_distance":0.49,"matched_keywords":[],"top_topic":"위치","is_auth":false}}
+→ {{"reasoning":"위치 질문 — '찾아가' 부분 문자열 + rag_probe 매우 강신호(0.49)","primary_intent":"intent_faq"}}
 
-입력 발화="상담원 좀 바꿔주세요" / last_intent=null / clarify_count=0
-→ {{"reasoning":"명시적 상담원 요청","primary_intent":"intent_escalation","clarify_question":null}}
+입력 발화="영업시간이어떻게되세요" / rag_probe={{"top_distance":0.65,"matched_keywords":[],"top_topic":"예약","is_auth":true}}
+→ {{"reasoning":"[2] is_auth=true 이지만 matched=[] → 미발동. [3] 영업시간 키워드 → faq","primary_intent":"intent_faq"}}
 
-입력 발화="다시 한번 말해주세요" / last_assistant_text="평일 외래 진료는 09:00~17:30입니다." / clarify_count=0
-→ {{"reasoning":"이전 AI 응답 재요청","primary_intent":"intent_repeat","clarify_question":null}}
-
-입력 발화="거기 갈려고는 어떻게 해요" / last_intent=null / clarify_count=0
-→ {{"reasoning":"명확 키워드 부재, 의도 추측 금지","primary_intent":"intent_clarify","clarify_question":"어떤 부분이 궁금하신가요?"}}
-
-입력 발화="위치안내요" / last_intent=intent_clarify / clarify_count=2
-→ {{"reasoning":"clarify 후속에 명확 키워드 '위치안내', 즉시 FAQ","primary_intent":"intent_faq","clarify_question":null}}
-
-입력 발화="음 그게..." / last_intent=intent_clarify / last_assistant_text="어떤 도움이 필요하신가요?" / clarify_count=1 / available_categories="메뉴 안내, 예약, 위치, 영업시간"
-→ {{"reasoning":"단서 부족, available_categories 로 객관식 좁히기","primary_intent":"intent_clarify","clarify_question":"메뉴 안내, 예약, 위치, 영업시간 중에 비슷한 게 있나요?"}}
-
-입력 발화="송년지원금신청에대해서자세하게설명해줘" / last_intent=null / clarify_count=0
-→ {{"reasoning":"실존하지 않는 '송년지원금' — STT 오인식 의심, 청년 지원금으로 해석","primary_intent":"intent_clarify","clarify_question":"청년 지원금 신청에 대해서 여쭤보시는 건가요?"}}
-
-입력 발화="강남구청을찾아가려고요" / last_intent=null / clarify_count=0 / rag_probe={{"top_distance":0.49,"matched_keywords":[],"top_topic":"위치"}}
-→ {{"reasoning":"위치 질문 — STT 띄어쓰기 부재지만 '찾아가' 부분 문자열 + rag_probe 매우 강신호(0.49)로 intent_faq 확신","primary_intent":"intent_faq","clarify_question":null}}
-
-입력 발화="예약하고싶어요" / last_intent=null / clarify_count=0 / rag_probe={{"top_distance":0.72,"matched_keywords":["예약"],"top_topic":"예약","is_auth":true}}
-→ {{"reasoning":"[3] 최우선 인증 규칙 — is_auth=true AND matched_keywords=['예약'] 1개 이상 → intent_auth","primary_intent":"intent_auth","clarify_question":null}}
-
-입력 발화="영업시간이어떻게되세요" / last_intent=null / clarify_count=0 / rag_probe={{"top_distance":0.65,"matched_keywords":[],"top_topic":"예약","is_auth":true}}
-→ {{"reasoning":"is_auth=true 이지만 matched_keywords=[] → [3] 미발동. [4] 영업시간 키워드 → intent_faq","primary_intent":"intent_faq","clarify_question":null}}
+입력 발화="네 맞아요" / last_assistant_text="인증 진행하시겠습니까?" / auth_pending=true
+→ {{"reasoning":"auth_pending=true — [2]-1 최우선 적용","primary_intent":"intent_auth"}}
 """
 
 
@@ -206,25 +128,18 @@ _JSON_BLOCK_RE = re.compile(r"\{.*\}", re.DOTALL)
 
 
 def _build_user_message(state: CallState) -> str:
-    """Phase 2 — session_view 의 맥락 정보를 모두 LLM 입력으로 풍부화.
+    """slim user message — refined_text + 핵심 컨텍스트만.
 
-    barge-in turn (직전 AI 응답이 사용자 발화로 끊긴 경우) 에는 끊긴 응답 원문을
-    추가 라인으로 끼워 넣어, 새 발화가 끊긴 응답에 대한 후속/거부/재요청인지
-    완전히 새로운 의도인지 LLM 이 판단하도록 한다.
+    clarify_count / Progressive 관련 필드는 query_refine / clarify_author 가 처리하므로
+    본 노드 입력에서 제거.
     """
     sv = state.get("session_view") or {}
-    cats = state.get("available_categories") or []
-    cats_line = ", ".join(cats) if cats else "(없음)"
+    text = state.get("refined_text") or state.get("normalized_text") or ""
     base = (
-        f"입력 발화: {state['normalized_text']}\n"
+        f"입력 발화: {text}\n"
         f"tenant_name: {sv.get('tenant_name', '고객센터')}\n"
-        f"is_within_hours: {sv.get('is_within_hours', True)}\n"
-        f"turn_count: {sv.get('turn_count', 0)}\n"
         f"last_intent: {sv.get('last_intent')}\n"
-        f"last_question: {sv.get('last_question')}\n"
-        f"last_assistant_text: {sv.get('last_assistant_text')}\n"
-        f"clarify_count: {sv.get('clarify_count', 0)}\n"
-        f"available_categories: {cats_line}"
+        f"last_assistant_text: {sv.get('last_assistant_text')}"
     )
     probe = state.get("rag_probe")
     if probe and probe.get("top_distance") is not None:
@@ -234,7 +149,6 @@ def _build_user_message(state: CallState) -> str:
             f"\n  top_distance: {probe['top_distance']:.3f}"
             f"\n  matched_keywords: {', '.join(matched) if matched else '(없음)'}"
             f"\n  top_topic: {probe.get('top_topic') or '(없음)'}"
-            f"\n  top_title: {probe.get('top_title') or '(없음)'}"
             f"\n  is_auth: {probe.get('is_auth', False)}"
         )
     base += f"\nauth_pending: {state.get('auth_pending', False)}"
@@ -252,8 +166,7 @@ def _build_user_message(state: CallState) -> str:
 def _parse_intent_response(raw: str) -> dict | None:
     """LLM 응답에서 JSON 추출 → primary_intent 검증.
 
-    intent_clarify 인 경우 clarify_question 도 같이 추출. 없거나 비어있으면 안전망 문구로 대체.
-    실패 시 None 반환.
+    intent_clarify 가 출력되면 invalid 처리 (refine/clarify_author 가 결정해야 하는 영역).
     """
     match = _JSON_BLOCK_RE.search(raw)
     if not match:
@@ -267,49 +180,19 @@ def _parse_intent_response(raw: str) -> dict | None:
     if intent not in VALID_INTENTS:
         return None
 
-    clarify_question = parsed.get("clarify_question")
-    if intent == "intent_clarify" and not clarify_question:
-        clarify_question = "조금 더 자세히 말씀해 주시겠어요?"
-
-    out = {"primary_intent": intent}
-    if intent == "intent_clarify":
-        out["clarify_question"] = clarify_question
-    return out
+    return {"primary_intent": intent}
 
 
 def _fallback() -> dict:
-    """LLM timeout/parse 실패 시 폴백 분류 — 항상 clarify 로 회귀.
+    """LLM timeout/parse 실패 시 폴백 — escalation.
 
-    의도 파악 자체 실패 = "다시 한 번 물어보는" 게 자연스러움.
-    escalation 은 "AI 로 정말 못 풀 때" 만 (clarify 한도 도달, 명시 요청 등).
+    이전엔 intent_clarify 로 회귀했지만, query_refine 가 이미 *명확하다* 고 판정한
+    발화이므로 다시 clarify 로 돌리는 건 무의미. 사람에게 넘기는 게 맞음.
     """
-    return {
-        "primary_intent": "intent_clarify",
-        "clarify_question": "죄송합니다, 다시 한 번 말씀해 주시겠어요?",
-    }
-
-
-def _force_escalation_if_clarify_exhausted(state: CallState) -> dict | None:
-    """clarify 가 누적 한도(MAX_CLARIFY_TURNS=6) 에 도달한 경우 LLM 호출 전 즉시 escalation.
-
-    LLM 결과가 또 clarify 일 위험 차단 + 비용/지연 절약. Progressive 전략 4단계
-    + 다른 표현 2회까지 시도해도 여전히 모호하면 사람에게 넘긴다.
-    """
-    sv = state.get("session_view") or {}
-    if sv.get("clarify_count", 0) >= MAX_CLARIFY_TURNS:
-        logger.info(
-            "intent_router clarify 누적 한도 초과 call_id=%s clarify_count=%d → 강제 escalation",
-            state["call_id"], sv.get("clarify_count"),
-        )
-        return {"primary_intent": "intent_escalation"}
-    return None
+    return {"primary_intent": "intent_escalation"}
 
 
 async def intent_router_llm_node(state: CallState) -> dict:
-    forced = _force_escalation_if_clarify_exhausted(state)
-    if forced is not None:
-        return forced
-
     sv = state.get("session_view") or {}
     tenant_name = sv.get("tenant_name", "고객센터")
     user_message = _build_user_message(state)
@@ -320,7 +203,7 @@ async def intent_router_llm_node(state: CallState) -> dict:
                 system_prompt=_build_system_prompt(tenant_name),
                 user_message=user_message,
                 temperature=0.1,
-                max_tokens=300,
+                max_tokens=100,
             ),
             timeout=INTENT_ROUTER_TIMEOUT_SEC,
         )
@@ -340,8 +223,7 @@ async def intent_router_llm_node(state: CallState) -> dict:
         return _fallback()
 
     logger.info(
-        "intent_router 결과 call_id=%s intent=%s clarify=%s",
+        "intent_router 결과 call_id=%s intent=%s",
         state["call_id"], parsed["primary_intent"],
-        bool(parsed.get("clarify_question")),
     )
     return parsed
