@@ -79,11 +79,16 @@ class Settings(BaseSettings):
     bargein_verify_chunk_bytes: int = 25600 # 0.8s × 16kHz × 2byte (PCM16 mono)
     bargein_verify_chunk_sec: float = 0.8   # 디버그/로그용
 
-    # SMS Provider — "solapi" (기본) | "twilio"
-    sms_provider: str = "solapi"
+    # SMS Provider — "mock" (기본) | "solapi" | "twilio"
+    sms_provider: str = "mock"
     solapi_api_key: str = ""
     solapi_api_secret: str = ""
     solapi_sender_number: str = ""
+
+    # Vision upload URL
+    vision_upload_base_url: str = "http://localhost:5173"
+    vision_upload_path_prefix: str = "/v"
+    vision_upload_ttl_sec: int = 600
 
     # Face Auth (M3+)
     arcface_model_name: str = "buffalo_l"

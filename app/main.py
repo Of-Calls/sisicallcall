@@ -12,7 +12,7 @@ from fastapi import FastAPI
 
 from app.core.config import APP_DESCRIPTION, APP_TITLE, APP_VERSION
 from app.core.middleware import RequestLoggingMiddleware
-from app.api.v1 import auth, call, summary, tenant, dashboard
+from app.api.v1 import auth, call, summary, tenant, dashboard, vision
 from app.utils.logger import get_logger
 
 _logger = get_logger(__name__)
@@ -63,6 +63,7 @@ app.include_router(summary.router, prefix="/summary", tags=["summary"])
 app.include_router(tenant.router, prefix="/tenant", tags=["tenant"])
 app.include_router(dashboard.router, prefix="/dashboard", tags=["dashboard"])
 app.include_router(auth.router, prefix="/auth", tags=["auth"])
+app.include_router(vision.router, prefix="/vision", tags=["vision"])
 
 
 @app.get("/health")
