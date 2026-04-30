@@ -84,6 +84,14 @@ class CallState(TypedDict):
     # RAG probe 신호 (cache miss → rag_probe_node 가 채움 → intent_router_llm 이 활용).
     # dict 또는 None. dict 일 때 키:
     #   top_distance(float), matched_keywords(list[str]), top_topic(str),
-    #   top_title(str), top_chunk_id(str)
+    #   top_title(str), top_chunk_id(str), is_auth(bool)
     # 임베딩 미보유·검색 오류·결과 0 시 None.
     rag_probe: NotRequired[Optional[dict]]
+
+    # 인증 브랜치 상태 — call.py 가 session_view 경유로 턴 간 유지.
+    # Turn 1: auth_branch_node 가 확인 질문 발화 후 True 설정.
+    # Turn 2: 사용자 응답 처리 후 False 로 리셋.
+    auth_pending: NotRequired[bool]
+
+    # SMS 발송 완료 플래그 — 관측·로깅용. auth_branch_node 가 설정.
+    auth_sms_sent: NotRequired[bool]

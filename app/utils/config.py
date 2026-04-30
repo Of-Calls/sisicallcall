@@ -42,16 +42,29 @@ class Settings(BaseSettings):
     # threshold 변경 이력:
     #   0.40 → 0.30 (barge-in false negative 줄이려)
     #   0.30 → 0.45 (한뼘통화 echo/잔향이 0.30~0.40 회색지대 통과해 거짓 cancel — 2026-04-28)
-    # 진짜 본인 발화는 0.6~0.8 영역이라 0.45 도 충분히 통과. 0.30~0.45 false positive 차단.
+    #   0.45 → 0.30 (2026-04-29): 짧은 발화 (1초 미만) sim 0.31 → verified=False → graph
+    #     EOF 사례 다수 (server_220342.log Turn 4). 본인 음성도 짧으면 임베딩 거리가 멀어지는
+    #     TitaNet 한계. echo 위험 재증가하지만 STT fallback (graph.py route_after_speaker_verify)
+    #     이중 안전망과 함께 적용. 실통화 측정 후 0.35 등으로 재조정 가능.
     titanet_model_name: str = "titanet_large"
-    titanet_similarity_threshold: float = 0.45
+    titanet_similarity_threshold: float = 0.30
     titanet_enrollment_sec: float = 3.0   # voiceprint 등록에 사용할 첫 발화 누적 시간
 
-    # WebRTC VAD (주미 연구 결과 — webrtc_vad 채택)
+    # WebRTC VAD (주미 연구 결과 — webrtc_vad 채택). 2026-04-30 Silero 로 교체.
+    # 보존 사유: rollback 안전판 (call.py / vad_node.py 의 import 1줄 환원으로 즉시 복구).
     webrtc_mode: int = 3                        # aggressiveness 0~3 (3: 최대 잡음 제거)
     webrtc_frame_ms: int = 30                   # 프레임 크기 ms (10/20/30 중 택일)
     webrtc_speech_ratio_threshold: float = 0.5  # 프레임 중 발화 비율 임계값
     webrtc_energy_fallback_threshold: int = 1200 # webrtcvad 미설치 시 energy fallback RMS 임계값
+
+    # Silero VAD (v6.2+, 2026-04-30 채택 — 짧은 발화 + 긴 trailing silence reject 해결).
+    # logs/2026-04-30/server_100651.log Turn 4/5 사례: "예약은어떻게해요" 0.5s + trailing 1.3s
+    # → WebRTC bulk ratio 28~38% reject → graph END. Silero per-frame 누적으로 해결.
+    silero_threshold: float = 0.5            # speech 확률 임계값 (Silero 기본). 낮추면 잡음 통과↑
+    silero_min_speech_frames: int = 3        # 청크 내 speech frame (32ms each) 최소 개수.
+                                              # 3 = 96ms — 짧은 단어 ("응", "예") 까지 통과
+    silero_use_onnx: bool = False            # ONNX runtime 가속 (~2x faster). PyTorch JIT 가
+                                              # default — 첫 운영 안정화 후 True 전환 검토.
 
     # TTS 합성 엔진 — "azure" (Azure Speech SDK, μ-law 8kHz 네이티브 출력) 단일화
     tts_provider: str = "azure"

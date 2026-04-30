@@ -137,21 +137,26 @@ async def rag_probe_node(state: CallState) -> dict:
     keywords = [k.strip() for k in (meta.get("llm_keywords") or "").split(",") if k.strip()]
     matched = [kw for kw in keywords if kw in query_text]
 
+    # is_auth: ChromaDB 저장 시 bool 또는 미설정("") 가능 — 모두 bool 로 정규화
+    is_auth_raw = meta.get("is_auth", False)
+    is_auth = is_auth_raw is True or str(is_auth_raw).lower() == "true"
+
     probe = {
         "top_distance": top.get("distance"),
         "matched_keywords": matched,
         "top_topic": meta.get("llm_topic", ""),
         "top_title": meta.get("llm_title", ""),
         "top_chunk_id": top.get("id", ""),
+        "is_auth": is_auth,
     }
 
     field = _select_stall_field(probe, stall_messages)
     _spawn_stall(state, field)
 
     logger.info(
-        "rag_probe call_id=%s distance=%.3f matched=%s topic=%r stall_field=%s",
+        "rag_probe call_id=%s distance=%.3f matched=%s topic=%r is_auth=%s stall_field=%s",
         call_id,
         probe["top_distance"] if probe["top_distance"] is not None else -1.0,
-        matched, probe["top_topic"], field,
+        matched, probe["top_topic"], is_auth, field,
     )
     return {"rag_probe": probe}

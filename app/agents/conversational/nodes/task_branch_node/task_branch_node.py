@@ -16,4 +16,5 @@ async def task_branch_node(state: CallState) -> dict:
         "response_text": FALLBACK_MESSAGE,
         "response_path": "task",
         "is_timeout": False,
+        "is_fallback": True,
     }

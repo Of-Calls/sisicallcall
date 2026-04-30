@@ -54,7 +54,18 @@ def route_after_vad(state: CallState) -> str:
 
 
 def route_after_speaker_verify(state: CallState) -> str:
-    return "pass" if state["is_speaker_verified"] else "reject"
+    """verify 통과 시 그대로 pass. 실패해도 STT 결과 (raw_transcript) 가 비어있지 않으면
+    pass — 짧은 발화에서 TitaNet 임베딩 거리가 멀어지는 한계 보완. 본인 음성인데 verify
+    실패한 케이스 (sim 0.3 수준) 도 graph 진행 → 응답 생성 가능.
+
+    위험: TTS echo 가 마이크에 잡혀 STT 가 텍스트로 변환한 경우 통과될 수 있음.
+    실통화 측정 후 echo 빈도 보고 STT 길이 가드 (≥ N자) 등 추가 검토.
+    """
+    if state["is_speaker_verified"]:
+        return "pass"
+    if (state.get("raw_transcript") or "").strip():
+        return "pass"
+    return "reject"
 
 
 def route_after_stt(state: CallState) -> str:

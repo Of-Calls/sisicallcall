@@ -17,8 +17,13 @@ openai==1.57.0  # 1.52+ : httpx 0.28 proxies 호환 수정
 # STT
 deepgram-sdk==3.7.0
 
-# VAD — WebRTC Voice Activity Detection (주미 R-03 채택)
-# Windows 사전 컴파일 바이너리 — Linux 배포 시 webrtcvad==2.0.10 으로 교체
+# VAD — Silero VAD (v6.2+, 2026-04-30 채택, ML 기반 — WebRTC 대체).
+# 짧은 발화 + 긴 trailing silence 청크에서 WebRTC bulk ratio gate 가 reject 하던 문제 해결.
+# torch 는 ML 스택에서 이미 설치 (BGE-M3 / TitaNet). onnxruntime 도 ArcFace 용으로 존재.
+silero-vad>=6.2
+
+# WebRTC VAD (rollback 안전판) — call.py / vad_node.py 의 import 1줄 환원으로 즉시 복구.
+# Windows 사전 컴파일 바이너리 — Linux 배포 시 webrtcvad==2.0.10 으로 교체.
 webrtcvad-wheels==2.0.14
 
 # TTS — Azure Speech SDK (μ-law 8kHz 네이티브 출력, Twilio 호환)

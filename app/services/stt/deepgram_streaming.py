@@ -21,19 +21,27 @@ from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-_LIVE_OPTIONS = LiveOptions(
-    model="nova-3",
-    language="ko",
-    encoding="linear16",
-    sample_rate=16000,
-    smart_format=True,
-    punctuate=True,
-    interim_results=True,
-)
-
 # Deepgram 무음 timeout 은 약 10~12초. TTS 재생 중에는 사용자 PCM 이 안 들어와
 # 연결이 끊길 수 있으므로 5초 간격으로 KeepAlive 메시지를 보내 연결을 유지한다.
 _KEEP_ALIVE_INTERVAL_SEC = 5.0
+
+
+def _build_live_options(keyterms: list[str] | None = None) -> LiveOptions:
+    """LiveOptions 동적 생성. keyterms 있을 때만 keyterm 파라미터 포함."""
+    options = LiveOptions(
+        model="nova-3",
+        language="ko",
+        encoding="linear16",
+        sample_rate=16000,
+        smart_format=True,
+        punctuate=True,
+        interim_results=True,
+        endpointing=400,       # 파열음 끝음절 조기 절단 방지 (기본 10ms → 400ms)
+        utterance_end_ms=1000, # interim_results=True 와 함께 발화 경계 정확도 향상
+    )
+    if keyterms:
+        options.keyterm = keyterms
+    return options
 
 
 @dataclass
@@ -41,6 +49,10 @@ class _CallStream:
     connection: object
     parts: list[str] = field(default_factory=list)
     keep_alive_task: Optional[asyncio.Task] = None
+    # Deepgram UtteranceEnd 이벤트 수신 flag — 발화 종료 신호.
+    # call.py 의 silence chunk 카운팅 (VAD fallback) 보다 먼저 발사되면 즉시 trigger.
+    # consume_utterance_end() 호출 시 즉시 reset (idempotent get).
+    utterance_end_received: bool = False
 
 
 class DeepgramStreamingSTTService:
@@ -50,8 +62,11 @@ class DeepgramStreamingSTTService:
         self._client = DeepgramClient(settings.deepgram_api_key)
         self._streams: dict[str, _CallStream] = {}
 
-    async def open(self, call_id: str) -> None:
-        """통화 시작 시 Deepgram 스트리밍 연결 개설."""
+    async def open(self, call_id: str, keyterms: list[str] | None = None) -> None:
+        """통화 시작 시 Deepgram 스트리밍 연결 개설.
+
+        keyterms: tenant 도메인 용어 목록 (Nova-3 keyterm 부스팅). 없으면 생략.
+        """
         if call_id in self._streams:
             logger.warning("스트리밍 연결 중복 개설 call_id=%s — 기존 연결 재사용", call_id)
             return
@@ -68,9 +83,21 @@ class DeepgramStreamingSTTService:
             except Exception as exc:
                 logger.warning("STT 스트리밍 콜백 오류 call_id=%s: %s", call_id, exc)
 
-        connection.on(LiveTranscriptionEvents.Transcript, _on_transcript)
+        async def _on_utterance_end(self_dg, *args, **kwargs):
+            """Deepgram 의 의미 단위 발화 종료 신호 (utterance_end_ms 기반).
+            VAD 묵음 카운팅 (call.py _SILENCE_CHUNKS_TO_END) 보다 먼저 발사되면
+            consume_utterance_end() 가 trigger 분기에서 사용해 즉시 graph 진입.
 
-        started = await connection.start(_LIVE_OPTIONS)
+            시그니처 노트: Deepgram SDK 가 콜백 호출 시 인자 형태(positional/keyword)가
+            이벤트 종류·SDK 버전마다 다름. *args/**kwargs 로 무엇이 와도 안전하게 수신.
+            """
+            state.utterance_end_received = True
+            logger.debug("STT UtteranceEnd call_id=%s", call_id)
+
+        connection.on(LiveTranscriptionEvents.Transcript, _on_transcript)
+        connection.on(LiveTranscriptionEvents.UtteranceEnd, _on_utterance_end)
+
+        started = await connection.start(_build_live_options(keyterms))
         if not started:
             raise RuntimeError(f"Deepgram 스트리밍 연결 실패 call_id={call_id}")
 
@@ -129,8 +156,22 @@ class DeepgramStreamingSTTService:
 
         transcript = " ".join(stream.parts).strip()
         stream.parts.clear()
+        # 발화 종료 신호도 flush — 다음 발화에서 재사용 못 하도록 reset
+        stream.utterance_end_received = False
         logger.info("STT flush call_id=%s result='%s'", call_id, transcript)
         return transcript
+
+    def consume_utterance_end(self, call_id: str) -> bool:
+        """Deepgram UtteranceEnd 수신 여부 반환 + 즉시 reset.
+
+        call.py 가 매 청크 처리 시 호출 — True 반환 시 발화 종료 trigger 발사.
+        VAD 묵음 카운팅과 OR 결합 (어느 쪽이 먼저 도달하든 trigger).
+        """
+        stream = self._streams.get(call_id)
+        if stream and stream.utterance_end_received:
+            stream.utterance_end_received = False
+            return True
+        return False
 
     async def close(self, call_id: str) -> None:
         """통화 종료 시 연결 정리."""

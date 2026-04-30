@@ -24,8 +24,9 @@ from app.agents.conversational.nodes.enrollment_node.enrollment_node import (
 )
 from app.services.speaker_verify.titanet import get_titanet_service
 from app.services.stt.deepgram_streaming import DeepgramStreamingSTTService
+from app.services.stt.keyterm_cache import get_tenant_keyterms
 from app.services.tts.channel import tts_channel
-from app.services.vad.webrtc_vad import WebRTCVADService
+from app.services.vad.silero_vad import SileroVADService
 from app.utils.audio import mulaw_to_pcm16, reset_resample_state
 from app.utils.config import settings
 from app.utils.logger import get_logger
@@ -38,7 +39,9 @@ _graph = build_call_graph()
 _session_service = RedisSessionService()
 _streaming_stt = DeepgramStreamingSTTService()
 # barge-in verify 게이트용 — VAD 1차, TitaNet 2차. 둘 다 모듈 싱글톤.
-_bargein_vad = WebRTCVADService()
+# 2026-04-30: WebRTCVADService → SileroVADService 교체 (짧은 발화 + 긴 trailing silence
+# reject 해결). stateless 인터페이스 동일 (detect(bytes)→bool), per-call cleanup 불필요.
+_bargein_vad = SileroVADService()
 
 # 발화 감지 파라미터 — Silero VAD(주미) 구현 전 임시 에너지 기반 묵음 감지
 _SPEECH_RMS_THRESHOLD = 1200   # 일반 발화 임계값 (TTS 에코 필터링 포함)
@@ -48,7 +51,9 @@ _BARGEIN_RMS_THRESHOLD = 2400
 # Barge-in 후 silence_check 가 즉시 끼어드는 것 방지. 사용자가 인터럽트 후 새 말 꺼낼
 # 자연스러운 텀. 너무 길면 (>5초) 진짜 무응답 escalation 이 늦어짐.
 _BARGEIN_GRACE_SEC = 3.0
-_SILENCE_CHUNKS_TO_END = 40    # 발화 종료 판단 묵음 청크 수 (~800ms, 청크당 ~20ms)
+_SILENCE_CHUNKS_TO_END = 65    # 발화 종료 판단 묵음 청크 수 (~1300ms, 청크당 ~20ms).
+                                # Deepgram UtteranceEnd 이벤트가 먼저 오면 즉시 trigger,
+                                # 본 카운팅은 fallback (UtteranceEnd 미수신 시 안전망).
 _MIN_UTTERANCE_BYTES = 16000   # 최소 발화 길이 (~500ms at 16kHz 16-bit)
 _MAX_UTTERANCE_BYTES = 320000  # 최대 발화 길이 (~10s)
 
@@ -161,6 +166,7 @@ async def call_websocket(
         "last_assistant_text": None,
         "clarify_count": 0,
         "rag_miss_count": 0,  # FAQ RAG miss 누적 — faq_branch_node 가 분기에 사용
+        "auth_pending": False,  # 인증 확인 질문 발화 후 응답 대기 중
     }
 
     # Barge-in 상태 — 메인 루프 + _run_turn 공유
@@ -261,6 +267,9 @@ async def call_websocket(
         else:
             session_view["rag_miss_count"] = 0
 
+        # 인증 대기 상태 — auth_branch_node 가 반환한 값으로 갱신 (턴 간 유지)
+        session_view["auth_pending"] = _result.get("auth_pending", False)
+
     async def _cancel_turn_task() -> None:
         """진행 중 turn task 가 있으면 cancel + 정리."""
         nonlocal turn_task
@@ -308,11 +317,22 @@ async def call_websocket(
 
         channel_speaking = channel_opened and tts_channel.is_speaking(call_id)
         turn_running = turn_task is not None and not turn_task.done()
+
+        # TTS 재생 중(speaking=True) echo로 인한 유사도 급락 보정.
+        # enrollment 완료(sim<1.0) + speaking=True → 완화 임계값 적용.
+        # 숨소리/잡음은 voiceprint 패턴 없어 sim≈0.05로 여전히 차단됨.
+        _ECHO_BARGEIN_THRESHOLD = 0.20
+        enrollment_done = similarity < 1.0  # bypass=1.0(미등록), 실측값=등록 완료
+        if channel_speaking and enrollment_done:
+            effective_verified = similarity >= _ECHO_BARGEIN_THRESHOLD
+        else:
+            effective_verified = is_verified  # 기존 임계값 0.45
+
         logger.info(
             "call_id=%s BARGE-IN verify sim=%.3f verified=%s speaking=%s turn_running=%s",
-            call_id, similarity, is_verified, channel_speaking, turn_running,
+            call_id, similarity, effective_verified, channel_speaking, turn_running,
         )
-        if not is_verified:
+        if not effective_verified:
             return
 
         # ── 통과 → BARGE-IN trigger ─────────────────────────
@@ -358,22 +378,28 @@ async def call_websocket(
                     channel_opened = True
                 stall_messages = await _session_service.get_stall_messages(tenant_id)
 
-                # Deepgram 스트리밍 연결 개설 — 통화 전체에서 재사용
-                try:
-                    await _streaming_stt.open(call_id)
-                except Exception as _stt_err:
-                    logger.warning("STT 스트리밍 연결 실패 call_id=%s: %s (prerecorded 폴백)", call_id, _stt_err)
-
-                # 연결 즉시 인사말 발송 — 영업시간 내/외에 따라 다른 멘트
-                within_hours = await _session_service.is_within_business_hours(tenant_id)
+                # tenant 메타 + STT keyterm 병렬 fetch — 통화 초기화 레이턴시 최소화
+                (
+                    tenant_keyterms,
+                    rag_categories,
+                    within_hours,
+                    tenant_name,
+                ) = await asyncio.gather(
+                    get_tenant_keyterms(tenant_id),
+                    _session_service.get_rag_categories(tenant_id),
+                    _session_service.is_within_business_hours(tenant_id),
+                    get_tenant_name(tenant_id),
+                )
+                session_view["rag_categories"] = rag_categories
+                session_view["is_within_hours"] = within_hours
+                session_view["tenant_name"] = tenant_name
                 greeting = await get_greeting(tenant_id, within_hours)
 
-                # Intent Router 가 사용할 통화 메타 채우기 (turn 0 부터 활용)
-                tenant_name = await get_tenant_name(tenant_id)
-                session_view["tenant_name"] = tenant_name
-                session_view["is_within_hours"] = within_hours
-                # tenant 가용 RAG 카테고리 1회 fetch — faq_branch_node 가 rag_miss>=2 시 안내 사용
-                session_view["rag_categories"] = await _session_service.get_rag_categories(tenant_id)
+                # Deepgram 스트리밍 연결 개설 — tenant keyterm 부스팅 주입
+                try:
+                    await _streaming_stt.open(call_id, keyterms=tenant_keyterms)
+                except Exception as _stt_err:
+                    logger.warning("STT 스트리밍 연결 실패 call_id=%s: %s (prerecorded 폴백)", call_id, _stt_err)
 
                 # Greeting 송신은 백그라운드 task — 메인 루프가 즉시 inbound 처리 시작 (greeting barge-in 가능)
                 asyncio.create_task(
@@ -422,16 +448,27 @@ async def call_websocket(
                     pcm_buffer.extend(pcm_bytes)
                     silence_chunk_count += 1
 
+                    # Deepgram 의 의미 단위 발화 종료 신호 (utterance_end_ms 기반).
+                    # silence chunk 카운팅보다 먼저 도달하면 즉시 trigger — 한국어 머뭇거림
+                    # 침묵에서 조기 절단 방지 (예: "주말에 ... [생각] ... 영업하나요?").
+                    utterance_end_signal = _streaming_stt.consume_utterance_end(call_id)
                     trigger = (
                         silence_chunk_count >= _SILENCE_CHUNKS_TO_END
                         or len(pcm_buffer) >= _MAX_UTTERANCE_BYTES
+                        or utterance_end_signal
                     )
                     if trigger:
                         if len(pcm_buffer) >= _MIN_UTTERANCE_BYTES:
                             chunk = bytes(pcm_buffer)
+                            trigger_reason = (
+                                "utterance_end" if utterance_end_signal
+                                else ("max_bytes" if len(pcm_buffer) >= _MAX_UTTERANCE_BYTES
+                                      else "silence")
+                            )
                             logger.info(
                                 f"call_id={call_id} | 발화 완성 "
-                                f"{len(chunk)} bytes ({len(chunk)/32000:.1f}s) → 그래프 실행"
+                                f"{len(chunk)} bytes ({len(chunk)/32000:.1f}s) "
+                                f"trigger={trigger_reason} → 그래프 실행"
                             )
                             streaming_transcript = await _streaming_stt.flush_transcript(call_id)
                             state: CallState = {
@@ -465,6 +502,8 @@ async def call_websocket(
                             state["rag_miss_count"] = session_view.get("rag_miss_count", 0)
                             # tenant 가용 카테고리 주입 — Redis 에서 미리 fetch (start 이벤트)
                             state["available_categories"] = session_view.get("rag_categories", [])
+                            # 인증 대기 상태 주입 — auth_branch_node 가 Turn 2 판단에 사용
+                            state["auth_pending"] = session_view.get("auth_pending", False)
 
                             # barge-in 단순 모델 (architect 감사) — turn cancel 은 오직
                             # `_attempt_bargein_verify` (TitaNet 통과 시) 만 책임진다.

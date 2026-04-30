@@ -1,7 +1,7 @@
 from app.agents.conversational.state import CallState
-from app.services.vad.webrtc_vad import WebRTCVADService
+from app.services.vad.silero_vad import SileroVADService
 
-_vad_service = WebRTCVADService()
+_vad_service = SileroVADService()
 
 
 async def vad_node(state: CallState) -> dict:
