@@ -27,7 +27,13 @@ class SolapiSMSService(BaseSMSService):
             logger.info("SMS 발송 완료 to=%s", to)
             return True
         except Exception as e:
-            logger.error("SMS 발송 실패 to=%s: %s", to, e)
+            failed_messages = getattr(e, "failed_messages", None)
+            logger.error(
+                "SMS 발송 실패 to=%s err=%s failed_messages=%s",
+                to,
+                e,
+                failed_messages,
+            )
             return False
 
     @staticmethod

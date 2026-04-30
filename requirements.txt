@@ -88,3 +88,6 @@ pymupdf4llm
 
 # post-call Agent
 typing_extensions
+
+# OAuth token encryption (SaaS tenant integration)
+cryptography==41.0.7

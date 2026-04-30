@@ -7,6 +7,8 @@ KDT-77 Repository 계층 테스트.
 from __future__ import annotations
 
 import copy
+import json
+from datetime import datetime
 
 import pytest
 
@@ -19,7 +21,7 @@ from app.repositories import (
     save_summary, get_summary_by_call_id,
     seed_call_context, get_call_context,
     save_voc_analysis, get_voc_by_call_id,
-    save_action_logs, get_action_logs_by_call_id, get_action_logs,
+    save_action_logs, find_successful_action, get_action_logs_by_call_id, get_action_logs,
     upsert_dashboard_payload, get_dashboard_payload,
     get_post_call_detail, get_dashboard_overview,
     get_emotion_distribution, get_priority_queue,
@@ -34,16 +36,18 @@ from tests.fixtures.sample_transcripts import (
 
 
 @pytest.fixture(autouse=True)
-def reset_stores():
+def reset_stores(monkeypatch, tmp_path):
     """모든 in-memory store를 테스트 전후로 초기화한다."""
+    monkeypatch.setenv("MCP_ACTION_LOG_STORE", "file")
+    monkeypatch.setenv("MCP_ACTION_LOG_FILE", str(tmp_path / "mcp_action_logs.json"))
     summary_mod._reset()
     voc_mod._reset()
-    action_mod._reset()
+    action_mod._reset(remove_file=True)
     dashboard_mod._reset()
     yield
     summary_mod._reset()
     voc_mod._reset()
-    action_mod._reset()
+    action_mod._reset(remove_file=True)
     dashboard_mod._reset()
 
 
@@ -129,10 +133,10 @@ async def test_save_and_get_action_logs():
     assert logs[1]["error_message"] == "smtp error"
 
 
-# ── 4. save_action_logs 재저장 시 기존 logs 교체 ──────────────────────────────
+# ── 4. save_action_logs 재저장 시 기존 logs 보존 + append ───────────────────
 
 @pytest.mark.asyncio
-async def test_save_action_logs_upsert_replaces():
+async def test_save_action_logs_appends_without_replacing():
     first = [{"action_type": "first_action", "tool": "company_db", "status": "success",
                "external_id": None, "error": None, "result": {}, "params": {}}]
     await save_action_logs("call-upsert", "tenant-x", first)
@@ -146,9 +150,280 @@ async def test_save_action_logs_upsert_replaces():
     await save_action_logs("call-upsert", "tenant-x", second)
 
     logs = await get_action_logs_by_call_id("call-upsert")
+    assert len(logs) == 3
+    assert logs[0]["action_type"] == "first_action"
+    assert logs[1]["action_type"] == "second_action_a"
+    assert logs[2]["action_type"] == "second_action_b"
+
+
+@pytest.mark.asyncio
+async def test_save_action_logs_creates_file_store():
+    actions = [{
+        "action_type": "create_jira_issue",
+        "tool": "jira",
+        "status": "success",
+        "external_id": "KDT-1",
+        "error": None,
+        "result": {"issue_key": "KDT-1"},
+        "params": {"summary": "demo"},
+    }]
+
+    await save_action_logs("call-file-001", "tenant-x", actions)
+
+    path = action_mod._get_store_path()
+    assert path.exists()
+    assert "call-file-001" in path.read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_find_successful_action_loads_success_from_file():
+    await save_action_logs(
+        "call-file-002",
+        "tenant-x",
+        [{
+            "action_type": "create_jira_issue",
+            "tool": "jira",
+            "status": "success",
+            "external_id": "KDT-2",
+            "error": None,
+            "result": {},
+            "params": {},
+        }],
+    )
+    action_mod._action_store.clear()
+
+    found = await find_successful_action("call-file-002", "create_jira_issue", "jira")
+
+    assert found is not None
+    assert found["external_id"] == "KDT-2"
+    assert found["status"] == "success"
+
+
+@pytest.mark.asyncio
+async def test_find_successful_action_ignores_failed_and_skipped_from_file():
+    await save_action_logs(
+        "call-file-003",
+        "tenant-x",
+        [
+            {
+                "action_type": "create_jira_issue",
+                "tool": "jira",
+                "status": "failed",
+                "external_id": None,
+                "error": "boom",
+                "result": {},
+                "params": {},
+            },
+            {
+                "action_type": "send_manager_email",
+                "tool": "gmail",
+                "status": "skipped",
+                "external_id": None,
+                "error": "missing_recipient",
+                "result": {},
+                "params": {},
+            },
+        ],
+    )
+    action_mod._action_store.clear()
+
+    assert await find_successful_action("call-file-003", "create_jira_issue", "jira") is None
+    assert await find_successful_action("call-file-003", "send_manager_email", "gmail") is None
+
+
+@pytest.mark.asyncio
+async def test_save_action_logs_appends_existing_file_logs():
+    await save_action_logs(
+        "call-file-004",
+        "tenant-x",
+        [{
+            "action_type": "first_action",
+            "tool": "jira",
+            "status": "success",
+            "external_id": "KDT-4",
+            "error": None,
+            "result": {},
+            "params": {},
+        }],
+    )
+    action_mod._action_store.clear()
+
+    await save_action_logs(
+        "call-file-004",
+        "tenant-x",
+        [{
+            "action_type": "second_action",
+            "tool": "gmail",
+            "status": "success",
+            "external_id": "gmail-4",
+            "error": None,
+            "result": {},
+            "params": {},
+        }],
+    )
+    action_mod._action_store.clear()
+
+    logs = await get_action_logs_by_call_id("call-file-004")
     assert len(logs) == 2
-    assert logs[0]["action_type"] == "second_action_a"
-    assert logs[1]["action_type"] == "second_action_b"
+    assert logs[0]["action_type"] == "first_action"
+    assert logs[1]["action_type"] == "second_action"
+
+
+@pytest.mark.asyncio
+async def test_action_log_reset_can_remove_file_store():
+    await save_action_logs(
+        "call-file-005",
+        "tenant-x",
+        [{
+            "action_type": "create_jira_issue",
+            "tool": "jira",
+            "status": "success",
+            "external_id": "KDT-5",
+            "error": None,
+            "result": {},
+            "params": {},
+        }],
+    )
+    path = action_mod._get_store_path()
+    assert path.exists()
+
+    action_mod._reset(remove_file=True)
+
+    assert not path.exists()
+
+
+def test_action_log_store_mode_defaults_to_file(monkeypatch):
+    monkeypatch.delenv("MCP_ACTION_LOG_STORE", raising=False)
+
+    assert action_mod._get_store_mode() == "file"
+
+
+def test_action_log_store_mode_can_select_db(monkeypatch):
+    monkeypatch.setenv("MCP_ACTION_LOG_STORE", "db")
+
+    assert action_mod._get_store_mode() == "db"
+
+
+@pytest.mark.asyncio
+async def test_db_store_save_action_logs_inserts_rows(monkeypatch):
+    monkeypatch.setenv("MCP_ACTION_LOG_STORE", "db")
+    calls: list[tuple] = []
+
+    class FakeConn:
+        async def execute(self, sql, *args):
+            calls.append((sql, args))
+            return "INSERT 0 1"
+
+        async def close(self):
+            calls.append(("close", ()))
+
+    async def fake_connect(url):
+        calls.append(("connect", (url,)))
+        return FakeConn()
+
+    monkeypatch.setattr(action_mod.asyncpg, "connect", fake_connect)
+
+    await save_action_logs(
+        "call-db-001",
+        "tenant-db",
+        [{
+            "action_type": "create_jira_issue",
+            "tool": "jira",
+            "status": "success",
+            "external_id": "KDT-101",
+            "error": None,
+            "result": {"issue": "KDT-101"},
+            "params": {"summary": "db mode"},
+        }],
+    )
+
+    inserts = [
+        item for item in calls
+        if isinstance(item[0], str) and "INSERT INTO mcp_action_logs" in item[0]
+    ]
+    assert len(inserts) == 1
+    args = inserts[0][1]
+    assert args[0] == "call-db-001"
+    assert args[1] == "tenant-db"
+    assert args[2] == "create_jira_issue"
+    assert args[3] == "jira"
+    assert args[6] == "success"
+    assert args[7] == "KDT-101"
+    # created_at / updated_at은 datetime 객체여야 한다 (asyncpg TIMESTAMPTZ 요구)
+    assert isinstance(args[9], datetime), f"created_at은 datetime이어야 함, 실제: {type(args[9])}"
+    assert args[9].tzinfo is not None, "created_at은 timezone-aware datetime이어야 함"
+    assert isinstance(args[10], datetime), f"updated_at은 datetime이어야 함, 실제: {type(args[10])}"
+    assert args[10].tzinfo is not None, "updated_at은 timezone-aware datetime이어야 함"
+
+
+@pytest.mark.asyncio
+async def test_save_action_logs_file_created_at_is_iso_string():
+    """file mode로 저장된 JSON에서 created_at/updated_at은 ISO string이어야 한다."""
+    actions = [{
+        "action_type": "create_jira_issue",
+        "tool": "jira",
+        "status": "success",
+        "external_id": "KDT-dt-001",
+        "error": None,
+        "result": {},
+        "params": {},
+    }]
+    await save_action_logs("call-dt-001", "tenant-x", actions)
+
+    path = action_mod._get_store_path()
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    entry = raw["call-dt-001"][0]
+
+    assert isinstance(entry["created_at"], str), "file JSON의 created_at은 str이어야 함"
+    assert isinstance(entry["updated_at"], str), "file JSON의 updated_at은 str이어야 함"
+    # ISO 형식 파싱 가능해야 함
+    datetime.fromisoformat(entry["created_at"].replace("Z", "+00:00"))
+    datetime.fromisoformat(entry["updated_at"].replace("Z", "+00:00"))
+
+
+@pytest.mark.asyncio
+async def test_db_store_find_successful_action_uses_idempotency_query(monkeypatch):
+    monkeypatch.setenv("MCP_ACTION_LOG_STORE", "db")
+    calls: list[tuple] = []
+    row = {
+        "call_id": "call-db-002",
+        "tenant_id": "tenant-db",
+        "action_type": "send_manager_email",
+        "tool_name": "gmail",
+        "request_payload": {"to": "ops@example.com"},
+        "response_payload": {"sent": True},
+        "status": "success",
+        "external_id": "gmail-002",
+        "error_message": None,
+        "created_at": "2026-04-30T10:00:00Z",
+        "updated_at": "2026-04-30T10:00:00Z",
+    }
+
+    class FakeConn:
+        async def fetchrow(self, sql, *args):
+            calls.append((sql, args))
+            return row
+
+        async def close(self):
+            calls.append(("close", ()))
+
+    async def fake_connect(url):
+        calls.append(("connect", (url,)))
+        return FakeConn()
+
+    monkeypatch.setattr(action_mod.asyncpg, "connect", fake_connect)
+
+    found = await find_successful_action("call-db-002", "send_manager_email", "gmail")
+
+    assert found is not None
+    assert found["external_id"] == "gmail-002"
+    assert found["tool_name"] == "gmail"
+    fetch_calls = [
+        item for item in calls
+        if isinstance(item[0], str) and "status = 'success'" in item[0]
+    ]
+    assert len(fetch_calls) == 1
+    assert fetch_calls[0][1] == ("call-db-002", "send_manager_email", "gmail")
 
 
 # ── 5. upsert_dashboard_payload / get_dashboard_payload ──────────────────────

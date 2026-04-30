@@ -22,8 +22,14 @@ async def action_router_node(state: PostCallAgentState) -> dict:
         logger.info("action_router: actions 빈 목록 call_id=%s — 건너뜀", call_id)
         return {"executed_actions": []}
 
+    tenant_id: str = state.get("tenant_id", "") or ""  # type: ignore[call-overload]
+
     try:
-        executed = await _executor.execute_all(actions, call_id=call_id)
+        executed = await _executor.execute_actions(
+            call_id=call_id,
+            tenant_id=tenant_id,
+            actions=actions,
+        )
         failed = [a for a in executed if a.get("status") == "failed"]
         logger.info(
             "action_router 완료 call_id=%s executed=%d failed=%d",

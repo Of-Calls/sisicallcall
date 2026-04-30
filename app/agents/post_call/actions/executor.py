@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from app.agents.post_call.actions.registry import get_handler
 from app.agents.post_call.actions.result import action_failed, action_skipped, action_success
+from app.repositories.mcp_action_log_repo import find_successful_action
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -61,6 +62,29 @@ class ActionExecutor:
                 call_id, tool_key, action_type,
             )
             return action_failed(action, error=f"unknown tool: {tool_key!r}")
+
+        previous = await find_successful_action(
+            call_id=call_id,
+            action_type=action_type,
+            tool=tool_key,
+        )
+        if previous:
+            logger.info(
+                "action idempotency skip call_id=%s tool=%s action_type=%s previous_external_id=%s",
+                call_id,
+                tool_key,
+                action_type,
+                previous.get("external_id"),
+            )
+            return action_skipped(
+                action,
+                reason="already_succeeded",
+                result={
+                    "idempotency": "already_succeeded",
+                    "previous_external_id": previous.get("external_id"),
+                    "previous_status": previous.get("status"),
+                },
+            )
 
         try:
             raw: dict = await handler.execute(

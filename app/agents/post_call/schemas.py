@@ -14,6 +14,13 @@ class ActionType(str, Enum):
     schedule_callback = "schedule_callback"
     add_priority_queue = "add_priority_queue"
     mark_faq_candidate = "mark_faq_candidate"
+    create_jira_issue = "create_jira_issue"
+    send_slack_alert = "send_slack_alert"
+    send_callback_sms = "send_callback_sms"
+    send_voc_receipt_sms = "send_voc_receipt_sms"
+    send_reservation_confirmation = "send_reservation_confirmation"
+    create_notion_call_record = "create_notion_call_record"
+    create_notion_voc_record = "create_notion_voc_record"
 
 
 class Tool(str, Enum):
@@ -21,6 +28,10 @@ class Tool(str, Enum):
     gmail = "gmail"
     calendar = "calendar"
     internal_dashboard = "internal_dashboard"
+    jira = "jira"
+    slack = "slack"
+    sms = "sms"
+    notion = "notion"
 
 
 class ActionStatus(str, Enum):
@@ -154,3 +165,33 @@ class PriorityResult(BaseModel):
     score: int
     tier: str
     reason: str
+
+
+# ── Review Gate 스키마 ────────────────────────────────────────────────────────
+
+class ReviewVerdictValues:
+    """review_node verdict 허용값. 'pass'는 Python 예약어이므로 클래스 상수로 관리."""
+    PASS = "pass"
+    CORRECTABLE = "correctable"
+    RETRY = "retry"
+    FAIL = "fail"
+    _VALID = frozenset({"pass", "correctable", "retry", "fail"})
+
+    @classmethod
+    def is_valid(cls, v: str) -> bool:
+        return v in cls._VALID
+
+
+class ReviewIssue(BaseModel):
+    type: str
+    message: str
+    evidence: Optional[str] = None
+
+
+class ReviewResult(BaseModel):
+    verdict: str = "fail"
+    confidence: float = 0.0
+    issues: list[ReviewIssue] = Field(default_factory=list)
+    corrections: dict[str, Any] = Field(default_factory=dict)
+    blocked_actions: list[str] = Field(default_factory=list)
+    reason: str = ""

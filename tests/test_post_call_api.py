@@ -16,6 +16,7 @@ import app.repositories.call_summary_repo as summary_mod
 import app.repositories.voc_analysis_repo as voc_mod
 import app.repositories.mcp_action_log_repo as action_mod
 import app.repositories.dashboard_repo as dashboard_mod
+from app.repositories.call_summary_repo import _context_store as _ctx_store
 
 from app.api.v1.post_call import router as post_call_router
 from app.api.v1.summary import router as summary_router
@@ -47,6 +48,7 @@ def reset_stores():
     voc_mod._reset()
     action_mod._reset()
     dashboard_mod._reset()
+    _ctx_store.clear()
 
 
 # ── 시딩 헬퍼 (동기 — 내부 store 직접 접근) ─────────────────────────────────
@@ -74,6 +76,16 @@ def _seed_summary(call_id: str, tenant_id: str, summary: dict) -> None:
         "created_at": now,
         "updated_at": now,
     }
+
+
+def _seed_call_context(call_id: str, tenant_id: str = "default") -> None:
+    """run 테스트용 — completed_call_runner가 context를 찾을 수 있도록 주입한다."""
+    import copy
+    _ctx_store[call_id] = copy.deepcopy({
+        "metadata": {"call_id": call_id, "tenant_id": tenant_id},
+        "transcripts": [{"role": "customer", "text": "테스트 문의입니다"}],
+        "branch_stats": {"faq": 1, "task": 0, "escalation": 0},
+    })
 
 
 def _seed_action_logs(call_id: str, tenant_id: str, actions: list[dict]) -> None:
@@ -153,6 +165,7 @@ def test_get_call_actions_empty_for_unknown_call():
 # ── 4. POST /post-call/{call_id}/run manual 실행 성공 ─────────────────────────
 
 def test_run_post_call_manual():
+    _seed_call_context("run-test-001", "test-tenant")
     resp = _client.post("/post-call/run-test-001/run?trigger=manual&tenant_id=test-tenant")
     assert resp.status_code == 200
 
@@ -169,18 +182,21 @@ def test_run_post_call_manual():
 
 
 def test_run_post_call_invalid_trigger():
+    # trigger 검증은 context 조회 전에 수행되므로 seed 불필요
     resp = _client.post("/post-call/run-test-002/run?trigger=invalid_trigger")
     assert resp.status_code == 400
     assert "trigger" in resp.json()["detail"].lower() or "unknown" in resp.json()["detail"].lower()
 
 
 def test_run_post_call_call_ended_trigger():
+    _seed_call_context("run-test-003")
     resp = _client.post("/post-call/run-test-003/run?trigger=call_ended")
     assert resp.status_code == 200
     assert resp.json()["ok"] is True
 
 
 def test_run_post_call_escalation_trigger():
+    _seed_call_context("run-test-004")
     resp = _client.post("/post-call/run-test-004/run?trigger=escalation_immediate")
     assert resp.status_code == 200
     data = resp.json()

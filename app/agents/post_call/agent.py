@@ -43,6 +43,13 @@ class PostCallAgent:
             "dashboard_payload": None,
             "errors": [],
             "partial_success": False,
+            # ── Review Gate 초기값 ─────────────────────────────────────────
+            "analysis_result": None,
+            "review_result": None,
+            "review_verdict": None,
+            "review_retry_count": 0,
+            "human_review_required": False,
+            "blocked_actions": [],
         }
 
         logger.info("PostCallAgent 시작 call_id=%s trigger=%s", call_id, trigger)

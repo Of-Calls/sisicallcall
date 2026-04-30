@@ -18,3 +18,10 @@ class PostCallAgentState(TypedDict):
     dashboard_payload: Optional[dict]
     errors: list[dict]
     partial_success: bool
+    # ── Review Gate 필드 (통합 분석 + 검토 게이트) ─────────────────────────────
+    analysis_result: Optional[dict]     # post_call_analysis_node 통합 출력
+    review_result: Optional[dict]       # review_node 출력
+    review_verdict: Optional[str]       # "pass" | "correctable" | "retry" | "fail"
+    review_retry_count: int             # 재분석 횟수 (최대 1회)
+    human_review_required: bool         # True이면 외부 action 금지
+    blocked_actions: list[str]          # review가 차단한 action_type 또는 tool 이름

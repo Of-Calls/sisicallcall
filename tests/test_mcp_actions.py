@@ -1,4 +1,5 @@
 import pytest
+import app.repositories.mcp_action_log_repo as mcp_action_log_repo
 from app.agents.post_call.actions.executor import ActionExecutor, execute_actions
 from app.agents.post_call.actions.gmail_action import GmailAction
 from app.agents.post_call.actions.company_db_action import CompanyDBAction
@@ -8,6 +9,80 @@ from app.agents.post_call.actions.registry import (
     get_handler, register, unregister, registered_tools,
 )
 from app.agents.post_call.schemas import ActionType, Tool, ActionStatus
+
+
+@pytest.fixture(autouse=True)
+def _clear_real_mode_envs(monkeypatch):
+    """테스트가 .env의 real-mode 설정에 영향받지 않도록 격리."""
+    monkeypatch.delenv("GMAIL_MCP_REAL", raising=False)
+    monkeypatch.delenv("CALENDAR_MCP_REAL", raising=False)
+    monkeypatch.delenv("JIRA_MCP_REAL", raising=False)
+    monkeypatch.delenv("SLACK_MCP_REAL", raising=False)
+    monkeypatch.delenv("SMS_MCP_REAL", raising=False)
+    monkeypatch.delenv("NOTION_MCP_REAL", raising=False)
+    monkeypatch.delenv("COMPANY_DB_MCP_REAL", raising=False)
+    monkeypatch.delenv("MCP_USE_TENANT_OAUTH", raising=False)
+    monkeypatch.delenv("MCP_ALLOW_ENV_FALLBACK", raising=False)
+    monkeypatch.delenv("POST_CALL_ENABLE_NOTION_RECORD", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _reset_mcp_action_logs(monkeypatch, tmp_path):
+    monkeypatch.setenv("MCP_ACTION_LOG_STORE", "file")
+    monkeypatch.setenv("MCP_ACTION_LOG_FILE", str(tmp_path / "mcp_action_logs.json"))
+    mcp_action_log_repo._reset(remove_file=True)
+    yield
+    mcp_action_log_repo._reset(remove_file=True)
+
+
+def _force_mcp_actions_mock_mode(monkeypatch) -> None:
+    """모든 MCP connector를 강제로 mock 모드로 고정한다 (delenv 대신 setenv false)."""
+    for key in (
+        "GMAIL_MCP_REAL", "CALENDAR_MCP_REAL", "JIRA_MCP_REAL",
+        "SLACK_MCP_REAL", "SMS_MCP_REAL", "NOTION_MCP_REAL",
+        "COMPANY_DB_MCP_REAL", "MCP_COMPANY_DB_REAL",
+        "MCP_USE_TENANT_OAUTH", "POST_CALL_ENABLE_NOTION_RECORD",
+    ):
+        monkeypatch.setenv(key, "false")
+
+
+class _CountingAction:
+    def __init__(self, external_id: str = "new-external-id") -> None:
+        self.calls = 0
+        self.external_id = external_id
+
+    async def execute(self, action, *, call_id, tenant_id=""):
+        self.calls += 1
+        return {
+            "status": "success",
+            "external_id": self.external_id,
+            "result": {"called": self.calls, "call_id": call_id},
+        }
+
+
+async def _seed_action_log(
+    *,
+    call_id: str,
+    action_type: str,
+    tool: str,
+    status: str,
+    external_id: str | None = "previous-external-id",
+) -> None:
+    await mcp_action_log_repo.save_action_logs(
+        call_id=call_id,
+        tenant_id="tenant-test",
+        executed_actions=[
+            {
+                "action_type": action_type,
+                "tool": tool,
+                "params": {},
+                "status": status,
+                "external_id": external_id if status == "success" else None,
+                "result": {"seeded": True},
+                "error": None if status == "success" else status,
+            }
+        ],
+    )
 
 
 @pytest.fixture
@@ -303,15 +378,27 @@ async def test_execute_actions_one_fail_does_not_stop_others():
 # ── KDT-76 후속 보강: registry / result helper 테스트 ─────────────────────────
 
 def test_default_tools_registered():
-    """기본 4개 tool이 registry에 등록되어 있어야 한다."""
+    """기본 8개 tool이 registry에 등록되어 있어야 한다."""
     tools = registered_tools()
-    for tool in ("gmail", "company_db", "calendar", "internal_dashboard"):
+    for tool in ("gmail", "company_db", "calendar", "internal_dashboard", "jira", "slack", "sms", "notion"):
         assert tool in tools, f"기본 tool {tool!r} 이 registry에 없음"
+
+
+def test_jira_tool_registered():
+    """jira tool이 registry에 등록되어 있어야 한다."""
+    assert get_handler("jira") is not None
+    assert hasattr(get_handler("jira"), "execute")
+
+
+def test_slack_tool_registered():
+    """slack tool이 registry에 등록되어 있어야 한다."""
+    assert get_handler("slack") is not None
+    assert hasattr(get_handler("slack"), "execute")
 
 
 def test_get_handler_returns_handler_for_known_tools():
     """알려진 tool 이름으로 handler를 조회할 수 있어야 한다."""
-    for tool in ("gmail", "company_db", "calendar", "internal_dashboard"):
+    for tool in ("gmail", "company_db", "calendar", "internal_dashboard", "jira", "slack", "sms", "notion"):
         handler = get_handler(tool)
         assert handler is not None, f"{tool!r} handler가 None"
         assert hasattr(handler, "execute"), f"{tool!r} handler에 execute 메서드 없음"
@@ -373,22 +460,22 @@ async def test_handler_exception_continues_next_action():
 async def test_register_new_handler_and_execute():
     """새 dummy handler를 registry에 등록하면 execute_actions로 즉시 실행 가능하다."""
 
-    class DummySlackAction:
+    class DummyTestAction:
         async def execute(self, action, *, call_id, tenant_id=""):
             return {
-                "external_id": f"slack-{call_id}",
+                "external_id": f"dummy-{call_id}",
                 "status": "success",
                 "result": {"posted": True, "channel": action.get("params", {}).get("channel", "#general")},
             }
 
-    register("slack", DummySlackAction())
+    register("dummy_test", DummyTestAction())
     try:
         results = await execute_actions(
             call_id="reg-001",
             tenant_id="t",
             actions=[{
-                "action_type": "post_slack_message",
-                "tool": "slack",
+                "action_type": "post_message",
+                "tool": "dummy_test",
                 "params": {"channel": "#alerts"},
                 "status": "pending",
             }],
@@ -396,9 +483,178 @@ async def test_register_new_handler_and_execute():
         assert results[0]["status"] == "success"
         assert results[0]["result"]["posted"] is True
         assert results[0]["result"]["channel"] == "#alerts"
-        assert results[0]["external_id"] == "slack-reg-001"
+        assert results[0]["external_id"] == "dummy-reg-001"
     finally:
-        unregister("slack")
+        unregister("dummy_test")
+
+
+@pytest.mark.asyncio
+async def test_executor_skips_action_when_same_call_type_tool_already_succeeded(executor):
+    tool = "idempotency_fake_success"
+    action_type = "send_manager_email"
+    handler = _CountingAction()
+    await _seed_action_log(
+        call_id="idem-001",
+        action_type=action_type,
+        tool=tool,
+        status="success",
+        external_id="prev-001",
+    )
+
+    register(tool, handler)
+    try:
+        results = await executor.execute_actions(
+            call_id="idem-001",
+            tenant_id="tenant-test",
+            actions=[{"action_type": action_type, "tool": tool, "params": {}}],
+        )
+    finally:
+        unregister(tool)
+
+    assert handler.calls == 0
+    assert results[0]["status"] == "skipped"
+    assert results[0]["error"] == "already_succeeded"
+    assert results[0]["external_id"] is None
+    assert results[0]["result"]["idempotency"] == "already_succeeded"
+    assert results[0]["result"]["previous_external_id"] == "prev-001"
+    assert results[0]["result"]["previous_status"] == "success"
+
+
+@pytest.mark.asyncio
+async def test_executor_retries_when_previous_log_failed(executor):
+    tool = "idempotency_fake_failed"
+    action_type = "send_manager_email"
+    handler = _CountingAction("new-after-failed")
+    await _seed_action_log(
+        call_id="idem-002",
+        action_type=action_type,
+        tool=tool,
+        status="failed",
+        external_id=None,
+    )
+
+    register(tool, handler)
+    try:
+        results = await executor.execute_actions(
+            call_id="idem-002",
+            tenant_id="tenant-test",
+            actions=[{"action_type": action_type, "tool": tool, "params": {}}],
+        )
+    finally:
+        unregister(tool)
+
+    assert handler.calls == 1
+    assert results[0]["status"] == "success"
+    assert results[0]["external_id"] == "new-after-failed"
+
+
+@pytest.mark.asyncio
+async def test_executor_retries_when_previous_log_skipped(executor):
+    tool = "idempotency_fake_skipped"
+    action_type = "send_manager_email"
+    handler = _CountingAction("new-after-skipped")
+    await _seed_action_log(
+        call_id="idem-003",
+        action_type=action_type,
+        tool=tool,
+        status="skipped",
+        external_id=None,
+    )
+
+    register(tool, handler)
+    try:
+        results = await executor.execute_actions(
+            call_id="idem-003",
+            tenant_id="tenant-test",
+            actions=[{"action_type": action_type, "tool": tool, "params": {}}],
+        )
+    finally:
+        unregister(tool)
+
+    assert handler.calls == 1
+    assert results[0]["status"] == "success"
+    assert results[0]["external_id"] == "new-after-skipped"
+
+
+@pytest.mark.asyncio
+async def test_executor_runs_when_call_id_differs_from_success_log(executor):
+    tool = "idempotency_fake_call"
+    action_type = "send_manager_email"
+    handler = _CountingAction("new-different-call")
+    await _seed_action_log(
+        call_id="idem-004-previous",
+        action_type=action_type,
+        tool=tool,
+        status="success",
+    )
+
+    register(tool, handler)
+    try:
+        results = await executor.execute_actions(
+            call_id="idem-004-current",
+            tenant_id="tenant-test",
+            actions=[{"action_type": action_type, "tool": tool, "params": {}}],
+        )
+    finally:
+        unregister(tool)
+
+    assert handler.calls == 1
+    assert results[0]["status"] == "success"
+    assert results[0]["external_id"] == "new-different-call"
+
+
+@pytest.mark.asyncio
+async def test_executor_runs_when_action_type_differs_from_success_log(executor):
+    tool = "idempotency_fake_action_type"
+    handler = _CountingAction("new-different-action-type")
+    await _seed_action_log(
+        call_id="idem-005",
+        action_type="send_manager_email",
+        tool=tool,
+        status="success",
+    )
+
+    register(tool, handler)
+    try:
+        results = await executor.execute_actions(
+            call_id="idem-005",
+            tenant_id="tenant-test",
+            actions=[{"action_type": "send_sms", "tool": tool, "params": {}}],
+        )
+    finally:
+        unregister(tool)
+
+    assert handler.calls == 1
+    assert results[0]["status"] == "success"
+    assert results[0]["external_id"] == "new-different-action-type"
+
+
+@pytest.mark.asyncio
+async def test_executor_runs_when_tool_differs_from_success_log(executor):
+    previous_tool = "idempotency_fake_tool_previous"
+    current_tool = "idempotency_fake_tool_current"
+    action_type = "send_manager_email"
+    handler = _CountingAction("new-different-tool")
+    await _seed_action_log(
+        call_id="idem-006",
+        action_type=action_type,
+        tool=previous_tool,
+        status="success",
+    )
+
+    register(current_tool, handler)
+    try:
+        results = await executor.execute_actions(
+            call_id="idem-006",
+            tenant_id="tenant-test",
+            actions=[{"action_type": action_type, "tool": current_tool, "params": {}}],
+        )
+    finally:
+        unregister(current_tool)
+
+    assert handler.calls == 1
+    assert results[0]["status"] == "success"
+    assert results[0]["external_id"] == "new-different-tool"
 
 
 @pytest.mark.asyncio
@@ -449,3 +705,219 @@ def test_real_mode_env_does_not_break_import(monkeypatch):
     assert gmail_mod.GmailMCPService is not None
     assert cdb_mod.CompanyDBMCPService is not None
     assert cal_mod.CalendarMCPService is not None
+
+
+# ── MCPClient 경유 실행 테스트 ────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_gmail_action_via_mcp_client(executor):
+    """GmailAction이 MCPClient/connector 경유로 실행된다."""
+    action = {
+        "action_type": ActionType.send_manager_email.value,
+        "tool": Tool.gmail.value,
+        "params": {"subject": "MCPClient 경유 테스트", "to": "mgr@example.com"},
+        "status": ActionStatus.pending.value,
+    }
+    results = await executor.execute_all([action], call_id="mcp-001")
+    assert results[0]["status"] == "success"
+    assert results[0]["result"]["sent"] is True
+    assert results[0]["external_id"] == "gmail-mock-mcp-001"
+
+
+@pytest.mark.asyncio
+async def test_jira_action_via_mcp_client(executor, monkeypatch):
+    """JiraAction이 MCPClient/connector 경유로 실행된다."""
+    monkeypatch.setenv("JIRA_MCP_REAL", "false")
+    action = {
+        "action_type": "create_jira_issue",
+        "tool": "jira",
+        "params": {"summary_short": "Jira 이슈 테스트"},
+        "status": "pending",
+    }
+    results = await executor.execute_all([action], call_id="mcp-002")
+    assert results[0]["status"] == "success"
+    assert results[0]["external_id"] == "jira-mock-mcp-002"
+    assert results[0]["result"]["mock"] is True
+
+
+@pytest.mark.asyncio
+async def test_slack_action_via_mcp_client(executor):
+    """SlackAction이 MCPClient/connector 경유로 실행된다."""
+    action = {
+        "action_type": "send_slack_alert",
+        "tool": "slack",
+        "params": {"channel": "#critical", "message": "[CRITICAL] 테스트"},
+        "status": "pending",
+    }
+    results = await executor.execute_all([action], call_id="mcp-003")
+    assert results[0]["status"] == "success"
+    assert results[0]["external_id"] == "slack-mock-mcp-003"
+    assert results[0]["result"]["channel"] == "#critical"
+    assert results[0]["result"]["mock"] is True
+
+
+@pytest.mark.asyncio
+async def test_execute_all_six_action_types(executor, monkeypatch):
+    """execute_actions가 gmail/jira/slack/calendar/company_db/internal_dashboard를 모두 실행 가능하다."""
+    _force_mcp_actions_mock_mode(monkeypatch)
+    actions = [
+        {"action_type": "send_manager_email",  "tool": "gmail",              "params": {}, "status": "pending"},
+        {"action_type": "create_jira_issue",   "tool": "jira",               "params": {}, "status": "pending"},
+        {"action_type": "send_slack_alert",    "tool": "slack",              "params": {}, "status": "pending"},
+        {"action_type": "schedule_callback",   "tool": "calendar",           "params": {}, "status": "pending"},
+        {"action_type": "create_voc_issue",    "tool": "company_db",         "params": {}, "status": "pending"},
+        {"action_type": "add_priority_queue",  "tool": "internal_dashboard", "params": {}, "status": "pending"},
+    ]
+    results = await execute_actions(call_id="six-001", tenant_id="t", actions=actions)
+    assert len(results) == 6
+    for r in results:
+        assert r["status"] == "success", f"action {r['action_type']} failed: {r.get('error')}"
+
+
+@pytest.mark.asyncio
+async def test_one_connector_failure_does_not_stop_others(executor):
+    """하나의 connector 실패가 전체 실행을 막지 않는다."""
+    actions = [
+        {"action_type": "noop", "tool": "nonexistent_tool", "params": {}, "status": "pending"},
+        {"action_type": "send_manager_email", "tool": "gmail", "params": {}, "status": "pending"},
+        {"action_type": "send_slack_alert", "tool": "slack", "params": {}, "status": "pending"},
+    ]
+    results = await execute_actions(call_id="fail-001", tenant_id="t", actions=actions)
+    assert len(results) == 3
+    assert results[0]["status"] == "failed"
+    assert results[1]["status"] == "success"
+    assert results[2]["status"] == "success"
+
+
+@pytest.mark.asyncio
+async def test_all_action_results_have_standard_6_keys(executor, monkeypatch):
+    """모든 action result가 action_type/tool/status/external_id/error/result 키를 포함한다."""
+    _force_mcp_actions_mock_mode(monkeypatch)
+    actions = [
+        {"action_type": "send_manager_email",  "tool": "gmail",      "params": {}, "status": "pending"},
+        {"action_type": "create_jira_issue",   "tool": "jira",       "params": {}, "status": "pending"},
+        {"action_type": "send_slack_alert",    "tool": "slack",      "params": {}, "status": "pending"},
+        {"action_type": "noop",                "tool": "bad_tool",   "params": {}, "status": "pending"},
+    ]
+    results = await execute_actions(call_id="key-001", tenant_id="t", actions=actions)
+    for r in results:
+        for key in ("action_type", "tool", "status", "external_id", "error", "result"):
+            assert key in r, f"action {r.get('action_type')} 결과에 {key!r} 키 없음"
+
+
+# ── SMS / Notion action 테스트 ────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_sms_action_callback_mock_success(executor):
+    """SMSAction이 send_callback_sms mock 결과를 반환한다."""
+    action = {
+        "action_type": "send_callback_sms",
+        "tool": "sms",
+        "params": {"customer_phone": "01012345678"},
+        "status": "pending",
+    }
+    results = await executor.execute_all([action], call_id="sms-t-001")
+    assert results[0]["status"] == "success"
+    assert results[0]["result"]["mock"] is True
+    assert results[0]["result"]["to"] == "01012345678"
+
+
+@pytest.mark.asyncio
+async def test_sms_action_missing_phone_skipped(executor):
+    """customer_phone 없으면 skipped 반환, 다른 action은 계속 실행된다."""
+    actions = [
+        {"action_type": "send_callback_sms", "tool": "sms", "params": {}, "status": "pending"},
+        {"action_type": "send_manager_email", "tool": "gmail", "params": {}, "status": "pending"},
+    ]
+    results = await executor.execute_all(actions, call_id="sms-t-002")
+    assert len(results) == 2
+    assert results[0]["status"] == "skipped"
+    assert results[0]["error"] == "customer_phone_missing"
+    assert results[1]["status"] == "success"
+
+
+@pytest.mark.asyncio
+async def test_notion_action_call_record_mock_success(executor):
+    """NotionAction이 create_notion_call_record mock 결과를 반환한다."""
+    action = {
+        "action_type": "create_notion_call_record",
+        "tool": "notion",
+        "params": {"summary_short": "테스트", "priority": "high"},
+        "status": "pending",
+    }
+    results = await executor.execute_all([action], call_id="notion-t-001")
+    assert results[0]["status"] == "success"
+    assert results[0]["result"]["mock"] is True
+
+
+@pytest.mark.asyncio
+async def test_notion_action_voc_record_mock_success(executor):
+    """NotionAction이 create_notion_voc_record mock 결과를 반환한다."""
+    action = {
+        "action_type": "create_notion_voc_record",
+        "tool": "notion",
+        "params": {"priority": "critical", "customer_emotion": "angry"},
+        "status": "pending",
+    }
+    results = await executor.execute_all([action], call_id="notion-t-002")
+    assert results[0]["status"] == "success"
+    assert results[0]["result"]["mock"] is True
+
+
+@pytest.mark.asyncio
+async def test_execute_all_eight_action_types(executor, monkeypatch):
+    """execute_actions가 8개 tool을 모두 실행 가능하다."""
+    _force_mcp_actions_mock_mode(monkeypatch)
+    actions = [
+        {"action_type": "send_manager_email",       "tool": "gmail",              "params": {}, "status": "pending"},
+        {"action_type": "create_jira_issue",        "tool": "jira",               "params": {}, "status": "pending"},
+        {"action_type": "send_slack_alert",         "tool": "slack",              "params": {}, "status": "pending"},
+        {"action_type": "schedule_callback",        "tool": "calendar",           "params": {}, "status": "pending"},
+        {"action_type": "create_voc_issue",         "tool": "company_db",         "params": {}, "status": "pending"},
+        {"action_type": "add_priority_queue",       "tool": "internal_dashboard", "params": {}, "status": "pending"},
+        {"action_type": "send_callback_sms",        "tool": "sms",                "params": {"customer_phone": "01099990000"}, "status": "pending"},
+        {"action_type": "create_notion_call_record","tool": "notion",             "params": {}, "status": "pending"},
+    ]
+    from app.agents.post_call.actions.executor import execute_actions
+    results = await execute_actions(call_id="eight-001", tenant_id="t", actions=actions)
+    assert len(results) == 8
+    for r in results:
+        assert r["status"] in ("success", "skipped"), f"action {r['action_type']} failed: {r.get('error')}"
+
+
+@pytest.mark.asyncio
+async def test_sms_failure_does_not_stop_others(executor):
+    """SMS 실패(phone 없음)가 Calendar, Notion 실행을 막지 않는다."""
+    actions = [
+        {"action_type": "send_callback_sms",        "tool": "sms",      "params": {}, "status": "pending"},
+        {"action_type": "schedule_callback",        "tool": "calendar", "params": {}, "status": "pending"},
+        {"action_type": "create_notion_call_record","tool": "notion",   "params": {}, "status": "pending"},
+    ]
+    from app.agents.post_call.actions.executor import execute_actions
+    results = await execute_actions(call_id="sms-fail-001", tenant_id="t", actions=actions)
+    assert len(results) == 3
+    assert results[0]["status"] == "skipped"  # phone missing
+    assert results[1]["status"] == "success"   # calendar ok
+    assert results[2]["status"] == "success"   # notion ok
+
+
+@pytest.mark.asyncio
+async def test_notion_failure_does_not_stop_others():
+    """Notion 실패가 다른 action 실행을 막지 않는다."""
+
+    class ExplodingNotion:
+        async def execute(self, action, *, call_id, tenant_id=""):
+            raise RuntimeError("Notion 의도적 폭발")
+
+    register("notion_exploding", ExplodingNotion())
+    try:
+        actions = [
+            {"action_type": "create_notion_call_record", "tool": "notion_exploding", "params": {}, "status": "pending"},
+            {"action_type": "send_manager_email",        "tool": "gmail",            "params": {}, "status": "pending"},
+        ]
+        from app.agents.post_call.actions.executor import execute_actions
+        results = await execute_actions(call_id="notion-fail-chain", tenant_id="t", actions=actions)
+        assert results[0]["status"] == "failed"
+        assert results[1]["status"] == "success"
+    finally:
+        unregister("notion_exploding")
