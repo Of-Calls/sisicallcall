@@ -19,7 +19,7 @@ from app.repositories import (
     save_summary, get_summary_by_call_id,
     seed_call_context, get_call_context,
     save_voc_analysis, get_voc_by_call_id,
-    save_action_logs, get_action_logs_by_call_id, get_action_logs,
+    save_action_logs, find_successful_action, get_action_logs_by_call_id, get_action_logs,
     upsert_dashboard_payload, get_dashboard_payload,
     get_post_call_detail, get_dashboard_overview,
     get_emotion_distribution, get_priority_queue,
@@ -34,16 +34,17 @@ from tests.fixtures.sample_transcripts import (
 
 
 @pytest.fixture(autouse=True)
-def reset_stores():
+def reset_stores(monkeypatch, tmp_path):
     """모든 in-memory store를 테스트 전후로 초기화한다."""
+    monkeypatch.setenv("MCP_ACTION_LOG_FILE", str(tmp_path / "mcp_action_logs.json"))
     summary_mod._reset()
     voc_mod._reset()
-    action_mod._reset()
+    action_mod._reset(remove_file=True)
     dashboard_mod._reset()
     yield
     summary_mod._reset()
     voc_mod._reset()
-    action_mod._reset()
+    action_mod._reset(remove_file=True)
     dashboard_mod._reset()
 
 
@@ -150,6 +151,142 @@ async def test_save_action_logs_appends_without_replacing():
     assert logs[0]["action_type"] == "first_action"
     assert logs[1]["action_type"] == "second_action_a"
     assert logs[2]["action_type"] == "second_action_b"
+
+
+@pytest.mark.asyncio
+async def test_save_action_logs_creates_file_store():
+    actions = [{
+        "action_type": "create_jira_issue",
+        "tool": "jira",
+        "status": "success",
+        "external_id": "KDT-1",
+        "error": None,
+        "result": {"issue_key": "KDT-1"},
+        "params": {"summary": "demo"},
+    }]
+
+    await save_action_logs("call-file-001", "tenant-x", actions)
+
+    path = action_mod._get_store_path()
+    assert path.exists()
+    assert "call-file-001" in path.read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_find_successful_action_loads_success_from_file():
+    await save_action_logs(
+        "call-file-002",
+        "tenant-x",
+        [{
+            "action_type": "create_jira_issue",
+            "tool": "jira",
+            "status": "success",
+            "external_id": "KDT-2",
+            "error": None,
+            "result": {},
+            "params": {},
+        }],
+    )
+    action_mod._action_store.clear()
+
+    found = await find_successful_action("call-file-002", "create_jira_issue", "jira")
+
+    assert found is not None
+    assert found["external_id"] == "KDT-2"
+    assert found["status"] == "success"
+
+
+@pytest.mark.asyncio
+async def test_find_successful_action_ignores_failed_and_skipped_from_file():
+    await save_action_logs(
+        "call-file-003",
+        "tenant-x",
+        [
+            {
+                "action_type": "create_jira_issue",
+                "tool": "jira",
+                "status": "failed",
+                "external_id": None,
+                "error": "boom",
+                "result": {},
+                "params": {},
+            },
+            {
+                "action_type": "send_manager_email",
+                "tool": "gmail",
+                "status": "skipped",
+                "external_id": None,
+                "error": "missing_recipient",
+                "result": {},
+                "params": {},
+            },
+        ],
+    )
+    action_mod._action_store.clear()
+
+    assert await find_successful_action("call-file-003", "create_jira_issue", "jira") is None
+    assert await find_successful_action("call-file-003", "send_manager_email", "gmail") is None
+
+
+@pytest.mark.asyncio
+async def test_save_action_logs_appends_existing_file_logs():
+    await save_action_logs(
+        "call-file-004",
+        "tenant-x",
+        [{
+            "action_type": "first_action",
+            "tool": "jira",
+            "status": "success",
+            "external_id": "KDT-4",
+            "error": None,
+            "result": {},
+            "params": {},
+        }],
+    )
+    action_mod._action_store.clear()
+
+    await save_action_logs(
+        "call-file-004",
+        "tenant-x",
+        [{
+            "action_type": "second_action",
+            "tool": "gmail",
+            "status": "success",
+            "external_id": "gmail-4",
+            "error": None,
+            "result": {},
+            "params": {},
+        }],
+    )
+    action_mod._action_store.clear()
+
+    logs = await get_action_logs_by_call_id("call-file-004")
+    assert len(logs) == 2
+    assert logs[0]["action_type"] == "first_action"
+    assert logs[1]["action_type"] == "second_action"
+
+
+@pytest.mark.asyncio
+async def test_action_log_reset_can_remove_file_store():
+    await save_action_logs(
+        "call-file-005",
+        "tenant-x",
+        [{
+            "action_type": "create_jira_issue",
+            "tool": "jira",
+            "status": "success",
+            "external_id": "KDT-5",
+            "error": None,
+            "result": {},
+            "params": {},
+        }],
+    )
+    path = action_mod._get_store_path()
+    assert path.exists()
+
+    action_mod._reset(remove_file=True)
+
+    assert not path.exists()
 
 
 # ── 5. upsert_dashboard_payload / get_dashboard_payload ──────────────────────

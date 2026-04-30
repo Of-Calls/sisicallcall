@@ -27,10 +27,11 @@ def _clear_real_mode_envs(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _reset_mcp_action_logs():
-    mcp_action_log_repo._reset()
+def _reset_mcp_action_logs(monkeypatch, tmp_path):
+    monkeypatch.setenv("MCP_ACTION_LOG_FILE", str(tmp_path / "mcp_action_logs.json"))
+    mcp_action_log_repo._reset(remove_file=True)
     yield
-    mcp_action_log_repo._reset()
+    mcp_action_log_repo._reset(remove_file=True)
 
 
 def _force_mcp_actions_mock_mode(monkeypatch) -> None:
