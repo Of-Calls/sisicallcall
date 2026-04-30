@@ -3,6 +3,9 @@ import time
 from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
 
 # 서브모듈 import 이전에 .env 로드 — Azure/Twilio/Deepgram 등 외부 서비스 자격증명이
 # os.environ 경유로 읽히므로 반드시 최상단에서 수행해야 한다.
@@ -57,6 +60,9 @@ app = FastAPI(
 )
 
 app.add_middleware(RequestLoggingMiddleware)
+app.state.limiter = vision.limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.add_middleware(SlowAPIMiddleware)
 
 app.include_router(call.router, prefix="/call", tags=["call"])
 app.include_router(summary.router, prefix="/summary", tags=["summary"])

@@ -89,6 +89,8 @@ class Settings(BaseSettings):
     vision_upload_base_url: str = "http://localhost:5173"
     vision_upload_path_prefix: str = "/v"
     vision_upload_ttl_sec: int = 600
+    vision_upload_max_bytes: int = 20 * 1024 * 1024
+    vision_upload_dir: str = "uploads/vision"
 
     # Face Auth (M3+)
     arcface_model_name: str = "buffalo_l"

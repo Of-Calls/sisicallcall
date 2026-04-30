@@ -8,6 +8,43 @@ from app.utils.logger import get_logger
 logger = get_logger(__name__)
 
 VISION_STATUS_WAITING_UPLOAD = "WAITING_UPLOAD"
+VISION_STATUS_PROCESSING = "PROCESSING"
+VISION_STATUS_DONE = "DONE"
+VISION_STATUS_NEED_CONFIRM = "NEED_CONFIRM"
+VISION_STATUS_FAILED = "FAILED"
+
+
+class VisionUploadSessionNotFoundError(Exception):
+    pass
+
+
+class VisionUploadSessionAlreadyUsedError(Exception):
+    pass
+
+
+RESERVE_UPLOAD_SESSION_LUA = """
+local key = KEYS[1]
+local now = ARGV[1]
+
+if redis.call("EXISTS", key) == 0 then
+  return {"missing"}
+end
+
+local used = redis.call("HGET", key, "used")
+if used == "true" then
+  return {"used"}
+end
+
+redis.call("HSET", key,
+  "used", "true",
+  "status", "PROCESSING",
+  "processing_started_at", now
+)
+
+local data = redis.call("HGETALL", key)
+table.insert(data, 1, "ok")
+return data
+"""
 
 
 def _upload_key(token_hash: str) -> str:
@@ -16,6 +53,17 @@ def _upload_key(token_hash: str) -> str:
 
 def _call_session_key(call_id: str) -> str:
     return f"call:{call_id}:session"
+
+
+def _decode_redis_value(value: object) -> object:
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    return value
+
+
+def _flat_list_to_dict(items: list) -> dict:
+    decoded = [_decode_redis_value(item) for item in items]
+    return dict(zip(decoded[0::2], decoded[1::2]))
 
 
 class VisionUploadSessionStore:
@@ -58,6 +106,41 @@ class VisionUploadSessionStore:
         if not data:
             return None
         return data
+
+    async def reserve_upload_session_for_processing(self, token_hash: str) -> dict:
+        key = _upload_key(token_hash)
+        now = datetime.now(timezone.utc).isoformat()
+        result = await self._redis.eval(RESERVE_UPLOAD_SESSION_LUA, 1, key, now)
+        if not result:
+            raise VisionUploadSessionNotFoundError()
+
+        tag = _decode_redis_value(result[0])
+        if tag == "missing":
+            raise VisionUploadSessionNotFoundError()
+        if tag == "used":
+            raise VisionUploadSessionAlreadyUsedError()
+        if tag != "ok":
+            raise RuntimeError(f"unexpected reserve upload session result: {tag}")
+
+        return _flat_list_to_dict(result[1:])
+
+    async def attach_upload_file_info(
+        self,
+        token_hash: str,
+        image_path: str,
+        mime_type: str,
+        size_bytes: int,
+    ) -> None:
+        key = _upload_key(token_hash)
+        await self._redis.hset(
+            key,
+            mapping={
+                "image_path": image_path,
+                "mime_type": mime_type,
+                "size_bytes": str(size_bytes),
+                "uploaded_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
 
     async def set_call_vision_status(self, call_id: str, status: str) -> None:
         key = _call_session_key(call_id)

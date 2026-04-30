@@ -9,7 +9,10 @@ import app.api.v1.vision as vision_mod
 from app.services.sms import get_sms_service
 from app.services.sms.mock import MockSMSService
 from app.services.vision.session_store import (
+    VISION_STATUS_PROCESSING,
     VISION_STATUS_WAITING_UPLOAD,
+    VisionUploadSessionAlreadyUsedError,
+    VisionUploadSessionNotFoundError,
     VisionUploadSessionStore,
 )
 from app.services.vision.token import hash_upload_token
@@ -289,3 +292,312 @@ def test_get_upload_session_returns_500_on_lookup_failure(monkeypatch):
 
     assert resp.status_code == 500
     assert resp.json()["detail"] == "vision upload session lookup failed"
+
+
+@pytest.mark.asyncio
+async def test_validate_image_upload_accepts_jpeg(monkeypatch):
+    from io import BytesIO
+
+    from starlette.datastructures import UploadFile
+
+    from app.services.vision import validation
+
+    monkeypatch.setattr(validation, "detect_mime_type", lambda content: "image/jpeg")
+
+    file = UploadFile(filename="x.txt", file=BytesIO(b"fake-jpeg"))
+    result = await validation.validate_image_upload(file, max_bytes=1024)
+
+    assert result.mime_type == "image/jpeg"
+    assert result.extension == ".jpg"
+    assert result.size_bytes == len(b"fake-jpeg")
+
+
+@pytest.mark.asyncio
+async def test_validate_image_upload_rejects_empty_file():
+    from io import BytesIO
+
+    from starlette.datastructures import UploadFile
+
+    from app.services.vision.validation import EmptyImageFileError, validate_image_upload
+
+    file = UploadFile(filename="empty.png", file=BytesIO(b""))
+
+    with pytest.raises(EmptyImageFileError):
+        await validate_image_upload(file, max_bytes=1024)
+
+
+@pytest.mark.asyncio
+async def test_validate_image_upload_rejects_too_large_file():
+    from io import BytesIO
+
+    from starlette.datastructures import UploadFile
+
+    from app.services.vision.validation import ImageFileTooLargeError, validate_image_upload
+
+    file = UploadFile(filename="big.png", file=BytesIO(b"12345"))
+
+    with pytest.raises(ImageFileTooLargeError):
+        await validate_image_upload(file, max_bytes=4)
+
+
+@pytest.mark.asyncio
+async def test_validate_image_upload_rejects_unsupported_mime(monkeypatch):
+    from io import BytesIO
+
+    from starlette.datastructures import UploadFile
+
+    from app.services.vision import validation
+    from app.services.vision.validation import UnsupportedImageMimeTypeError
+
+    monkeypatch.setattr(validation, "detect_mime_type", lambda content: "text/plain")
+
+    file = UploadFile(filename="x.jpg", file=BytesIO(b"not-image"))
+
+    with pytest.raises(UnsupportedImageMimeTypeError):
+        await validation.validate_image_upload(file, max_bytes=1024)
+
+
+@pytest.mark.asyncio
+async def test_reserve_upload_session_for_processing_returns_session_data():
+    store = VisionUploadSessionStore()
+    store._redis = AsyncMock()
+    store._redis.eval = AsyncMock(
+        return_value=[
+            "ok",
+            "call_id",
+            "CAxxxxxxxx",
+            "tenant_id",
+            "tenant-123",
+            "used",
+            "true",
+            "status",
+            VISION_STATUS_PROCESSING,
+        ]
+    )
+
+    data = await store.reserve_upload_session_for_processing("abc123hash")
+
+    assert data == {
+        "call_id": "CAxxxxxxxx",
+        "tenant_id": "tenant-123",
+        "used": "true",
+        "status": VISION_STATUS_PROCESSING,
+    }
+    store._redis.eval.assert_awaited_once()
+    assert store._redis.eval.call_args.args[1] == 1
+    assert store._redis.eval.call_args.args[2] == "vision_upload:abc123hash"
+
+
+@pytest.mark.asyncio
+async def test_reserve_upload_session_for_processing_raises_when_missing():
+    store = VisionUploadSessionStore()
+    store._redis = AsyncMock()
+    store._redis.eval = AsyncMock(return_value=["missing"])
+
+    with pytest.raises(VisionUploadSessionNotFoundError):
+        await store.reserve_upload_session_for_processing("missinghash")
+
+
+@pytest.mark.asyncio
+async def test_reserve_upload_session_for_processing_raises_when_used():
+    store = VisionUploadSessionStore()
+    store._redis = AsyncMock()
+    store._redis.eval = AsyncMock(return_value=["used"])
+
+    with pytest.raises(VisionUploadSessionAlreadyUsedError):
+        await store.reserve_upload_session_for_processing("usedhash")
+
+
+def test_post_vision_upload_success(monkeypatch):
+    from app.services.vision.validation import ValidatedImage
+
+    token = "fixed-token"
+    expected_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+    class FakeStore:
+        def __init__(self):
+            self.reserve_token_hash = None
+            self.attach_args = None
+            self.call_status_args = None
+
+        async def reserve_upload_session_for_processing(self, token_hash: str):
+            self.reserve_token_hash = token_hash
+            return {"call_id": "CAxxxxxxxx", "tenant_id": "tenant-123"}
+
+        async def attach_upload_file_info(
+            self,
+            token_hash: str,
+            image_path: str,
+            mime_type: str,
+            size_bytes: int,
+        ):
+            self.attach_args = (token_hash, image_path, mime_type, size_bytes)
+
+        async def set_call_vision_status(self, call_id: str, status: str):
+            self.call_status_args = (call_id, status)
+
+    fake_store = FakeStore()
+    save_args = {}
+
+    async def fake_validate_image_upload(file, max_bytes: int):
+        assert max_bytes == 1024
+        return ValidatedImage(
+            content=b"fake-jpeg",
+            mime_type="image/jpeg",
+            extension=".jpg",
+            size_bytes=len(b"fake-jpeg"),
+        )
+
+    async def fake_save_vision_image(content, extension, call_id, upload_dir):
+        save_args.update(
+            {
+                "content": content,
+                "extension": extension,
+                "call_id": call_id,
+                "upload_dir": upload_dir,
+            }
+        )
+        return "uploads/vision/CAxxxxxxxx_fake.jpg"
+
+    monkeypatch.setattr(vision_mod, "_session_store", fake_store)
+    monkeypatch.setattr(vision_mod, "validate_image_upload", fake_validate_image_upload)
+    monkeypatch.setattr(vision_mod, "save_vision_image", fake_save_vision_image)
+    monkeypatch.setattr(vision_mod.settings, "vision_upload_max_bytes", 1024)
+    monkeypatch.setattr(vision_mod.settings, "vision_upload_dir", "uploads/vision")
+
+    app = FastAPI()
+    app.include_router(vision_mod.router, prefix="/vision")
+    client = TestClient(app)
+
+    resp = client.post(
+        "/vision/upload?token=fixed-token",
+        files={"file": ("photo.jpg", b"fake-jpeg", "image/jpeg")},
+    )
+
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "status": VISION_STATUS_PROCESSING,
+        "message": "사진을 받았습니다. 제품을 분석하고 있습니다.",
+    }
+    assert fake_store.reserve_token_hash == expected_hash
+    assert save_args == {
+        "content": b"fake-jpeg",
+        "extension": ".jpg",
+        "call_id": "CAxxxxxxxx",
+        "upload_dir": "uploads/vision",
+    }
+    assert fake_store.attach_args == (
+        expected_hash,
+        "uploads/vision/CAxxxxxxxx_fake.jpg",
+        "image/jpeg",
+        len(b"fake-jpeg"),
+    )
+    assert fake_store.call_status_args == ("CAxxxxxxxx", VISION_STATUS_PROCESSING)
+
+
+def test_post_vision_upload_returns_404_when_session_missing(monkeypatch):
+    from app.services.vision.validation import ValidatedImage
+
+    class FakeStore:
+        async def reserve_upload_session_for_processing(self, token_hash: str):
+            raise VisionUploadSessionNotFoundError()
+
+    async def fake_validate_image_upload(file, max_bytes: int):
+        return ValidatedImage(
+            content=b"fake-jpeg",
+            mime_type="image/jpeg",
+            extension=".jpg",
+            size_bytes=len(b"fake-jpeg"),
+        )
+
+    monkeypatch.setattr(vision_mod, "_session_store", FakeStore())
+    monkeypatch.setattr(vision_mod, "validate_image_upload", fake_validate_image_upload)
+
+    app = FastAPI()
+    app.include_router(vision_mod.router, prefix="/vision")
+    client = TestClient(app)
+
+    resp = client.post(
+        "/vision/upload?token=missing-token",
+        files={"file": ("photo.jpg", b"fake-jpeg", "image/jpeg")},
+    )
+
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "vision upload session not found or expired"
+
+
+def test_post_vision_upload_returns_409_when_session_used(monkeypatch):
+    from app.services.vision.validation import ValidatedImage
+
+    class FakeStore:
+        async def reserve_upload_session_for_processing(self, token_hash: str):
+            raise VisionUploadSessionAlreadyUsedError()
+
+    async def fake_validate_image_upload(file, max_bytes: int):
+        return ValidatedImage(
+            content=b"fake-jpeg",
+            mime_type="image/jpeg",
+            extension=".jpg",
+            size_bytes=len(b"fake-jpeg"),
+        )
+
+    monkeypatch.setattr(vision_mod, "_session_store", FakeStore())
+    monkeypatch.setattr(vision_mod, "validate_image_upload", fake_validate_image_upload)
+
+    app = FastAPI()
+    app.include_router(vision_mod.router, prefix="/vision")
+    client = TestClient(app)
+
+    resp = client.post(
+        "/vision/upload?token=used-token",
+        files={"file": ("photo.jpg", b"fake-jpeg", "image/jpeg")},
+    )
+
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == "vision upload session already used"
+
+
+def test_post_vision_upload_returns_400_when_mime_unsupported(monkeypatch):
+    from app.services.vision.validation import UnsupportedImageMimeTypeError
+
+    class FakeStore:
+        async def reserve_upload_session_for_processing(self, token_hash: str):
+            raise AssertionError("reserve should not be called")
+
+    async def fake_validate_image_upload(file, max_bytes: int):
+        raise UnsupportedImageMimeTypeError()
+
+    monkeypatch.setattr(vision_mod, "_session_store", FakeStore())
+    monkeypatch.setattr(vision_mod, "validate_image_upload", fake_validate_image_upload)
+
+    app = FastAPI()
+    app.include_router(vision_mod.router, prefix="/vision")
+    client = TestClient(app)
+
+    resp = client.post(
+        "/vision/upload?token=fixed-token",
+        files={"file": ("photo.txt", b"not-image", "text/plain")},
+    )
+
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == "unsupported image MIME type"
+
+
+def test_post_vision_upload_returns_404_when_token_missing(monkeypatch):
+    class FakeStore:
+        async def reserve_upload_session_for_processing(self, token_hash: str):
+            raise AssertionError("reserve should not be called")
+
+    monkeypatch.setattr(vision_mod, "_session_store", FakeStore())
+
+    app = FastAPI()
+    app.include_router(vision_mod.router, prefix="/vision")
+    client = TestClient(app)
+
+    resp = client.post(
+        "/vision/upload",
+        files={"file": ("photo.jpg", b"fake-jpeg", "image/jpeg")},
+    )
+
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "vision upload session not found or expired"
