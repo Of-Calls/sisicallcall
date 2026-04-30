@@ -4,10 +4,6 @@ import time
 from langgraph.graph import END, StateGraph
 
 from app.agents.conversational.state import CallState
-from app.agents.conversational.nodes.vad_node.vad_node import vad_node
-from app.agents.conversational.nodes.speaker_verify_node.speaker_verify_node import speaker_verify_node
-from app.agents.conversational.nodes.stt_node.stt_node import stt_node
-from app.agents.conversational.nodes.enrollment_node.enrollment_node import enrollment_node
 from app.agents.conversational.nodes.cache_node.cache_node import cache_node
 from app.agents.conversational.nodes.cache_store_node.cache_store_node import cache_store_node
 from app.agents.conversational.nodes.rag_probe_node.rag_probe_node import rag_probe_node
@@ -48,29 +44,9 @@ def _timed(name: str):
 
 
 # ── 조건부 엣지 함수 ──────────────────────────────────────────
-
-def route_after_vad(state: CallState) -> str:
-    return "pass" if state["is_speech"] else "skip"
-
-
-def route_after_speaker_verify(state: CallState) -> str:
-    """verify 통과 시 그대로 pass. 실패해도 STT 결과 (raw_transcript) 가 비어있지 않으면
-    pass — 짧은 발화에서 TitaNet 임베딩 거리가 멀어지는 한계 보완. 본인 음성인데 verify
-    실패한 케이스 (sim 0.3 수준) 도 graph 진행 → 응답 생성 가능.
-
-    위험: TTS echo 가 마이크에 잡혀 STT 가 텍스트로 변환한 경우 통과될 수 있음.
-    실통화 측정 후 echo 빈도 보고 STT 길이 가드 (≥ N자) 등 추가 검토.
-    """
-    if state["is_speaker_verified"]:
-        return "pass"
-    if (state.get("raw_transcript") or "").strip():
-        return "pass"
-    return "reject"
-
-
-def route_after_stt(state: CallState) -> str:
-    return "pass" if state.get("raw_transcript") else "skip"
-
+# audio 도메인 라우팅 (route_after_vad / route_after_speaker_verify / route_after_stt)
+# 은 2026-04-30 graph 구조 개편으로 call.py 로 이전. graph 진입 자체가 raw_transcript
+# 채워진 상태에서만 발생하므로 텍스트 전처리 단계 분기는 불필요.
 
 def route_after_cache(state: CallState) -> str:
     return "hit" if state["cache_hit"] else "miss"
@@ -105,13 +81,15 @@ def _is_high_risk(state: CallState) -> bool:
 # ── 그래프 빌더 ───────────────────────────────────────────────
 
 def build_call_graph():
+    """텍스트 워크플로우 graph (2026-04-30 구조 개편).
+
+    audio 도메인 (VAD / 화자검증 / STT / enrollment) 은 call.py 가 graph 진입
+    전에 처리. graph 는 이미 검증·확정된 raw_transcript 를 받아 cache → rag_probe
+    → intent_router → branch → cache_store → tts 흐름만 담당.
+    """
     graph = StateGraph(CallState)
 
     # 노드 등록 — 모두 _timed 로 감싸 실행 시간 자동 로깅
-    graph.add_node("vad",               _timed("vad")(vad_node))
-    graph.add_node("speaker_verify",    _timed("speaker_verify")(speaker_verify_node))
-    graph.add_node("stt",               _timed("stt")(stt_node))
-    graph.add_node("enrollment",        _timed("enrollment")(enrollment_node))
     graph.add_node("cache",             _timed("cache")(cache_node))
     # 노드명 != state key ("rag_probe" 는 CallState 키이므로 노드명에 _step 접미)
     graph.add_node("rag_probe_step",    _timed("rag_probe")(rag_probe_node))
@@ -126,19 +104,8 @@ def build_call_graph():
     graph.add_node("cache_store",       _timed("cache_store")(cache_store_node))
     graph.add_node("tts",               _timed("tts")(tts_node))
 
-    # 진입점
-    graph.set_entry_point("vad")
-
-    # 전처리 단계
-    graph.add_conditional_edges("vad", route_after_vad,
-        {"pass": "speaker_verify", "skip": END})
-    graph.add_conditional_edges("speaker_verify", route_after_speaker_verify,
-        {"pass": "stt", "reject": END})
-    graph.add_conditional_edges("stt", route_after_stt,
-        {"pass": "enrollment", "skip": END})
-    # norm_text_node 폐지 (2026-04-27) — Deepgram 출력이 이미 trim/공백 정규화 완료라
-    # 별도 노드는 no-op. stt_node 가 normalized_text 도 동시 set 하도록 통합.
-    graph.add_edge("enrollment", "cache")
+    # 진입점 — 텍스트 정제 단계 없이 cache 부터 (raw_transcript 는 call.py 가 채움)
+    graph.set_entry_point("cache")
 
     # Gate 1 분기 — cache miss 시 rag_probe_step (top_k=3 신호 채집) → IntentRouterLLM
     # (이전 KNN Router 단계는 stub 이라 영구 보류 결정 후 2026-04-27 제거 — CLAUDE.md 참조)
@@ -146,7 +113,7 @@ def build_call_graph():
         {"hit": "tts", "miss": "rag_probe_step"})
     graph.add_edge("rag_probe_step", "intent_router_llm")
 
-    # IntentRouterLLM → 브랜치 (clarify 포함 5개)
+    # IntentRouterLLM → 브랜치 (clarify 포함 6개)
     graph.add_conditional_edges("intent_router_llm", route_to_branch, {
         "faq": "faq_branch",
         "task": "task_branch",

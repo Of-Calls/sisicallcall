@@ -167,14 +167,20 @@ async def faq_branch_node(state: CallState) -> dict:
     # LLM 호출 SKIP, 카테고리 안내 직접 합성. ~3초 latency 절약.
     # response_path="clarify" 로 cache_store 자동 차단 + is_fallback=True.
     # 후속 cycle 검토: 같은 텍스트 반복 시 escalation 트리거 또는 텍스트 다양화.
+    #
+    # 2026-04-30: 모든 카테고리 나열 → 상위 3개 + "등" 으로 단축. 한밭식당 7개 카테고리
+    # 전체 나열 시 ~90자 → 18.6초 TTS 사고 (server_114028.log Turn 2). 사용자가 끝까지
+    # 듣지 못하고 BARGE-IN 발사하는 흔적 line 102~106. preview 3개 + 등 으로 ~45자, ~9초.
     if not rag_results and incoming_miss_count >= 2 and available_categories:
-        cats_text = ", ".join(available_categories)
+        preview_cats = available_categories[:3]
+        cats_text = ", ".join(preview_cats)
+        suffix = " 등" if len(available_categories) > len(preview_cats) else ""
         synth_text = (
-            f"안내드릴 수 있는 분야는 {cats_text} 입니다. 어떤 정보가 필요하신가요?"
+            f"안내드릴 수 있는 분야는 {cats_text}{suffix}이 있습니다. 어떤 정보가 필요하신가요?"
         )
         logger.info(
             "rag miss synth (LLM skip) call_id=%s miss_count=%d cats=%s",
-            call_id, incoming_miss_count, cats_text,
+            call_id, incoming_miss_count, cats_text + suffix,
         )
         return {
             "rag_results": rag_results,

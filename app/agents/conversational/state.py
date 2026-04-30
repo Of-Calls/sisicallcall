@@ -2,19 +2,20 @@ from typing import NotRequired, Optional, TypedDict
 
 
 class CallState(TypedDict):
+    """통화 응대 graph 상태 — 텍스트 워크플로우 전용 (2026-04-30 구조 개편).
+
+    audio 도메인 (VAD / 화자검증 / STT / enrollment) 은 call.py 가 graph 진입 전에
+    처리. graph 는 텍스트 + 컨텍스트만 받아 cache → rag_probe → intent → branch →
+    cache_store → tts 흐름 담당. graph 가 audio_chunk: bytes 를 들고 다니던 이중
+    책임 구조 제거 + 단위 테스트 시 mock audio 불필요.
+    """
     # 식별자
     call_id: str
     tenant_id: str
     turn_index: int
 
-    # 오디오 입력
-    audio_chunk: bytes
-
-    # VAD / 화자 검증
-    is_speech: bool
-    is_speaker_verified: bool
-
-    # STT 결과
+    # STT 결과 — call.py 가 graph 진입 전 streaming flush + (fallback) prerecorded
+    # 까지 마친 후 채워서 넘김. 빈 문자열이면 graph 진입 자체가 발생하지 않음.
     raw_transcript: str
     normalized_text: str
 
@@ -54,12 +55,9 @@ class CallState(TypedDict):
     # 브랜치 노드가 명시적으로 설정. RAG miss / LLM 고정 fallback 텍스트 등.
     is_fallback: NotRequired[bool]
 
-    # 빈 STT 연속 횟수 — call.py 에서 주입, stt_node 에서 증가.
-    # N회 초과 시 escalation 처리 (안내 멘트 → 상담원 연결).
+    # 빈 STT 연속 횟수 — call.py 가 직접 관리 + 누적. graph 는 사용 안 하지만
+    # 후속 escalation 분기 (N회 초과 → 상담원 연결) 위해 통과 시 보존.
     empty_stt_count: NotRequired[int]
-
-    # voiceprint 등록 완료 여부 — enrollment_node 에서 관리 (관측용)
-    enrollment_done: NotRequired[bool]
 
     # Intent Router LLM 이 모호한 발화에 대해 생성한 역질문 (intent_clarify 시만 채워짐).
     # clarify_branch_node 가 그대로 response_text 로 사용. 다른 intent 일 때는 키 자체가 없음.

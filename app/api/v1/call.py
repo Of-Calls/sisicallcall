@@ -19,10 +19,9 @@ from app.core.events import CALL_ENDED, CALL_STARTED
 from app.repositories.call_repo import finalize_call, insert_call
 from app.repositories.transcript_repo import insert_transcript
 from app.services.session.redis_session import RedisSessionService
-from app.agents.conversational.nodes.enrollment_node.enrollment_node import (
-    cleanup as cleanup_enrollment_state,
-)
+from app.services.speaker_verify import enrollment as voiceprint_enrollment
 from app.services.speaker_verify.titanet import get_titanet_service
+from app.services.stt.deepgram import DeepgramSTTService
 from app.services.stt.deepgram_streaming import DeepgramStreamingSTTService
 from app.services.stt.keyterm_cache import get_tenant_keyterms
 from app.services.tts.channel import tts_channel
@@ -34,14 +33,17 @@ from app.utils.logger import get_logger
 logger = get_logger(__name__)
 router = APIRouter()
 
-# 그래프 싱글톤 (앱 기동 시 1회 컴파일)
+# 그래프 싱글톤 (앱 기동 시 1회 컴파일) — 텍스트 워크플로우 전용 (2026-04-30 개편).
+# audio 처리 (VAD / 화자검증 / STT / enrollment) 는 graph 진입 전 본 파일에서 처리.
 _graph = build_call_graph()
 _session_service = RedisSessionService()
 _streaming_stt = DeepgramStreamingSTTService()
-# barge-in verify 게이트용 — VAD 1차, TitaNet 2차. 둘 다 모듈 싱글톤.
-# 2026-04-30: WebRTCVADService → SileroVADService 교체 (짧은 발화 + 긴 trailing silence
-# reject 해결). stateless 인터페이스 동일 (detect(bytes)→bool), per-call cleanup 불필요.
-_bargein_vad = SileroVADService()
+_prerecorded_stt = DeepgramSTTService()  # streaming flush 가 비어있을 때 fallback
+# Silero VAD — main path 게이트 + barge-in verify 1차. 둘 다 stateless 라 같은 인스턴스
+# 공유 가능. (이전: WebRTCVADService 였으나 짧은 발화 + 긴 trailing silence reject 문제로
+# 2026-04-30 교체. detect(bytes)→bool 인터페이스 동일, per-call cleanup 불필요.)
+_silero_vad = SileroVADService()
+_bargein_vad = _silero_vad  # alias — barge-in 코드 가독성용
 
 # 발화 감지 파라미터 — Silero VAD(주미) 구현 전 임시 에너지 기반 묵음 감지
 _SPEECH_RMS_THRESHOLD = 1200   # 일반 발화 임계값 (TTS 에코 필터링 포함)
@@ -468,52 +470,108 @@ async def call_websocket(
                             logger.info(
                                 f"call_id={call_id} | 발화 완성 "
                                 f"{len(chunk)} bytes ({len(chunk)/32000:.1f}s) "
-                                f"trigger={trigger_reason} → 그래프 실행"
+                                f"trigger={trigger_reason} → 오디오 처리"
                             )
-                            streaming_transcript = await _streaming_stt.flush_transcript(call_id)
-                            state: CallState = {
-                                "call_id": call_id,
-                                "tenant_id": tenant_id,
-                                "turn_index": turn_index,
-                                "audio_chunk": chunk,
-                                "is_speech": False,
-                                "is_speaker_verified": False,
-                                "raw_transcript": streaming_transcript,
-                                "normalized_text": "",
-                                "query_embedding": [],
-                                "cache_hit": False,
-                                "primary_intent": None,
-                                "session_view": session_view,
-                                "rag_results": [],
-                                "response_text": "",
-                                "response_path": "",
-                                "reviewer_applied": False,
-                                "reviewer_verdict": None,
-                                "is_timeout": False,
-                                "stall_messages": stall_messages,
-                                "stall_delay_sec": _STALL_DELAY_SEC,  # 모듈 상수와 통일 (Phase D)
-                                "empty_stt_count": empty_stt_count,
-                            }
-                            if interrupted_response_text:
-                                state["is_bargein"] = True
-                                state["interrupted_response_text"] = interrupted_response_text
-                                interrupted_response_text = ""
-                            # FAQ RAG miss 누적 카운터 주입 (faq_branch_node 가 LLM 분기에 사용)
-                            state["rag_miss_count"] = session_view.get("rag_miss_count", 0)
-                            # tenant 가용 카테고리 주입 — Redis 에서 미리 fetch (start 이벤트)
-                            state["available_categories"] = session_view.get("rag_categories", [])
-                            # 인증 대기 상태 주입 — auth_branch_node 가 Turn 2 판단에 사용
-                            state["auth_pending"] = session_view.get("auth_pending", False)
 
-                            # barge-in 단순 모델 (architect 감사) — turn cancel 은 오직
-                            # `_attempt_bargein_verify` (TitaNet 통과 시) 만 책임진다.
-                            # 새 발화 완성 자체로는 이전 turn 을 cancel 하지 않음 — verify 실패한
-                            # noise (호흡·바람소리 등) 가 응답을 끊는 것을 차단.
-                            # 백그라운드 실행 — 송신 동안에도 메인 루프가 inbound 처리
-                            turn_task = asyncio.create_task(
-                                _run_turn(state, streaming_transcript)
+                            # ── 오디오 처리 (graph 진입 전, 2026-04-30 구조 개편) ──
+                            # 이전: graph 안의 vad / speaker_verify / stt / enrollment 노드.
+                            # 이후: 본 파일이 직접 처리. graph 는 텍스트 워크플로우만 담당.
+
+                            # 1) STT — streaming 결과 회수, 비어있으면 prerecorded fallback
+                            stt_t0 = time.monotonic()
+                            transcript = await _streaming_stt.flush_transcript(call_id)
+                            if not transcript:
+                                try:
+                                    transcript = await _prerecorded_stt.transcribe(chunk)
+                                    if transcript:
+                                        logger.info(
+                                            "call_id=%s | STT prerecorded fallback '%s'",
+                                            call_id, transcript,
+                                        )
+                                except Exception as exc:
+                                    logger.warning(
+                                        "call_id=%s | STT prerecorded 실패: %s", call_id, exc,
+                                    )
+                            transcript_norm = " ".join(transcript.split()) if transcript else ""
+                            logger.info(
+                                "[pre-graph:stt] elapsed=%.0fms call_id=%s len=%d",
+                                (time.monotonic() - stt_t0) * 1000, call_id, len(transcript_norm),
                             )
-                            turn_index += 1
+
+                            if not transcript_norm:
+                                # 빈 STT — graph 진입 skip, 횟수 누적 (escalation 후속 작업)
+                                empty_stt_count += 1
+                                logger.debug(
+                                    "call_id=%s | 빈 STT %d회 → graph skip",
+                                    call_id, empty_stt_count,
+                                )
+                            else:
+                                empty_stt_count = 0
+
+                                # 2) 화자 검증 — STT 결과 있으면 graph 진입 자체는 막지 않음
+                                #    (route_after_speaker_verify 의 STT fallback 가드 동일 정책).
+                                #    텔레메트리 + 향후 echo 차단 정책 강화 여지.
+                                verify_t0 = time.monotonic()
+                                try:
+                                    await get_titanet_service().verify(chunk, call_id)
+                                except Exception as exc:
+                                    logger.error("call_id=%s | 화자 검증 실패: %s", call_id, exc)
+                                logger.info(
+                                    "[pre-graph:verify] elapsed=%.0fms call_id=%s",
+                                    (time.monotonic() - verify_t0) * 1000, call_id,
+                                )
+
+                                # 3) Enrollment — STT 성공 발화만 누적해 voiceprint 등록.
+                                #    임계 (settings.titanet_enrollment_sec) 도달 시 등록.
+                                enroll_t0 = time.monotonic()
+                                await voiceprint_enrollment.accumulate(call_id, chunk, transcript_norm)
+                                logger.info(
+                                    "[pre-graph:enroll] elapsed=%.0fms call_id=%s",
+                                    (time.monotonic() - enroll_t0) * 1000, call_id,
+                                )
+
+                                # 4) Graph state — 텍스트 워크플로우 전용 (audio_chunk / is_speech /
+                                #    is_speaker_verified 필드 제거됨, 2026-04-30 개편)
+                                state: CallState = {
+                                    "call_id": call_id,
+                                    "tenant_id": tenant_id,
+                                    "turn_index": turn_index,
+                                    "raw_transcript": transcript,
+                                    "normalized_text": transcript_norm,
+                                    "query_embedding": [],
+                                    "cache_hit": False,
+                                    "primary_intent": None,
+                                    "session_view": session_view,
+                                    "rag_results": [],
+                                    "response_text": "",
+                                    "response_path": "",
+                                    "reviewer_applied": False,
+                                    "reviewer_verdict": None,
+                                    "is_timeout": False,
+                                    "stall_messages": stall_messages,
+                                    "stall_delay_sec": _STALL_DELAY_SEC,
+                                    "empty_stt_count": 0,
+                                }
+                                if interrupted_response_text:
+                                    state["is_bargein"] = True
+                                    state["interrupted_response_text"] = interrupted_response_text
+                                    interrupted_response_text = ""
+                                # FAQ RAG miss 누적 (faq_branch_node 가 LLM 분기에 사용)
+                                state["rag_miss_count"] = session_view.get("rag_miss_count", 0)
+                                # tenant 가용 카테고리 (start 이벤트에서 미리 fetch)
+                                state["available_categories"] = session_view.get("rag_categories", [])
+                                # 인증 대기 상태 (auth_branch_node Turn 2 판단)
+                                state["auth_pending"] = session_view.get("auth_pending", False)
+
+                                # barge-in 단순 모델 (architect 감사) — turn cancel 은 오직
+                                # `_attempt_bargein_verify` (TitaNet 통과 시) 만 책임진다.
+                                # 새 발화 완성 자체로는 이전 turn 을 cancel 하지 않음 — verify
+                                # 실패한 noise (호흡·바람소리 등) 가 응답을 끊는 것을 차단.
+                                # 백그라운드 실행 — 송신 동안에도 메인 루프가 inbound 처리
+                                turn_task = asyncio.create_task(
+                                    _run_turn(state, transcript_norm)
+                                )
+                                turn_index += 1
                         else:
                             logger.debug(
                                 f"call_id={call_id} | 발화 무시 "
@@ -621,7 +679,7 @@ async def call_websocket(
         # per-call 메모리 해제 — enrollment 모듈 전역 dict + titanet voiceprint.
         # 종료 경로(stop / WebSocketDisconnect / Exception) 무엇이든 항상 정리.
         try:
-            cleanup_enrollment_state(call_id)
+            voiceprint_enrollment.cleanup(call_id)
             get_titanet_service().cleanup(call_id)
         except Exception as e:  # noqa: BLE001 — cleanup 실패가 통화 종료 흐름 차단 안 함
             logger.warning("call_id=%s 종료 cleanup 실패: %s", call_id, e)
