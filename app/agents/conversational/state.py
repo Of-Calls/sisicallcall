@@ -43,11 +43,6 @@ class CallState(TypedDict):
     # 타임아웃
     is_timeout: bool
 
-    # 대기 멘트 (RFC 001 v0.2) — run_turn 진입 시 tenant settings 에서 pre-load
-    # 노드는 .get() 로 안전 접근. 키 부재 시 _run_with_stall 이 하드코딩 기본값 사용.
-    stall_messages: NotRequired[dict]   # {"general": "잠시만요...", "faq": "...", ...}
-    stall_delay_sec: NotRequired[float] # 기본 1.0
-
     # cache_store_node 동작 결과 (관측·디버깅용)
     cache_stored: NotRequired[bool]
 
@@ -81,10 +76,16 @@ class CallState(TypedDict):
 
     # RAG probe 신호 (cache miss → rag_probe_node 가 채움 → intent_router_llm 이 활용).
     # dict 또는 None. dict 일 때 키:
-    #   top_distance(float), matched_keywords(list[str]), top_topic(str),
+    #   top_distance(float) — ChromaDB 기본 L2² distance (0~4 범위),
+    #   matched_keywords(list[str]), top_topic(str),
     #   top_title(str), top_chunk_id(str), is_auth(bool)
     # 임베딩 미보유·검색 오류·결과 0 시 None.
     rag_probe: NotRequired[Optional[dict]]
+
+    # RAG probe 원본 검색 결과 (top_k=8) — faq_branch_node 가 재사용해 ChromaDB 2회 쿼리 방지.
+    # rag_probe_node 가 채움. faq 분기가 아닌 turn 에서는 무시됨.
+    # list[dict] — search_with_meta 반환 형식 (distance, document, metadata, id).
+    rag_top_k_raw: NotRequired[Optional[list]]
 
     # Query refinement (2026-04-30 Option γ 도입 — query_refine_node).
     # query_refine_node 가 raw_transcript / normalized_text 를 받아 룰 기반으로 띄어쓰기

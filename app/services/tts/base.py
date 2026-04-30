@@ -15,76 +15,35 @@ class BaseTTSService(ABC):
 
 
 class BaseTTSOutputChannel(ABC):
-    """오디오 출력 전용 파이프라인 (RFC 001 v0.2).
-
-    노드가 stall utterance 와 최종 응답을 TTS/Twilio 로 라우팅할 때 사용한다.
-    Ordering, cancel (barge-in), 사전 캐시 조회, 멀티테넌시 격리를 이 계층에 집약한다.
+    """오디오 출력 전용 파이프라인.
 
     lifecycle:
-        open(call_id, tenant_id)
-            → (push_stall)*  # stall 은 턴당 최대 1회 (이중 방출 방지)
-            → push_response  # 최종 응답
-            → flush(call_id)
+        open(call_id, tenant_id) → push_response → flush(call_id)
 
     barge-in:
-        cancel(call_id) — current stream 중단 + 큐 클리어
-
-    실구현체는 `BaseTTSService` 를 내부 의존성으로 가진다 (합성/스트림 위임).
+        cancel(call_id) — current stream 중단
     """
 
     @abstractmethod
     async def open(self, call_id: str, tenant_id: str) -> None:
-        """턴 시작. Twilio Media Stream 핸들 바인딩 + 내부 큐 초기화."""
-
-    @abstractmethod
-    async def push_stall(self, call_id: str, text: str, audio_field: str) -> None:
-        """대기 멘트 push. 이미 같은 턴에 stall 이 방출됐으면 skip (이중 방출 방지).
-
-        실구현체는 사전 캐시 (Redis `tenant:{tenant_id}:stall_audio_cache`) 를 우선
-        조회하여 적중 시 TTS API 스킵. Miss 시 TTS 생성 후 write-back.
-        """
+        """통화 시작. Twilio Media Stream 핸들 바인딩."""
 
     @abstractmethod
     async def push_response(self, call_id: str, text: str, response_path: str) -> None:
-        """최종 응답 push. Reviewer 결과 반영된 최종 텍스트."""
+        """최종 응답 push."""
 
     @abstractmethod
     async def cancel(self, call_id: str) -> None:
-        """barge-in 시 호출 — current stream 중단 + 큐 클리어.
-
-        `stall_emitted_this_turn` 플래그는 reset 하지 않음 (같은 턴 내 재진입 시 혼란 방지).
-        플래그 reset 은 flush() 에서만.
-        """
+        """barge-in 시 호출 — current stream 중단."""
 
     @abstractmethod
     async def flush(self, call_id: str) -> None:
-        """턴 종료. 내부 상태 (큐 + stall_emitted 플래그 + tenant mapping) 정리."""
-
-    @abstractmethod
-    async def push_ack(self, call_id: str, text: str, audio_field: str) -> None:
-        """Fire-and-forget acknowledgment audio (예: '사용자님 질문을 이해했어요. 잠시만요.').
-
-        push_stall 과 달리 턴당 1회 가드(stall_emitted) 를 우회한다 — 같은 턴에
-        push_stall 과 동시에 방출 가능. 사용 목적: query_refine_node 가 발화 의도가
-        명확하다고 판단한 직후 즉각적인 청각 피드백 제공.
-
-        캐시 패턴은 push_stall 과 동일:
-            tenant:{tenant_id}:stall_audio_cache (audio_field 키) 우선 조회.
-            Miss 시 TTS 합성 후 write-back.
-        모든 오류는 best-effort — 로그만 남기고 크래시하지 않음.
-        """
-
-    # ── 상태 조회 (barge-in 지원) ─────────────────────────────
-    # 기본 구현은 송신 상태를 추적하지 않는 채널(예: 합성/스트림 분리 안 된 mock)
-    # 호환을 위해 항상 False/"" 반환. 실 구현체가 override.
+        """통화 종료. per-call 내부 상태 정리."""
 
     def is_speaking(self, call_id: str) -> bool:
         """현재 call_id 의 응답이 TTS 송신 중이면 True. barge-in 감지에 사용."""
         return False
 
     def current_text(self, call_id: str) -> str:
-        """현재 송신 중(또는 직전에 송신 중이었던) 응답 원문. 없으면 빈 문자열.
-
-        barge-in 시 끊긴 응답 컨텍스트 보존용 — intent_router_llm 이 활용.
-        """
+        """현재 송신 중인 응답 원문. 없으면 빈 문자열."""
         return ""

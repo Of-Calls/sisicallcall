@@ -2,8 +2,7 @@ from app.agents.conversational.state import CallState
 from app.services.tts.channel import tts_channel
 from app.utils.logger import get_logger
 
-# RFC 001 v0.2 이후 — 최종 응답은 TTSOutputChannel 경유로 push.
-# Stall utterance 는 브랜치 노드에서 직접 push_stall 하므로 여기서는 push_response 만.
+# 최종 응답은 TTSOutputChannel 경유로 push_response 호출.
 
 logger = get_logger(__name__)
 

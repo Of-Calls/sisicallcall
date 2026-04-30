@@ -102,15 +102,17 @@ async def faq_branch_node(state: CallState) -> dict:
     query_embedding = state.get("query_embedding") or []
     prev_miss_count = state.get("rag_miss_count", 0)
 
-    # RAG 검색 — 임베딩 없으면 스킵 (cache_node 에서 실패한 경우)
+    # RAG 검색 — rag_probe_node 가 이미 top_k=8 결과를 캐싱했으면 재사용 (ChromaDB 중복 쿼리 방지)
     rag_results: list[str] = []
     if query_embedding:
         try:
-            rag_meta = await _rag.search_with_meta(
-                query_embedding=query_embedding,
-                tenant_id=state["tenant_id"],
-                top_k=RAG_TOP_K,
-            )
+            rag_meta = state.get("rag_top_k_raw") or []
+            if not rag_meta:
+                rag_meta = await _rag.search_with_meta(
+                    query_embedding=query_embedding,
+                    tenant_id=state["tenant_id"],
+                    top_k=RAG_TOP_K,
+                )
             # Hybrid score: distance 에서 query 와 chunk metadata 의 llm_keywords 매칭만큼 차감.
             # ChromaDB metadata.llm_keywords 는 chunking 시 LLM 추출 ("메뉴, 한정식, 코스" 같은 string).
             query_text = state.get("normalized_text", "") or state.get("raw_transcript", "") or ""

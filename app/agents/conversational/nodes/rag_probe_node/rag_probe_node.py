@@ -6,7 +6,8 @@ state["rag_probe"] 로 노출한다. router 가 이 신호를 보고 더 정확�
 
 신호 (state["rag_probe"]):
     {
-        "top_distance": float,           # cosine distance, 0~2 (낮을수록 유사)
+        "top_distance": float,           # ChromaDB 기본 L2² distance (0~4 범위);
+                                         # BGE-M3 정규화 벡터 기준 L2² ≈ 2 × cosine_distance
         "matched_keywords": list[str],   # query 와 chunk.llm_keywords substring 매칭
         "top_topic": str,                # chunk.llm_topic (clarify 유도질문용)
         "top_title": str,                # chunk.llm_title (디버그)
@@ -30,83 +31,21 @@ from typing import Optional
 from app.agents.conversational.state import CallState
 from app.services.rag.base import BaseRAGService
 from app.services.rag.chroma import ChromaRAGService
-from app.services.tts.channel import tts_channel
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
 _rag: BaseRAGService = ChromaRAGService()
 
-PROBE_TOP_K = 3
+PROBE_TOP_K = 8           # faq_branch 와 동일한 top_k — 결과를 state 에 캐싱해 재사용
 PROBE_TIMEOUT_SEC = 1.0  # 5초 hardcut 안전 마진. ChromaDB local query ~30~80ms 추정.
-
-# 차등 stall (architect Phase C) — 명백한 신호일 때만 audio_field 변경, 그 외 general.
-_STALL_DIFF_DISTANCE_THRESHOLD = 0.4
-_STALL_DIFF_MIN_KEYWORDS = 2
-# top_topic 키워드 → audio_field 매핑. 명백한 task/auth 키워드만 등록.
-# 매칭 없으면서 신호는 강한 경우 → "faq" (정보 안내) 로 fallback.
-_TOPIC_TO_FIELD: list[tuple[str, str]] = [
-    ("예약", "task"), ("접수", "task"), ("신청", "task"),
-    ("변경", "task"), ("취소", "task"), ("조회", "task"), ("주문", "task"),
-    ("인증", "auth"), ("본인", "auth"), ("회원", "auth"),
-]
-_STALL_FALLBACK_TEXT = "잠시만요, 확인해 드리겠습니다."
-
-
-def _select_stall_field(probe: Optional[dict], stall_messages: dict) -> str:
-    """rag_probe 신호 + tenant 가용 stall_messages 키 기반 audio_field 선택.
-
-    보수 규칙: top_distance < 0.4 AND matched_keywords ≥ 2 일 때만 차등.
-    매핑 결과 키가 stall_messages 에 없으면 general 로 fallback.
-    """
-    if not probe:
-        return "general"
-    distance = probe.get("top_distance")
-    matched = probe.get("matched_keywords") or []
-    topic = probe.get("top_topic") or ""
-
-    if (
-        distance is None
-        or distance >= _STALL_DIFF_DISTANCE_THRESHOLD
-        or len(matched) < _STALL_DIFF_MIN_KEYWORDS
-    ):
-        return "general"
-
-    for kw, field in _TOPIC_TO_FIELD:
-        if kw in topic:
-            return field if field in stall_messages else "general"
-    # 매핑 없지만 신호는 강함 → 정보 안내 류 (faq)
-    if topic and "faq" in stall_messages:
-        return "faq"
-    return "general"
-
-
-def _spawn_stall(state: CallState, audio_field: str) -> None:
-    """stall 발화 spawn — fire-and-forget. push_stall '턴당 1회' 가드가 중복 차단."""
-    stall_messages = state.get("stall_messages") or {}
-    text = (
-        stall_messages.get(audio_field)
-        or stall_messages.get("general")
-        or _STALL_FALLBACK_TEXT
-    )
-    asyncio.create_task(
-        tts_channel.push_stall(
-            call_id=state["call_id"],
-            text=text,
-            audio_field=audio_field,
-        ),
-        name=f"stall:{state['call_id']}:{audio_field}",
-    )
 
 
 async def rag_probe_node(state: CallState) -> dict:
     call_id = state["call_id"]
     query_embedding = state.get("query_embedding") or []
-    stall_messages = state.get("stall_messages") or {}
 
     if not query_embedding:
-        # 임베딩 부재 → probe skip, stall 은 general 로 즉시 발화
-        _spawn_stall(state, "general")
         return {"rag_probe": None}
 
     try:
@@ -120,15 +59,12 @@ async def rag_probe_node(state: CallState) -> dict:
         )
     except asyncio.TimeoutError:
         logger.warning("rag_probe timeout call_id=%s", call_id)
-        _spawn_stall(state, "general")
         return {"rag_probe": None}
     except Exception as e:
         logger.error("rag_probe error call_id=%s: %s", call_id, e)
-        _spawn_stall(state, "general")
         return {"rag_probe": None}
 
     if not results:
-        _spawn_stall(state, "general")
         return {"rag_probe": None}
 
     top = results[0]
@@ -137,7 +73,6 @@ async def rag_probe_node(state: CallState) -> dict:
     keywords = [k.strip() for k in (meta.get("llm_keywords") or "").split(",") if k.strip()]
     matched = [kw for kw in keywords if kw in query_text]
 
-    # is_auth: ChromaDB 저장 시 bool 또는 미설정("") 가능 — 모두 bool 로 정규화
     is_auth_raw = meta.get("is_auth", False)
     is_auth = is_auth_raw is True or str(is_auth_raw).lower() == "true"
 
@@ -150,13 +85,10 @@ async def rag_probe_node(state: CallState) -> dict:
         "is_auth": is_auth,
     }
 
-    field = _select_stall_field(probe, stall_messages)
-    _spawn_stall(state, field)
-
     logger.info(
-        "rag_probe call_id=%s distance=%.3f matched=%s topic=%r is_auth=%s stall_field=%s",
+        "rag_probe call_id=%s distance=%.3f matched=%s topic=%r is_auth=%s",
         call_id,
         probe["top_distance"] if probe["top_distance"] is not None else -1.0,
-        matched, probe["top_topic"], is_auth, field,
+        matched, probe["top_topic"], is_auth,
     )
-    return {"rag_probe": probe}
+    return {"rag_probe": probe, "rag_top_k_raw": results}

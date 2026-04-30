@@ -16,15 +16,11 @@ from typing import Optional
 
 from fastapi import WebSocket
 
-from app.services.session.redis_session import RedisSessionService
 from app.services.tts.base import BaseTTSOutputChannel, BaseTTSService
 from app.utils.config import settings
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
-
-# stall 사전 음원 lazy cache 용 — push_stall 이 합성 전 조회, miss 시 합성 후 write-back.
-_session = RedisSessionService()
 
 # Twilio Media Stream chunk 권장 크기: 160 bytes per 20ms at μ-law 8kHz
 _TWILIO_CHUNK_BYTES = 160
@@ -51,7 +47,6 @@ class TwilioTTSOutputChannel(BaseTTSOutputChannel):
         self._injected_tts = tts_service
         self._tts: Optional[BaseTTSService] = tts_service
         self._bindings: dict[str, _CallBinding] = {}
-        self._stall_emitted: dict[str, bool] = {}
 
     def _get_tts(self) -> BaseTTSService:
         if self._tts is None:
@@ -81,94 +76,13 @@ class TwilioTTSOutputChannel(BaseTTSOutputChannel):
             tenant_id=tenant_id,
             lock=asyncio.Lock(),
         )
-        self._stall_emitted[call_id] = False
         logger.info("tts_channel opened call_id=%s stream_sid=%s", call_id, stream_sid)
 
     async def flush(self, call_id: str) -> None:
         self._bindings.pop(call_id, None)
-        self._stall_emitted.pop(call_id, None)
         logger.info("tts_channel flushed call_id=%s", call_id)
 
     # ── emit ──────────────────────────────────────────────────
-
-    async def push_stall(self, call_id: str, text: str, audio_field: str) -> None:
-        if call_id not in self._bindings:
-            logger.warning("push_stall on un-opened call_id=%s — ignored", call_id)
-            return
-        if self._stall_emitted.get(call_id):
-            logger.debug("stall already emitted for call_id=%s — skip", call_id)
-            return
-        self._stall_emitted[call_id] = True
-
-        # 사전 음원 lazy cache 조회 — hit 시 Azure TTS API skip, ~10ms 만에 송신 시작.
-        # miss 시 합성 후 write-back (다음 호출부터 hit).
-        tenant_id = self._bindings[call_id].tenant_id
-        cached_audio = await _session.get_stall_audio(tenant_id, audio_field)
-        cache_status = "hit" if cached_audio is not None else "miss"
-        logger.info(
-            "push_stall (%s) call_id=%s field=%s text=%r",
-            cache_status, call_id, audio_field, text[:200],
-        )
-
-        if cached_audio is not None:
-            await self._send_audio_bytes(
-                call_id, cached_audio, text, tag=f"stall:{audio_field}"
-            )
-            return
-
-        try:
-            audio = await self._get_tts().synthesize(text)
-        except Exception as e:
-            logger.error(
-                "tts synthesize failed call_id=%s field=%s: %s",
-                call_id, audio_field, e,
-            )
-            return
-        await self._send_audio_bytes(call_id, audio, text, tag=f"stall:{audio_field}")
-        # write-back fire-and-forget — 송신 실패해도 cache 만 채우면 다음 호출 빠름.
-        asyncio.create_task(
-            _session.set_stall_audio(tenant_id, audio_field, audio),
-            name=f"stall_cache_writeback:{call_id}:{audio_field}",
-        )
-
-    async def push_ack(self, call_id: str, text: str, audio_field: str) -> None:
-        """Acknowledgment 오디오 방출 — turn-once 가드 없음 (push_stall 과 동시 방출 가능).
-
-        캐시 패턴은 push_stall 과 동일 (tenant:{id}:stall_audio_cache).
-        모든 오류 best-effort — 로그 후 조용히 반환.
-        """
-        if call_id not in self._bindings:
-            logger.warning("push_ack on un-opened call_id=%s — ignored", call_id)
-            return
-
-        tenant_id = self._bindings[call_id].tenant_id
-        cached_audio = await _session.get_stall_audio(tenant_id, audio_field)
-        cache_status = "hit" if cached_audio is not None else "miss"
-        logger.info(
-            "push_ack (%s) call_id=%s field=%s text=%r",
-            cache_status, call_id, audio_field, text[:200],
-        )
-
-        if cached_audio is not None:
-            await self._send_audio_bytes(
-                call_id, cached_audio, text, tag=f"ack:{audio_field}"
-            )
-            return
-
-        try:
-            audio = await self._get_tts().synthesize(text)
-        except Exception as e:
-            logger.warning(
-                "push_ack tts synthesize failed call_id=%s field=%s: %s",
-                call_id, audio_field, e,
-            )
-            return
-        await self._send_audio_bytes(call_id, audio, text, tag=f"ack:{audio_field}")
-        # write-back fire-and-forget — 다음 호출 빠른 응답을 위해 캐시에 저장.
-        asyncio.create_task(
-            _session.set_stall_audio(tenant_id, audio_field, audio),
-            name=f"ack_cache_writeback:{call_id}:{audio_field}",
-        )
 
     async def push_response(self, call_id: str, text: str, response_path: str) -> None:
         if call_id not in self._bindings:

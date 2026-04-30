@@ -13,13 +13,11 @@
 
 LLM 없음. 목표 레이턴시 ~50ms.
 """
-import asyncio
 import re
 import time
 from typing import Optional
 
 from app.agents.conversational.state import CallState
-from app.services.tts.channel import tts_channel
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -28,25 +26,25 @@ logger = get_logger(__name__)
 # clarify 역질문 턴 상한. 초과 시 바로 escalation 분기.
 MAX_CLARIFY_TURNS = 6
 
-# ambiguity gate 파라미터
-_AMBIGUITY_DISTANCE_THRESHOLD = 0.95   # rag_probe.top_distance > this → 잠재적 모호
-_AMBIGUITY_MAX_LEN = 4                 # refined_text 길이 ≤ this → 잠재적 모호
+# ambiguity gate 파라미터 (2026-04-30 보수: short/long/mid 구간 차등)
+_AMBIGUITY_DISTANCE_THRESHOLD = 0.95   # rag_probe.top_distance ≤ this → RAG 강신호로 명확
+_AMBIGUITY_MID_DISTANCE = 0.85         # 중간 길이 발화 + is_auth 동반 검증 임계값
+_AMBIGUITY_SHORT_LEN = 4               # ≤ this: 신호 약하면 모호 후보 유지
 
 # 단독으로 왔을 때 모호 신호인 필러 집합 (정제 후 텍스트 전체가 이 중 하나이면 모호)
 _FILLER_ONLY_PATTERNS: set[str] = {
     "네", "응", "어", "음", "글쎄", "그게", "아", "예", "맞아", "아니", "아니요",
 }
 
-# 선두 필러 제거 정규식 — 음/어/그/저. 다음 문자가 반드시 공백/문자열 끝이어야 함
-# (lookahead) — 그렇지 않으면 "그게", "어떻게" 같은 정상 단어의 첫 음절을 잘못 제거함
-# (예: 옛 패턴 `^(음|어|그|저)\s*` 는 "그게 뭐냐면" 의 "그" 만 잘라 "게 뭐냐면" 생성).
-_FILLER_PREFIX_RE = re.compile(r"^(음|어|그|저)(?:\s+|$)")
-
-# ack stall 하드코딩 폴백 텍스트.
-# 사용자 피드백 (server_123844.log): "이해했어요" 부분이 중복·과하다는 인상.
-# rag_probe 의 stall ("잠시만요, 확인해 드리겠습니다") 직후에 별도 ack 가 한 번 더 발사
-# 되므로 짧고 단순한 "잠시만요." 로 충분 — 시스템이 처리 중임을 자연스럽게 전달.
-_ACK_FALLBACK_TEXT = "잠시만요."
+# 선두 필러 제거 정규식 — 음/어/그/저.
+# 단발 패턴: 다음 문자가 공백/문자열 끝이어야 함 (lookahead).
+#   → "그게", "어떻게" 같은 정상 단어의 첫 음절 보호.
+#   (옛 패턴 `^(음|어|그|저)\s*` 는 "그게 뭐냐면" 의 "그" 만 잘라 "게 뭐냐면" 생성)
+_FILLER_SINGLE_RE = re.compile(r"^(음|어|그|저)(?:\s+|$)")
+# 반복 패턴: 같은 필러 2회 이상 (\1 백레퍼런스). 공백 없이도 매칭.
+#   → "어어대중교통" → "대중교통" 처리 가능.
+#   "어떻게" 처럼 1회만 등장하는 정상 단어는 \1+ 가 추가 매칭 안 되어 보호.
+_FILLER_REPEAT_RE = re.compile(r"^(음|어|그|저)\1+(?:\s*|(?=\S))")
 
 
 # ── 내부 헬퍼 ────────────────────────────────────────────────────────────────
@@ -64,12 +62,19 @@ def _normalize_text(raw: str, tenant_keyterms: list[str]) -> str:
     """
     text = raw.strip()
 
-    # 선두 필러 반복 제거 (예: "음 어 그게 뭐냐면" → "그게 뭐냐면" → "뭐냐면"은 아님,
-    # 패턴이 "음|어|그|저" 단독이므로 "그게" 는 걸리지 않음)
-    prev = None
-    while prev != text:
-        prev = text
-        text = _FILLER_PREFIX_RE.sub("", text)
+    # 선두 필러 제거 — 반복 필러("어어") 우선, 단발 필러("어 ") 후순위.
+    # "어어대중교통" 처럼 같은 필러가 연속되면 _FILLER_REPEAT_RE 가 한 번에 잡고,
+    # "음 어 안녕하세요" 처럼 다른 필러가 공백으로 이어지면 _FILLER_SINGLE_RE 반복으로 제거.
+    while True:
+        new_text = _FILLER_REPEAT_RE.sub("", text, count=1)
+        if new_text != text:
+            text = new_text.lstrip()
+            continue
+        new_text = _FILLER_SINGLE_RE.sub("", text, count=1)
+        if new_text != text:
+            text = new_text.lstrip()
+            continue
+        break
     text = text.strip()
 
     # tenant 키텀 띄어쓰기 정정 — 길이 내림차순으로 처리.
@@ -117,44 +122,51 @@ def _is_ambiguous(
     Returns:
         (is_ambiguous, reason)
 
-    모호 판정 조건 (모두 충족 시 True):
-      A. len(refined) ≤ _AMBIGUITY_MAX_LEN  OR  refined ∈ _FILLER_ONLY_PATTERNS
-      B. rag_probe 없거나  top_distance > _AMBIGUITY_DISTANCE_THRESHOLD
-      C. matched_keywords 없음
-      D. is_auth 플래그 없음
-      E. auth_pending=False
+    명확(False) 신호 우선순위 — 발견 즉시 반환:
+      1. auth_pending=True                                  → "auth_pending"
+      2. SHORT_LEN(4) < len AND 필러 단독 아님 AND
+         (matched_keywords 있음 OR top_distance ≤ 0.85)     → "sufficient_with_signal"
+      3. is_auth=True AND top_distance ≤ MID_DISTANCE(0.85) → "rag_auth_signal"
+      4. matched_keywords 있음                              → "matched_keywords_present"
+      5. top_distance ≤ DISTANCE_THRESHOLD(0.95)            → "rag_strong"
+
+    위 어느 신호도 없으면 모호(True):
+      reason="filler_only" (필러 단독) 또는 "short_no_signal"
+
+    길이만으로 명확 판정하는 조건 제거 — STT 오인식 긴 문장도 RAG 신호 없으면 재질문.
     """
-    # 조건 E — auth_pending 이면 명확 (auth 분기 대기 중)
+    # 1. auth_pending — auth 분기 대기 중이면 명확
     if auth_pending:
         return False, "auth_pending"
 
-    # 조건 A — 너무 짧거나 필러 단독
-    short_or_filler = len(refined) <= _AMBIGUITY_MAX_LEN or refined in _FILLER_ONLY_PATTERNS
+    length = len(refined)
+    is_filler_only = refined in _FILLER_ONLY_PATTERNS
 
-    if not short_or_filler:
-        # 길이/필러 조건 자체를 통과 못 하면 명확
-        return False, "sufficient_length"
+    probe = rag_probe or {}
+    top_distance = probe.get("top_distance")
+    matched_keywords = probe.get("matched_keywords") or []
+    is_auth = probe.get("is_auth", False)
 
-    # 조건 B, C, D — rag_probe 신호 확인
-    if rag_probe is not None:
-        top_distance = rag_probe.get("top_distance", 2.0)
-        matched_keywords = rag_probe.get("matched_keywords") or []
-        is_auth = rag_probe.get("is_auth", False)
+    # 2. 길이 초과 + RAG 신호 동반 검증 (길이만으로는 명확 판정 안 함)
+    if length > _AMBIGUITY_SHORT_LEN and not is_filler_only:
+        if matched_keywords or (top_distance is not None and top_distance <= _AMBIGUITY_MID_DISTANCE):
+            return False, "sufficient_with_signal"
+        # 신호 약함 → 다음 조건 평가 (모호 후보 유지)
 
-        # 조건 D — auth 관련 청크 매칭
-        if is_auth:
-            return False, "rag_auth_signal"
+    # 4. is_auth + distance 동반 검증 — 약한 매칭에서는 무시
+    if is_auth and top_distance is not None and top_distance <= _AMBIGUITY_MID_DISTANCE:
+        return False, "rag_auth_signal"
 
-        # 조건 C — 키워드 매칭 있으면 명확
-        if matched_keywords:
-            return False, "matched_keywords_present"
+    # 5. matched_keywords 있음 → 명확
+    if matched_keywords:
+        return False, "matched_keywords_present"
 
-        # 조건 B — RAG 신호 강하면 명확
-        if top_distance <= _AMBIGUITY_DISTANCE_THRESHOLD:
-            return False, "rag_strong"
+    # 6. RAG 강신호 → 명확
+    if top_distance is not None and top_distance <= _AMBIGUITY_DISTANCE_THRESHOLD:
+        return False, "rag_strong"
 
-    # 모든 조건 충족 — 모호
-    reason = "filler_only" if refined in _FILLER_ONLY_PATTERNS else "short_no_signal"
+    # 모든 신호 약함 → 모호
+    reason = "filler_only" if is_filler_only else "short_no_signal"
     return True, reason
 
 
@@ -173,25 +185,6 @@ def _force_escalation_if_clarify_exhausted(state: CallState) -> Optional[dict]:
         }
     return None
 
-
-def _spawn_ack_stall(
-    call_id: str,
-    tenant_id: str,
-    stall_messages: dict,
-) -> None:
-    """ack stall fire-and-forget. push_ack 는 turn-once 가드 없음 — stall 과 동시 방출 가능.
-
-    stall_messages["understood"] 가 있으면 그 텍스트를 사용, 없으면 하드코딩 폴백.
-    """
-    text = stall_messages.get("understood") or _ACK_FALLBACK_TEXT
-    asyncio.create_task(
-        tts_channel.push_ack(
-            call_id=call_id,
-            text=text,
-            audio_field="understood",
-        ),
-        name=f"ack:{call_id}",
-    )
 
 
 # ── 노드 진입점 ───────────────────────────────────────────────────────────────
@@ -234,11 +227,6 @@ async def query_refine_node(state: CallState) -> dict:
 
     # 6. ambiguity gate
     is_amb, reason = _is_ambiguous(refined, probe, auth_pending)
-
-    # 7. 명확한 경우 ack stall fire-and-forget
-    if not is_amb:
-        stall_messages: dict = state.get("stall_messages") or {}
-        _spawn_ack_stall(call_id, state["tenant_id"], stall_messages)
 
     elapsed_ms = (time.monotonic() - t0) * 1000
     logger.info(
