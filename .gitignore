@@ -69,3 +69,5 @@ secrets/
 voice/
 
 tmp/
+
+.env_2
