@@ -52,6 +52,13 @@ class VisionUploadSessionStore:
         )
         return data
 
+    async def get_upload_session(self, token_hash: str) -> dict | None:
+        key = _upload_key(token_hash)
+        data = await self._redis.hgetall(key)
+        if not data:
+            return None
+        return data
+
     async def set_call_vision_status(self, call_id: str, status: str) -> None:
         key = _call_session_key(call_id)
         try:

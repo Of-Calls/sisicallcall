@@ -31,6 +31,18 @@ class VisionUploadSessionResponse(BaseModel):
     status: str
 
 
+class VisionUploadSessionStatusResponse(BaseModel):
+    status: str
+    expires_at: str
+    used: bool
+
+
+def _parse_redis_bool(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).lower() == "true"
+
+
 def _build_upload_url(token: str) -> str:
     base_url = settings.vision_upload_base_url.rstrip("/")
     path_prefix = settings.vision_upload_path_prefix.strip("/")
@@ -85,4 +97,38 @@ async def create_upload_session(body: VisionUploadSessionRequest):
         expires_in_sec=expires_in_sec,
         sms_sent=bool(sms_sent),
         status=VISION_STATUS_WAITING_UPLOAD,
+    )
+
+
+@router.get("/upload-sessions/{token}", response_model=VisionUploadSessionStatusResponse)
+async def get_upload_session(token: str):
+    token_hash = hash_upload_token(token)
+
+    try:
+        session = await _session_store.get_upload_session(token_hash)
+    except Exception as e:
+        logger.exception(
+            "vision upload session lookup failed token_hash=%s: %s",
+            token_hash,
+            e,
+        )
+        raise HTTPException(status_code=500, detail="vision upload session lookup failed")
+
+    if not session:
+        raise HTTPException(
+            status_code=404,
+            detail="vision upload session not found or expired",
+        )
+
+    used = _parse_redis_bool(session.get("used", "false"))
+    if used:
+        raise HTTPException(
+            status_code=409,
+            detail="vision upload session already used",
+        )
+
+    return VisionUploadSessionStatusResponse(
+        status=session.get("status", VISION_STATUS_WAITING_UPLOAD),
+        expires_at=session.get("expires_at", ""),
+        used=used,
     )
