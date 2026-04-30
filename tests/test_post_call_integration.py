@@ -40,7 +40,7 @@ def reset_stores():
 
 
 @pytest.fixture(autouse=True)
-def force_post_call_integration_mock_mode(monkeypatch):
+def force_post_call_integration_mock_mode(monkeypatch, tmp_path):
     for key in (
         "GMAIL_MCP_REAL",
         "CALENDAR_MCP_REAL",
@@ -54,6 +54,8 @@ def force_post_call_integration_mock_mode(monkeypatch):
         "POST_CALL_ENABLE_NOTION_RECORD",
     ):
         monkeypatch.setenv(key, "false")
+    monkeypatch.setenv("MCP_ACTION_LOG_STORE", "file")
+    monkeypatch.setenv("MCP_ACTION_LOG_FILE", str(tmp_path / "mcp_action_logs.json"))
 
 
 # ── post-call 전용 TestClient ─────────────────────────────────────────────────
