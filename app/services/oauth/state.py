@@ -8,6 +8,7 @@ from __future__ import annotations
 import secrets
 import time
 from dataclasses import dataclass, field
+from typing import Any
 
 _TTL_SECONDS = 600  # 10분
 
@@ -17,6 +18,7 @@ class _StateEntry:
     tenant_id: str
     provider: str
     return_url: str
+    payload: dict[str, Any] = field(default_factory=dict)
     created_at: float = field(default_factory=time.monotonic)
 
     def is_expired(self) -> bool:
@@ -26,7 +28,12 @@ class _StateEntry:
 _state_store: dict[str, _StateEntry] = {}
 
 
-def create_oauth_state(tenant_id: str, provider: str, return_url: str = "") -> str:
+def create_oauth_state(
+    tenant_id: str,
+    provider: str,
+    return_url: str = "",
+    payload: dict[str, Any] | None = None,
+) -> str:
     """새 CSRF state 토큰을 생성·저장하고 반환한다."""
     _purge_expired()
     state = secrets.token_urlsafe(32)
@@ -34,6 +41,7 @@ def create_oauth_state(tenant_id: str, provider: str, return_url: str = "") -> s
         tenant_id=tenant_id,
         provider=provider,
         return_url=return_url,
+        payload=payload or {},
     )
     return state
 

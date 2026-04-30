@@ -69,7 +69,12 @@ class JiraOAuth(BaseOAuthProvider):
             resp.raise_for_status()
             data = resp.json()
 
-        workspace_id, workspace_name = await self._fetch_workspace(data["access_token"])
+        resources = await self.fetch_accessible_resources(data["access_token"])
+        workspace_id = ""
+        workspace_name = ""
+        if len(resources) == 1:
+            workspace_id = resources[0].get("id", "")
+            workspace_name = resources[0].get("name", "")
 
         return TokenResult(
             access_token=data["access_token"],
@@ -79,7 +84,7 @@ class JiraOAuth(BaseOAuthProvider):
             token_type=data.get("token_type", "Bearer"),
             external_workspace_id=workspace_id,
             external_workspace_name=workspace_name,
-            raw=data,
+            raw={**data, "accessible_resources": resources},
         )
 
     async def refresh_token(self, refresh_token: str) -> TokenResult:
@@ -102,7 +107,7 @@ class JiraOAuth(BaseOAuthProvider):
             raw=data,
         )
 
-    async def _fetch_workspace(self, access_token: str) -> tuple[str, str]:
+    async def fetch_accessible_resources(self, access_token: str) -> list[dict]:
         try:
             async with httpx.AsyncClient() as client:
                 resp = await client.get(
@@ -111,9 +116,22 @@ class JiraOAuth(BaseOAuthProvider):
                 )
                 resp.raise_for_status()
                 resources = resp.json()
-            if resources:
-                first = resources[0]
-                return first.get("id", ""), first.get("name", "")
+            return [
+                {
+                    "id": item.get("id", ""),
+                    "name": item.get("name", ""),
+                    "url": item.get("url", ""),
+                    "scopes": item.get("scopes", []),
+                }
+                for item in resources
+                if isinstance(item, dict)
+            ]
         except Exception as exc:
             logger.warning("Jira accessible-resources 조회 실패: %s", exc)
+        return []
+
+    async def _fetch_workspace(self, access_token: str) -> tuple[str, str]:
+        resources = await self.fetch_accessible_resources(access_token)
+        if len(resources) == 1:
+            return resources[0].get("id", ""), resources[0].get("name", "")
         return "", ""

@@ -10,7 +10,7 @@ Jira MCP Connector.
   JIRA_MCP_REAL=true  + MCP_USE_TENANT_OAUTH=false → skipped("tenant_oauth_required")
   JIRA_MCP_REAL=true  + MCP_USE_TENANT_OAUTH=true + tenant_id 없음 → skipped("tenant_oauth_required")
   JIRA_MCP_REAL=true  + MCP_USE_TENANT_OAUTH=true + integration 없음 → skipped("tenant_integration_not_connected")
-  JIRA_MCP_REAL=true  + MCP_USE_TENANT_OAUTH=true + cloud_id/base_url 없음 → skipped("jira_site_not_configured")
+  JIRA_MCP_REAL=true  + MCP_USE_TENANT_OAUTH=true + workspace 미선택 → skipped("jira_workspace_not_selected")
   JIRA_MCP_REAL=true  + MCP_USE_TENANT_OAUTH=true + integration 있음 → Jira API 호출
 
 ── env API token fallback 없음 ─────────────────────────────────────────────
@@ -23,19 +23,13 @@ Jira MCP Connector.
     2) integration.metadata["cloudId"]
     3) integration.external_workspace_id   ← Atlassian OAuth 저장 시 cloud_id
 
-  base_url 탐색 순서 (cloud_id 없을 때):
-    1) integration.metadata["base_url"]
-    2) integration.metadata["site_url"]
-    3) integration.metadata["url"]
-    4) JIRA_BASE_URL env
-
   cloud_id → https://api.atlassian.com/ex/jira/{cloud_id}/rest/api/3/issue
-  base_url → {base_url}/rest/api/3/issue
-  없으면  → skipped("jira_site_not_configured")
+  없으면  → skipped("jira_workspace_not_selected")
 
 ── 필수 env ──────────────────────────────────────────────────────────────
   JIRA_PROJECT_KEY  — 이슈 생성 프로젝트 키 (기본값 "VOC")
   JIRA_ISSUE_TYPE   — 이슈 타입 (기본값 "Task")
+  JIRA_ISSUE_TYPE_ID — 이슈 타입 ID (설정 시 JIRA_ISSUE_TYPE 대신 사용)
 
 ── mock mode ─────────────────────────────────────────────────────────────────
   status: success
@@ -127,32 +121,32 @@ class JiraConnector(BaseMCPConnector):
 
         # API endpoint 결정
         meta: dict = getattr(integration, "metadata", None) or {}
+        if meta.get("workspace_selection_required") is True:
+            logger.warning(
+                "JiraConnector: Jira workspace not selected call_id=%s tenant_id=%s",
+                call_id,
+                tenant_id,
+            )
+            return self._skipped("jira_workspace_not_selected")
+
         cloud_id = (
             meta.get("cloud_id")
             or meta.get("cloudId")
             or getattr(integration, "external_workspace_id", None)
             or ""
         )
-        base_url = (
-            meta.get("base_url")
-            or meta.get("site_url")
-            or meta.get("url")
-            or os.getenv("JIRA_BASE_URL", "")
-        )
-
-        if cloud_id:
-            api_url = f"https://api.atlassian.com/ex/jira/{cloud_id}/rest/api/3/issue"
-        elif base_url:
-            api_url = f"{base_url.rstrip('/')}/rest/api/3/issue"
-        else:
+        if not cloud_id:
             logger.warning(
-                "JiraConnector: Jira site 설정 없음 call_id=%s tenant_id=%s",
+                "JiraConnector: Jira workspace not selected call_id=%s tenant_id=%s",
                 call_id, tenant_id,
             )
-            return self._skipped("jira_site_not_configured")
+            return self._skipped("jira_workspace_not_selected")
+
+        api_url = f"https://api.atlassian.com/ex/jira/{cloud_id}/rest/api/3/issue"
 
         project_key = os.getenv("JIRA_PROJECT_KEY", "VOC")
         issue_type = os.getenv("JIRA_ISSUE_TYPE", "Task")
+        issue_type_id = os.getenv("JIRA_ISSUE_TYPE_ID", "").strip()
         summary = (
             params.get("summary")
             or params.get("title")
@@ -172,6 +166,7 @@ class JiraConnector(BaseMCPConnector):
             api_url=api_url,
             project_key=project_key,
             issue_type=issue_type,
+            issue_type_id=issue_type_id,
             summary=summary,
             description_text=description_text,
             labels=labels,
@@ -187,6 +182,7 @@ class JiraConnector(BaseMCPConnector):
         api_url: str,
         project_key: str,
         issue_type: str,
+        issue_type_id: str,
         summary: str,
         description_text: str,
         labels: list,
@@ -195,10 +191,11 @@ class JiraConnector(BaseMCPConnector):
         """Jira Cloud REST API v3 issue create를 호출한다. token은 로그에 출력하지 않는다."""
         import httpx
 
+        issuetype_field = {"id": issue_type_id} if issue_type_id else {"name": issue_type}
         body = {
             "fields": {
                 "project": {"key": project_key},
-                "issuetype": {"name": issue_type},
+                "issuetype": issuetype_field,
                 "summary": summary,
                 "description": {
                     "type": "doc",
@@ -215,6 +212,15 @@ class JiraConnector(BaseMCPConnector):
         }
 
         try:
+            logger.debug(
+                "JiraConnector: create issue request call_id=%s project=%s issue_type=%s issue_type_id=%s summary=%s labels=%s",
+                call_id,
+                project_key,
+                issue_type,
+                issue_type_id or "",
+                summary,
+                labels,
+            )
             async with httpx.AsyncClient() as client:
                 resp = await client.post(
                     api_url,
@@ -228,9 +234,12 @@ class JiraConnector(BaseMCPConnector):
                 )
 
             if resp.status_code not in (200, 201):
+                body_preview = (getattr(resp, "text", "") or "")[:1000]
                 logger.error(
-                    "JiraConnector: HTTP 오류 call_id=%s status=%d",
-                    call_id, resp.status_code,
+                    "JiraConnector: HTTP 오류 call_id=%s status=%d body=%s",
+                    call_id,
+                    resp.status_code,
+                    body_preview,
                 )
                 return self._failed(f"jira_http_error:{resp.status_code}")
 
