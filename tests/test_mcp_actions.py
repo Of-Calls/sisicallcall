@@ -1,4 +1,5 @@
 import pytest
+import app.repositories.mcp_action_log_repo as mcp_action_log_repo
 from app.agents.post_call.actions.executor import ActionExecutor, execute_actions
 from app.agents.post_call.actions.gmail_action import GmailAction
 from app.agents.post_call.actions.company_db_action import CompanyDBAction
@@ -25,6 +26,13 @@ def _clear_real_mode_envs(monkeypatch):
     monkeypatch.delenv("POST_CALL_ENABLE_NOTION_RECORD", raising=False)
 
 
+@pytest.fixture(autouse=True)
+def _reset_mcp_action_logs():
+    mcp_action_log_repo._reset()
+    yield
+    mcp_action_log_repo._reset()
+
+
 def _force_mcp_actions_mock_mode(monkeypatch) -> None:
     """모든 MCP connector를 강제로 mock 모드로 고정한다 (delenv 대신 setenv false)."""
     for key in (
@@ -34,6 +42,45 @@ def _force_mcp_actions_mock_mode(monkeypatch) -> None:
         "MCP_USE_TENANT_OAUTH", "POST_CALL_ENABLE_NOTION_RECORD",
     ):
         monkeypatch.setenv(key, "false")
+
+
+class _CountingAction:
+    def __init__(self, external_id: str = "new-external-id") -> None:
+        self.calls = 0
+        self.external_id = external_id
+
+    async def execute(self, action, *, call_id, tenant_id=""):
+        self.calls += 1
+        return {
+            "status": "success",
+            "external_id": self.external_id,
+            "result": {"called": self.calls, "call_id": call_id},
+        }
+
+
+async def _seed_action_log(
+    *,
+    call_id: str,
+    action_type: str,
+    tool: str,
+    status: str,
+    external_id: str | None = "previous-external-id",
+) -> None:
+    await mcp_action_log_repo.save_action_logs(
+        call_id=call_id,
+        tenant_id="tenant-test",
+        executed_actions=[
+            {
+                "action_type": action_type,
+                "tool": tool,
+                "params": {},
+                "status": status,
+                "external_id": external_id if status == "success" else None,
+                "result": {"seeded": True},
+                "error": None if status == "success" else status,
+            }
+        ],
+    )
 
 
 @pytest.fixture
@@ -437,6 +484,175 @@ async def test_register_new_handler_and_execute():
         assert results[0]["external_id"] == "dummy-reg-001"
     finally:
         unregister("dummy_test")
+
+
+@pytest.mark.asyncio
+async def test_executor_skips_action_when_same_call_type_tool_already_succeeded(executor):
+    tool = "idempotency_fake_success"
+    action_type = "send_manager_email"
+    handler = _CountingAction()
+    await _seed_action_log(
+        call_id="idem-001",
+        action_type=action_type,
+        tool=tool,
+        status="success",
+        external_id="prev-001",
+    )
+
+    register(tool, handler)
+    try:
+        results = await executor.execute_actions(
+            call_id="idem-001",
+            tenant_id="tenant-test",
+            actions=[{"action_type": action_type, "tool": tool, "params": {}}],
+        )
+    finally:
+        unregister(tool)
+
+    assert handler.calls == 0
+    assert results[0]["status"] == "skipped"
+    assert results[0]["error"] == "already_succeeded"
+    assert results[0]["external_id"] is None
+    assert results[0]["result"]["idempotency"] == "already_succeeded"
+    assert results[0]["result"]["previous_external_id"] == "prev-001"
+    assert results[0]["result"]["previous_status"] == "success"
+
+
+@pytest.mark.asyncio
+async def test_executor_retries_when_previous_log_failed(executor):
+    tool = "idempotency_fake_failed"
+    action_type = "send_manager_email"
+    handler = _CountingAction("new-after-failed")
+    await _seed_action_log(
+        call_id="idem-002",
+        action_type=action_type,
+        tool=tool,
+        status="failed",
+        external_id=None,
+    )
+
+    register(tool, handler)
+    try:
+        results = await executor.execute_actions(
+            call_id="idem-002",
+            tenant_id="tenant-test",
+            actions=[{"action_type": action_type, "tool": tool, "params": {}}],
+        )
+    finally:
+        unregister(tool)
+
+    assert handler.calls == 1
+    assert results[0]["status"] == "success"
+    assert results[0]["external_id"] == "new-after-failed"
+
+
+@pytest.mark.asyncio
+async def test_executor_retries_when_previous_log_skipped(executor):
+    tool = "idempotency_fake_skipped"
+    action_type = "send_manager_email"
+    handler = _CountingAction("new-after-skipped")
+    await _seed_action_log(
+        call_id="idem-003",
+        action_type=action_type,
+        tool=tool,
+        status="skipped",
+        external_id=None,
+    )
+
+    register(tool, handler)
+    try:
+        results = await executor.execute_actions(
+            call_id="idem-003",
+            tenant_id="tenant-test",
+            actions=[{"action_type": action_type, "tool": tool, "params": {}}],
+        )
+    finally:
+        unregister(tool)
+
+    assert handler.calls == 1
+    assert results[0]["status"] == "success"
+    assert results[0]["external_id"] == "new-after-skipped"
+
+
+@pytest.mark.asyncio
+async def test_executor_runs_when_call_id_differs_from_success_log(executor):
+    tool = "idempotency_fake_call"
+    action_type = "send_manager_email"
+    handler = _CountingAction("new-different-call")
+    await _seed_action_log(
+        call_id="idem-004-previous",
+        action_type=action_type,
+        tool=tool,
+        status="success",
+    )
+
+    register(tool, handler)
+    try:
+        results = await executor.execute_actions(
+            call_id="idem-004-current",
+            tenant_id="tenant-test",
+            actions=[{"action_type": action_type, "tool": tool, "params": {}}],
+        )
+    finally:
+        unregister(tool)
+
+    assert handler.calls == 1
+    assert results[0]["status"] == "success"
+    assert results[0]["external_id"] == "new-different-call"
+
+
+@pytest.mark.asyncio
+async def test_executor_runs_when_action_type_differs_from_success_log(executor):
+    tool = "idempotency_fake_action_type"
+    handler = _CountingAction("new-different-action-type")
+    await _seed_action_log(
+        call_id="idem-005",
+        action_type="send_manager_email",
+        tool=tool,
+        status="success",
+    )
+
+    register(tool, handler)
+    try:
+        results = await executor.execute_actions(
+            call_id="idem-005",
+            tenant_id="tenant-test",
+            actions=[{"action_type": "send_sms", "tool": tool, "params": {}}],
+        )
+    finally:
+        unregister(tool)
+
+    assert handler.calls == 1
+    assert results[0]["status"] == "success"
+    assert results[0]["external_id"] == "new-different-action-type"
+
+
+@pytest.mark.asyncio
+async def test_executor_runs_when_tool_differs_from_success_log(executor):
+    previous_tool = "idempotency_fake_tool_previous"
+    current_tool = "idempotency_fake_tool_current"
+    action_type = "send_manager_email"
+    handler = _CountingAction("new-different-tool")
+    await _seed_action_log(
+        call_id="idem-006",
+        action_type=action_type,
+        tool=previous_tool,
+        status="success",
+    )
+
+    register(current_tool, handler)
+    try:
+        results = await executor.execute_actions(
+            call_id="idem-006",
+            tenant_id="tenant-test",
+            actions=[{"action_type": action_type, "tool": current_tool, "params": {}}],
+        )
+    finally:
+        unregister(current_tool)
+
+    assert handler.calls == 1
+    assert results[0]["status"] == "success"
+    assert results[0]["external_id"] == "new-different-tool"
 
 
 @pytest.mark.asyncio

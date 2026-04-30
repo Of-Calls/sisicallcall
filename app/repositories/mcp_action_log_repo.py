@@ -50,11 +50,28 @@ async def save_action_logs(
     executed_actions: list[dict],
 ) -> None:
     now = _now()
-    _action_store[call_id] = [
+    entries = [
         _to_log_entry(a, call_id=call_id, tenant_id=tenant_id, now=now)
         for a in executed_actions
     ]
-    logger.debug("action_logs saved call_id=%s count=%d", call_id, len(executed_actions))
+    _action_store.setdefault(call_id, []).extend(entries)
+    logger.debug("action_logs saved call_id=%s count=%d", call_id, len(entries))
+
+
+async def find_successful_action(
+    call_id: str,
+    action_type: str,
+    tool: str,
+) -> dict | None:
+    entries = _action_store.get(call_id, [])
+    for entry in reversed(entries):
+        if (
+            entry.get("action_type") == action_type
+            and entry.get("tool_name") == tool
+            and entry.get("status") == "success"
+        ):
+            return copy.deepcopy(entry)
+    return None
 
 
 async def get_action_logs_by_call_id(call_id: str) -> list[dict]:
@@ -89,3 +106,15 @@ class MCPActionLogRepository:
 
     async def get_action_log(self, call_id: str) -> list[dict]:
         return await get_action_logs_by_call_id(call_id)
+
+    async def find_successful_action(
+        self,
+        call_id: str,
+        action_type: str,
+        tool: str,
+    ) -> dict | None:
+        return await find_successful_action(
+            call_id=call_id,
+            action_type=action_type,
+            tool=tool,
+        )

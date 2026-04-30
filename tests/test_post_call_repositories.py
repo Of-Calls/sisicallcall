@@ -129,10 +129,10 @@ async def test_save_and_get_action_logs():
     assert logs[1]["error_message"] == "smtp error"
 
 
-# ── 4. save_action_logs 재저장 시 기존 logs 교체 ──────────────────────────────
+# ── 4. save_action_logs 재저장 시 기존 logs 보존 + append ───────────────────
 
 @pytest.mark.asyncio
-async def test_save_action_logs_upsert_replaces():
+async def test_save_action_logs_appends_without_replacing():
     first = [{"action_type": "first_action", "tool": "company_db", "status": "success",
                "external_id": None, "error": None, "result": {}, "params": {}}]
     await save_action_logs("call-upsert", "tenant-x", first)
@@ -146,9 +146,10 @@ async def test_save_action_logs_upsert_replaces():
     await save_action_logs("call-upsert", "tenant-x", second)
 
     logs = await get_action_logs_by_call_id("call-upsert")
-    assert len(logs) == 2
-    assert logs[0]["action_type"] == "second_action_a"
-    assert logs[1]["action_type"] == "second_action_b"
+    assert len(logs) == 3
+    assert logs[0]["action_type"] == "first_action"
+    assert logs[1]["action_type"] == "second_action_a"
+    assert logs[2]["action_type"] == "second_action_b"
 
 
 # ── 5. upsert_dashboard_payload / get_dashboard_payload ──────────────────────

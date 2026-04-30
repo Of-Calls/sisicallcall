@@ -21,6 +21,7 @@ from app.repositories.voc_analysis_repo import (
 from app.repositories.mcp_action_log_repo import (
     MCPActionLogRepository,
     save_action_logs,
+    find_successful_action,
     get_action_logs_by_call_id,
     get_action_logs,
 )
@@ -56,6 +57,7 @@ __all__ = [
     "get_voc_by_call_id",
     # mcp_action_log
     "save_action_logs",
+    "find_successful_action",
     "get_action_logs_by_call_id",
     "get_action_logs",
     # dashboard
