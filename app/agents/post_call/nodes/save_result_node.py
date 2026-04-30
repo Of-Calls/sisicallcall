@@ -72,16 +72,75 @@ async def save_result_node(state: PostCallAgentState) -> dict:
 
 
 async def _maybe_save_summary(call_id: str, state: PostCallAgentState) -> None:
-    if state.get("summary"):  # type: ignore[call-overload]
-        await _summary_repo.save_summary(call_id, state["summary"])  # type: ignore[typeddict-item]
+    summary = _summary_payload(state)
+    if summary:
+        await _summary_repo.save_summary(
+            call_id,
+            summary,
+            tenant_id=state["tenant_id"],
+        )
 
 
 async def _maybe_save_voc(call_id: str, state: PostCallAgentState) -> None:
-    if state.get("voc_analysis"):  # type: ignore[call-overload]
-        await _voc_repo.save_voc_analysis(call_id, state["voc_analysis"])  # type: ignore[typeddict-item]
+    voc = _voc_payload(state)
+    if voc:
+        await _voc_repo.save_voc_analysis(
+            call_id,
+            voc,
+            tenant_id=state["tenant_id"],
+            partial_success=bool(state.get("partial_success", False)),  # type: ignore[call-overload]
+            failed_subagents=_failed_subagents(state),
+        )
 
 
 async def _maybe_save_actions(call_id: str, state: PostCallAgentState) -> None:
     actions = state.get("executed_actions", [])  # type: ignore[call-overload]
     if actions:
         await _action_log_repo.save_action_log(call_id, actions)
+
+
+def _summary_payload(state: PostCallAgentState) -> dict:
+    summary = dict(state.get("summary") or {})  # type: ignore[call-overload]
+    analysis = state.get("analysis_result") or {}  # type: ignore[call-overload]
+    if not summary and isinstance(analysis, dict):
+        summary = dict(analysis.get("summary") or {})
+    if not summary:
+        return {}
+
+    summary.setdefault("summary_short", "")
+    summary.setdefault("summary_detailed", None)
+    summary.setdefault("customer_intent", summary.get("intent"))
+    summary.setdefault("customer_emotion", summary.get("emotion", "neutral"))
+    summary.setdefault("resolution_status", "resolved")
+    summary.setdefault("keywords", [])
+    summary.setdefault("handoff_notes", None)
+    summary.setdefault("generation_mode", "async")
+    summary.setdefault("model_used", "demo-mock-llm")
+    return summary
+
+
+def _voc_payload(state: PostCallAgentState) -> dict:
+    voc = dict(state.get("voc_analysis") or {})  # type: ignore[call-overload]
+    analysis = state.get("analysis_result") or {}  # type: ignore[call-overload]
+    if not voc and isinstance(analysis, dict):
+        voc = dict(analysis.get("voc_analysis") or {})
+    if not voc:
+        return {}
+
+    priority = state.get("priority_result") or {}  # type: ignore[call-overload]
+    if not voc.get("priority_result") and priority:
+        voc["priority_result"] = dict(priority)
+    voc.setdefault("sentiment_result", {})
+    voc.setdefault("intent_result", {})
+    voc.setdefault("priority_result", {})
+    return voc
+
+
+def _failed_subagents(state: PostCallAgentState) -> list[str]:
+    failed: list[str] = []
+    for err in state.get("errors", []):  # type: ignore[call-overload]
+        if isinstance(err, dict):
+            node = err.get("node")
+            if node:
+                failed.append(str(node))
+    return failed
