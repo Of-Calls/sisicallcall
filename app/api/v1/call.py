@@ -5,14 +5,17 @@ from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response
 
 from app.services.stt.deepgram import DeepgramSTTService
+from app.services.tts.azure import AzureTTSService
 from app.services.vad.silero_vad import SileroVADService
 
 router = APIRouter()
 _stt = DeepgramSTTService()
+_tts = AzureTTSService()
 _vad = SileroVADService()
 
-_VAD_FRAME_BYTES = 1024  # linear16 16kHz, 512 samples
-_SILENCE_THRESHOLD = 30  # 연속 침묵 VAD 프레임 수 (~960ms)
+_VAD_FRAME_BYTES = 1024     # linear16 16kHz, 512 samples
+_SILENCE_THRESHOLD = 30     # 연속 침묵 VAD 프레임 수 (~960ms)
+_TWILIO_CHUNK_BYTES = 160   # 20ms mulaw 8kHz — Twilio 권장 단위
 
 
 @router.post("/incoming")
@@ -30,6 +33,18 @@ async def incoming_call(request: Request):
     return Response(content=twiml, media_type="application/xml")
 
 
+async def _send_audio_to_twilio(websocket: WebSocket, stream_sid: str, audio: bytes) -> None:
+    """mulaw 8kHz 음성을 20ms 청크 단위로 Twilio Media Stream에 송출."""
+    for i in range(0, len(audio), _TWILIO_CHUNK_BYTES):
+        chunk = audio[i:i + _TWILIO_CHUNK_BYTES]
+        msg = {
+            "event": "media",
+            "streamSid": stream_sid,
+            "media": {"payload": base64.b64encode(chunk).decode()},
+        }
+        await websocket.send_text(json.dumps(msg))
+
+
 @router.websocket("/ws")
 async def call_ws(websocket: WebSocket):
     await websocket.accept()
@@ -39,7 +54,8 @@ async def call_ws(websocket: WebSocket):
     pcm_buffer = bytearray()    # VAD용 (linear16 16kHz 누적)
     ratecv_state = None         # audioop.ratecv state — 8k→16k 보간 연속성 유지
     silence_count = 0
-    had_speech = False          # 현재 누적 구간에 실제 발화가 있었는지
+    had_speech = False
+    stream_sid = None
 
     try:
         while True:
@@ -51,7 +67,8 @@ async def call_ws(websocket: WebSocket):
                 print("[WS] connected")
 
             elif event == "start":
-                print("[WS] start")
+                stream_sid = msg["start"]["streamSid"]
+                print(f"[WS] start streamSid={stream_sid}")
                 audio_buffer.clear()
                 pcm_buffer.clear()
                 ratecv_state = None
@@ -62,12 +79,10 @@ async def call_ws(websocket: WebSocket):
                 mulaw = base64.b64decode(msg["media"]["payload"])
                 audio_buffer.extend(mulaw)
 
-                # mulaw 8kHz → linear16 8kHz → linear16 16kHz
                 pcm_8k = audioop.ulaw2lin(mulaw, 2)
                 pcm_16k, ratecv_state = audioop.ratecv(pcm_8k, 2, 1, 8000, 16000, ratecv_state)
                 pcm_buffer.extend(pcm_16k)
 
-                # 정확히 1024 bytes 단위로 잘라 VAD 실행 (한 청크가 여러 프레임일 수 있음)
                 while len(pcm_buffer) >= _VAD_FRAME_BYTES:
                     frame = bytes(pcm_buffer[:_VAD_FRAME_BYTES])
                     del pcm_buffer[:_VAD_FRAME_BYTES]
@@ -87,11 +102,13 @@ async def call_ws(websocket: WebSocket):
                             silence_count = 0
                             had_speech = False
 
+                            if transcript and stream_sid:
+                                tts_audio = await _tts.synthesize(transcript)
+                                print(f"[TTS] {len(tts_audio)} bytes → Twilio 송출")
+                                await _send_audio_to_twilio(websocket, stream_sid, tts_audio)
+
             elif event == "stop":
                 print("[WS] stop")
-                if audio_buffer:
-                    transcript = await _stt.transcribe(bytes(audio_buffer))
-                    print(f"[STT] 마지막 발화: '{transcript}'")
                 break
 
     except WebSocketDisconnect:
