@@ -50,13 +50,6 @@ class Settings(BaseSettings):
     titanet_similarity_threshold: float = 0.30
     titanet_enrollment_sec: float = 3.0   # voiceprint 등록에 사용할 첫 발화 누적 시간
 
-    # WebRTC VAD (주미 연구 결과 — webrtc_vad 채택). 2026-04-30 Silero 로 교체.
-    # 보존 사유: rollback 안전판 (call.py / vad_node.py 의 import 1줄 환원으로 즉시 복구).
-    webrtc_mode: int = 3                        # aggressiveness 0~3 (3: 최대 잡음 제거)
-    webrtc_frame_ms: int = 30                   # 프레임 크기 ms (10/20/30 중 택일)
-    webrtc_speech_ratio_threshold: float = 0.5  # 프레임 중 발화 비율 임계값
-    webrtc_energy_fallback_threshold: int = 1200 # webrtcvad 미설치 시 energy fallback RMS 임계값
-
     # Silero VAD (v6.2+, 2026-04-30 채택 — 짧은 발화 + 긴 trailing silence reject 해결).
     # logs/2026-04-30/server_100651.log Turn 4/5 사례: "예약은어떻게해요" 0.5s + trailing 1.3s
     # → WebRTC bulk ratio 28~38% reject → graph END. Silero per-frame 누적으로 해결.
