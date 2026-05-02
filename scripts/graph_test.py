@@ -8,6 +8,7 @@
 사용법:
     python -m scripts.graph_test
 """
+
 import asyncio
 import sys
 import uuid
@@ -29,7 +30,7 @@ async def main():
     session = RedisSessionService()
 
     call_id = str(uuid.uuid4())
-    tenant_id = "ba2bf499-6fcc-4340-b3dd-9341f8bcc915"  # 한밭식당 (검증용 임시값)
+    tenant_id = "1484849a-549b-4b21-9cdb-77040afc2c2f"  # 한밭식당 (검증용 임시값)
 
     print(f"call_id={call_id} tenant_id={tenant_id}")
     print("종료: 'exit' 또는 Ctrl+C")

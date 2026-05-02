@@ -32,6 +32,7 @@ azure-cognitiveservices-speech==1.40.0
 # Speaker Verification
 # TitaNet (대영 R-01 채택) — NeMo ASR 포함
 nemo-toolkit[asr]==2.7.2
+tqdm>=4.66.0
 
 # Embedding / Vector DB
 chromadb==0.5.23

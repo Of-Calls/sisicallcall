@@ -49,6 +49,10 @@ class Settings(BaseSettings):
     titanet_model_name: str = "titanet_large"
     titanet_similarity_threshold: float = 0.30
     titanet_enrollment_sec: float = 3.0   # voiceprint 등록에 사용할 첫 발화 누적 시간
+    # mel 입력 ONNX 경로 — 설정 시 NeMo 대신 onnxruntime (기동 빠름). 빈 문자열이면 NeMo.
+    titanet_onnx_path: str = ""
+    # 실통화 STT만 검증할 때 NeMo 로드 생략 → SPEAKER_VERIFY_ENABLED=false
+    speaker_verify_enabled: bool = True
 
     # Silero VAD (v6.2+, 2026-04-30 채택 — 짧은 발화 + 긴 trailing silence reject 해결).
     # logs/2026-04-30/server_100651.log Turn 4/5 사례: "예약은어떻게해요" 0.5s + trailing 1.3s

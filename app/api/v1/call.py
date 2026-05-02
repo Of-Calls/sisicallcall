@@ -7,8 +7,11 @@ from fastapi.responses import Response
 from app.services.stt.deepgram import DeepgramSTTService
 from app.services.tts.azure import AzureTTSService
 from app.services.vad.silero_vad import SileroVADService
+from app.utils.config import settings
+from app.utils.logger import get_logger
 
 router = APIRouter()
+_logger = get_logger(__name__)
 _stt = DeepgramSTTService()
 _tts = AzureTTSService()
 _vad = SileroVADService()
@@ -16,6 +19,15 @@ _vad = SileroVADService()
 _VAD_FRAME_BYTES = 1024     # linear16 16kHz, 512 samples
 _SILENCE_THRESHOLD = 30     # 연속 침묵 VAD 프레임 수 (~960ms)
 _TWILIO_CHUNK_BYTES = 160   # 20ms mulaw 8kHz — Twilio 권장 단위
+
+
+def _mulaw_to_pcm16_16k(mulaw: bytes) -> bytes:
+    """Twilio μ-law 8kHz → linear16 16kHz mono (TitaNet·enrollment 동일 포맷)."""
+    if not mulaw:
+        return b""
+    pcm_8k = audioop.ulaw2lin(mulaw, 2)
+    pcm_16k, _ = audioop.ratecv(pcm_8k, 2, 1, 8000, 16000, None)
+    return pcm_16k
 
 
 @router.post("/incoming")
@@ -95,17 +107,57 @@ async def call_ws(websocket: WebSocket):
                     else:
                         silence_count += 1
                         if silence_count >= _SILENCE_THRESHOLD and had_speech:
-                            print(f"[VAD] 침묵 감지 — {len(audio_buffer)} bytes → STT")
-                            transcript = await _stt.transcribe(bytes(audio_buffer))
+                            mulaw_utt = bytes(audio_buffer)
+                            pcm_utt = _mulaw_to_pcm16_16k(mulaw_utt)
+                            call_id = stream_sid or "no-stream"
+
+                            print(f"[VAD] 침묵 감지 — {len(mulaw_utt)} bytes mulaw → 화자 검증")
+                            if settings.speaker_verify_enabled:
+                                from app.services.speaker_verify.titanet import (
+                                    get_titanet_service,
+                                )
+
+                                _speaker = get_titanet_service()
+                                verified, similarity = await _speaker.verify(
+                                    pcm_utt, call_id,
+                                )
+                            else:
+                                verified, similarity = True, 1.0
+                            if not verified:
+                                _logger.warning(
+                                    "[VERIFY] 실패 → STT 생략 call_id=%s similarity=%.4f",
+                                    call_id, similarity,
+                                )
+                                print(
+                                    f"[VERIFY] 실패 similarity={similarity:.4f} → STT 생략"
+                                )
+                                audio_buffer.clear()
+                                silence_count = 0
+                                had_speech = False
+                                break
+
+                            print(f"[VERIFY] 통과 similarity={similarity:.4f} → STT")
+                            transcript = await _stt.transcribe(mulaw_utt)
                             print(f"[STT] '{transcript}'")
                             audio_buffer.clear()
                             silence_count = 0
                             had_speech = False
 
+                            if transcript and settings.speaker_verify_enabled:
+                                from app.services.speaker_verify import (
+                                    enrollment as voice_enrollment,
+                                )
+
+                                await voice_enrollment.accumulate(
+                                    call_id, pcm_utt, transcript,
+                                )
+
                             if transcript and stream_sid:
                                 tts_audio = await _tts.synthesize(transcript)
                                 print(f"[TTS] {len(tts_audio)} bytes → Twilio 송출")
-                                await _send_audio_to_twilio(websocket, stream_sid, tts_audio)
+                                await _send_audio_to_twilio(
+                                    websocket, stream_sid, tts_audio,
+                                )
 
             elif event == "stop":
                 print("[WS] stop")
@@ -113,3 +165,14 @@ async def call_ws(websocket: WebSocket):
 
     except WebSocketDisconnect:
         print("[WS] 연결 끊김")
+    finally:
+        if stream_sid and settings.speaker_verify_enabled:
+            from app.services.speaker_verify.titanet import get_titanet_service
+
+            get_titanet_service().cleanup(stream_sid)
+            try:
+                from app.services.speaker_verify import enrollment as voice_enrollment
+
+                voice_enrollment.cleanup(stream_sid)
+            except Exception:
+                pass
