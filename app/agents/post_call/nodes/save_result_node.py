@@ -96,7 +96,11 @@ async def _maybe_save_voc(call_id: str, state: PostCallAgentState) -> None:
 async def _maybe_save_actions(call_id: str, state: PostCallAgentState) -> None:
     actions = state.get("executed_actions", [])  # type: ignore[call-overload]
     if actions:
-        await _action_log_repo.save_action_log(call_id, actions)
+        await _action_log_repo.save_action_log(
+            call_id,
+            actions,
+            tenant_id=state["tenant_id"],
+        )
 
 
 def _summary_payload(state: PostCallAgentState) -> dict:

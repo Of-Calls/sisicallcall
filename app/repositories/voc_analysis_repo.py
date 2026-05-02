@@ -107,9 +107,9 @@ async def _upsert_voc_analysis_to_db_if_possible(
     partial_success: bool = False,
     failed_subagents: list | None = None,
 ) -> None:
-    if not (_is_uuid(call_id) and _is_uuid(tenant_id)):
+    if not _is_uuid(call_id):
         logger.warning(
-            "voc_analyses db upsert skipped call_id=%s tenant_id=%s reason=non_uuid",
+            "voc_analysis db save skipped non_uuid_call_id=%s tenant_id=%s",
             call_id,
             tenant_id,
         )
@@ -119,6 +119,24 @@ async def _upsert_voc_analysis_to_db_if_possible(
     conn = None
     try:
         conn = await asyncpg.connect(_database_url())
+        call_tenant_id = await _fetch_call_tenant_id(conn, call_id)
+        if call_tenant_id is None:
+            logger.warning(
+                "post_call call not found: skip voc_analysis db save call_id=%s state_tenant_id=%s",
+                call_id,
+                tenant_id,
+            )
+            return
+
+        if call_tenant_id.lower() != str(tenant_id).lower():
+            logger.warning(
+                "post_call tenant mismatch: skip voc_analysis save call_id=%s state_tenant_id=%s call_tenant_id=%s",
+                call_id,
+                tenant_id,
+                call_tenant_id,
+            )
+            return
+
         await conn.execute(
             """
             INSERT INTO voc_analyses (
@@ -165,6 +183,21 @@ async def _upsert_voc_analysis_to_db_if_possible(
     finally:
         if conn is not None:
             await conn.close()
+
+
+async def _fetch_call_tenant_id(conn, call_id: str) -> str | None:
+    row = await conn.fetchrow(
+        """
+        SELECT tenant_id
+        FROM calls
+        WHERE id = $1::uuid
+        LIMIT 1
+        """,
+        call_id,
+    )
+    if row is None:
+        return None
+    return str(row["tenant_id"])
 
 
 async def get_voc_by_call_id(call_id: str) -> dict | None:

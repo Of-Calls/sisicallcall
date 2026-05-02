@@ -12,6 +12,7 @@ from app.repositories.voc_analysis_repo import save_voc_analysis
 
 CALL_UUID = "1fc3c309-2c9d-4cd4-9378-d9d8ed4b1b3c"
 TENANT_UUID = "ba2bf499-6fcc-4340-b3dd-9341f8bcc915"
+OTHER_TENANT_UUID = "22222222-2222-4222-8222-222222222222"
 
 
 @pytest.fixture(autouse=True)
@@ -28,6 +29,10 @@ async def test_uuid_summary_upserts_call_summaries(monkeypatch):
     calls: list[tuple[str, tuple]] = []
 
     class FakeConn:
+        async def fetchrow(self, sql, *args):
+            calls.append((sql, args))
+            return {"tenant_id": TENANT_UUID}
+
         async def execute(self, sql, *args):
             calls.append((sql, args))
             return "INSERT 0 1"
@@ -76,6 +81,10 @@ async def test_uuid_voc_upserts_voc_analyses(monkeypatch):
     calls: list[tuple[str, tuple]] = []
 
     class FakeConn:
+        async def fetchrow(self, sql, *args):
+            calls.append((sql, args))
+            return {"tenant_id": TENANT_UUID}
+
         async def execute(self, sql, *args):
             calls.append((sql, args))
             return "INSERT 0 1"
@@ -118,6 +127,140 @@ async def test_uuid_voc_upserts_voc_analyses(monkeypatch):
     assert json.loads(args[4])["priority"] == "critical"
     assert args[5] is True
     assert json.loads(args[6]) == ["priority_node"]
+
+
+@pytest.mark.asyncio
+async def test_uuid_summary_skips_db_upsert_when_tenant_mismatches(monkeypatch):
+    calls: list[tuple[str, tuple]] = []
+
+    class FakeConn:
+        async def fetchrow(self, sql, *args):
+            calls.append((sql, args))
+            return {"tenant_id": OTHER_TENANT_UUID}
+
+        async def execute(self, sql, *args):
+            raise AssertionError("summary upsert should be skipped on tenant mismatch")
+
+        async def close(self):
+            calls.append(("close", ()))
+
+    async def fake_connect(url):
+        calls.append(("connect", (url,)))
+        return FakeConn()
+
+    monkeypatch.setattr(summary_mod.asyncpg, "connect", fake_connect)
+
+    await save_summary(CALL_UUID, TENANT_UUID, {"summary_short": "tenant mismatch"})
+
+    inserts = [
+        item for item in calls
+        if "INSERT INTO call_summaries" in item[0]
+    ]
+    assert inserts == []
+    record = await summary_mod.get_summary_by_call_id(CALL_UUID)
+    assert record is not None
+    assert record["tenant_id"] == TENANT_UUID
+
+
+@pytest.mark.asyncio
+async def test_uuid_summary_skips_db_upsert_when_call_missing(monkeypatch):
+    calls: list[tuple[str, tuple]] = []
+
+    class FakeConn:
+        async def fetchrow(self, sql, *args):
+            calls.append((sql, args))
+            return None
+
+        async def execute(self, sql, *args):
+            raise AssertionError("summary upsert should be skipped when call is missing")
+
+        async def close(self):
+            calls.append(("close", ()))
+
+    async def fake_connect(url):
+        calls.append(("connect", (url,)))
+        return FakeConn()
+
+    monkeypatch.setattr(summary_mod.asyncpg, "connect", fake_connect)
+
+    await save_summary(CALL_UUID, TENANT_UUID, {"summary_short": "missing call"})
+
+    inserts = [
+        item for item in calls
+        if "INSERT INTO call_summaries" in item[0]
+    ]
+    assert inserts == []
+
+
+@pytest.mark.asyncio
+async def test_uuid_voc_skips_db_upsert_when_tenant_mismatches(monkeypatch):
+    calls: list[tuple[str, tuple]] = []
+
+    class FakeConn:
+        async def fetchrow(self, sql, *args):
+            calls.append((sql, args))
+            return {"tenant_id": OTHER_TENANT_UUID}
+
+        async def execute(self, sql, *args):
+            raise AssertionError("voc upsert should be skipped on tenant mismatch")
+
+        async def close(self):
+            calls.append(("close", ()))
+
+    async def fake_connect(url):
+        calls.append(("connect", (url,)))
+        return FakeConn()
+
+    monkeypatch.setattr(voc_mod.asyncpg, "connect", fake_connect)
+
+    await save_voc_analysis(
+        CALL_UUID,
+        TENANT_UUID,
+        {"priority_result": {"priority": "critical"}},
+    )
+
+    inserts = [
+        item for item in calls
+        if "INSERT INTO voc_analyses" in item[0]
+    ]
+    assert inserts == []
+    record = await voc_mod.get_voc_by_call_id(CALL_UUID)
+    assert record is not None
+    assert record["tenant_id"] == TENANT_UUID
+
+
+@pytest.mark.asyncio
+async def test_uuid_voc_skips_db_upsert_when_call_missing(monkeypatch):
+    calls: list[tuple[str, tuple]] = []
+
+    class FakeConn:
+        async def fetchrow(self, sql, *args):
+            calls.append((sql, args))
+            return None
+
+        async def execute(self, sql, *args):
+            raise AssertionError("voc upsert should be skipped when call is missing")
+
+        async def close(self):
+            calls.append(("close", ()))
+
+    async def fake_connect(url):
+        calls.append(("connect", (url,)))
+        return FakeConn()
+
+    monkeypatch.setattr(voc_mod.asyncpg, "connect", fake_connect)
+
+    await save_voc_analysis(
+        CALL_UUID,
+        TENANT_UUID,
+        {"priority_result": {"priority": "critical"}},
+    )
+
+    inserts = [
+        item for item in calls
+        if "INSERT INTO voc_analyses" in item[0]
+    ]
+    assert inserts == []
 
 
 @pytest.mark.asyncio
