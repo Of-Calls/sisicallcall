@@ -64,6 +64,26 @@ def test_existing_primary_category_is_preserved():
     assert result["voc_analysis"]["intent_result"]["primary_category"] == "LLM 분류"
 
 
+def test_existing_specific_primary_category_is_not_overwritten_by_tenant_rule():
+    state = _base_state()
+    state["tenant_industry"] = "hospital"
+    state["summary"] = {
+        "summary_short": "고객이 응급실 위치와 주차장을 문의했습니다.",
+        "customer_intent": "응급실 위치 문의",
+        "customer_emotion": "neutral",
+        "resolution_status": "resolved",
+        "keywords": ["응급실", "주차장"],
+    }
+    state["voc_analysis"]["intent_result"] = {
+        "primary_category": "제품/서비스 문의",
+        "reason": "already specific",
+    }
+
+    result = normalize_post_call_result(state)
+
+    assert result["voc_analysis"]["intent_result"]["primary_category"] == "제품/서비스 문의"
+
+
 def test_problem_row_like_hospital_input_gets_non_empty_category():
     state = {
         **_base_state(),
@@ -95,7 +115,121 @@ def test_problem_row_like_hospital_input_gets_non_empty_category():
     result = normalize_post_call_result(state)
     category = result["voc_analysis"]["intent_result"]["primary_category"]
 
-    assert category in {"의료/시설 문의", "제품/서비스 문의"}
+    assert category == "의료/시설 문의"
+
+
+def test_generic_category_is_refined_for_problem_row_like_hospital_input():
+    state = _base_state()
+    state["tenant_industry"] = "hospital"
+    state["summary"] = {
+        "summary_short": "고객은 응급실 이용 방법과 주차 요금, 교통편 및 음식 판매 여부에 대해 문의했습니다.",
+        "customer_intent": "응급실 이용 방법 및 주차 요금 문의",
+        "customer_emotion": "neutral",
+        "resolution_status": "resolved",
+        "keywords": ["응급실", "주차장", "주차요금", "대중교통", "음식"],
+    }
+    state["voc_analysis"]["intent_result"] = {
+        "primary_category": "기타",
+        "reason": "고객이 음식 판매 여부에 대해 반복적으로 질문함",
+        "is_repeat_topic": True,
+    }
+
+    result = normalize_post_call_result(state)
+
+    assert result["voc_analysis"]["intent_result"]["primary_category"] == "의료/시설 문의"
+
+
+def test_hospital_clinical_keywords_use_medical_care_category():
+    state = _base_state()
+    state["tenant_industry"] = "hospital"
+    state["summary"] = {
+        "summary_short": "고객이 진료 검사 결과와 처방 가능 여부를 문의했습니다.",
+        "customer_intent": "진료 및 처방 문의",
+        "customer_emotion": "neutral",
+        "resolution_status": "resolved",
+        "keywords": ["진료", "검사", "처방"],
+    }
+
+    result = normalize_post_call_result(state)
+
+    assert result["voc_analysis"]["intent_result"]["primary_category"] == "의료/진료 문의"
+
+
+def test_hospital_like_keywords_without_tenant_industry_do_not_fall_to_other():
+    category = infer_primary_category(
+        "고객이 응급실 주차장과 교통편을 문의했습니다.",
+        ["응급실", "주차장", "교통편"],
+        tenant_industry=None,
+    )
+
+    assert category == "의료/시설 문의"
+
+
+def test_restaurant_tenant_menu_reservation_breaktime_uses_restaurant_category():
+    state = _base_state()
+    state["tenant_industry"] = "restaurant"
+    state["summary"] = {
+        "summary_short": "고객이 메뉴와 예약 가능 여부, 브레이크타임을 문의했습니다.",
+        "customer_intent": "메뉴 및 예약 문의",
+        "customer_emotion": "neutral",
+        "resolution_status": "resolved",
+        "keywords": ["메뉴", "예약", "브레이크타임"],
+    }
+
+    result = normalize_post_call_result(state)
+
+    assert result["voc_analysis"]["intent_result"]["primary_category"] == "메뉴/예약 문의"
+
+
+def test_government_tenant_welfare_application_uses_admin_category():
+    state = _base_state()
+    state["context"] = {"tenant": {"industry": "government"}}
+    state["summary"] = {
+        "summary_short": "고객이 구청 청년복지 지원금 신청 방법을 문의했습니다.",
+        "customer_intent": "청년복지 신청 문의",
+        "customer_emotion": "neutral",
+        "resolution_status": "resolved",
+        "keywords": ["구청", "청년복지", "신청", "지원금"],
+    }
+
+    result = normalize_post_call_result(state)
+
+    assert result["voc_analysis"]["intent_result"]["primary_category"] == "복지/행정 문의"
+
+
+def test_finance_tenant_contract_keywords_use_finance_category():
+    state = _base_state()
+    state["tenant"] = {"industry": "finance"}
+    state["summary"] = {
+        "summary_short": "고객이 보험 계약과 대출 상품을 문의했습니다.",
+        "customer_intent": "보험 계약 및 대출 상품 문의",
+        "customer_emotion": "neutral",
+        "resolution_status": "resolved",
+        "keywords": ["보험", "계약", "대출", "상품"],
+    }
+
+    result = normalize_post_call_result(state)
+
+    assert result["voc_analysis"]["intent_result"]["primary_category"] == "금융/계약 문의"
+
+
+def test_generic_category_stays_other_when_no_clear_rule_matches():
+    state = _base_state()
+    state["summary"] = {
+        "summary_short": "고객이 기타 내용을 문의했습니다.",
+        "customer_intent": "기타 문의",
+        "customer_emotion": "neutral",
+        "resolution_status": "resolved",
+        "keywords": [],
+    }
+    state["voc_analysis"]["intent_result"] = {
+        "primary_category": "기타",
+        "reason": "명확한 분류 기준 없음",
+    }
+
+    result = normalize_post_call_result(state)
+
+    assert result["voc_analysis"]["intent_result"]["primary_category"] == "기타"
 
 
 def test_priority_missing_uses_safe_fallback():

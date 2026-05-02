@@ -189,9 +189,9 @@ def normalize_intent_result(
 ) -> dict:
     result = _as_dict(intent_result)
     primary_category = _clean_str(result.get("primary_category"))
-    if not primary_category:
+    if not primary_category or primary_category == "기타":
         summary = _as_dict(fallback_context.get("summary"))
-        primary_category = infer_primary_category(
+        inferred_category = infer_primary_category(
             text=" ".join(
                 part
                 for part in (
@@ -204,11 +204,15 @@ def normalize_intent_result(
             keywords=_as_list(summary.get("keywords")),
             tenant_industry=_clean_str(fallback_context.get("tenant_industry")) or None,
         )
-        logger.warning(
-            "post_call_normalizer: primary_category filled call_id=%s value=%s reason=missing_primary_category",
-            call_id,
-            primary_category,
-        )
+        if not primary_category or inferred_category != "기타":
+            reason = "missing_primary_category" if not primary_category else "generic_primary_category"
+            primary_category = inferred_category
+            logger.warning(
+                "post_call_normalizer: primary_category filled call_id=%s value=%s reason=%s",
+                call_id,
+                primary_category,
+                reason,
+            )
     result["primary_category"] = primary_category
     if not isinstance(result.get("sub_categories"), list):
         result["sub_categories"] = []
@@ -247,26 +251,22 @@ def infer_primary_category(
     haystack = _normalize_text(" ".join([text, *[str(k) for k in keywords]]))
     industry = _normalize_text(tenant_industry or "")
 
-    if industry == "hospital" and _has_any(
-        haystack,
-        ("응급실", "진료", "예약", "주차", "주차요금", "교통편", "대중교통", "음식", "준비물"),
-    ):
-        return "의료/시설 문의"
-    if industry == "restaurant" and _has_any(
-        haystack,
-        ("메뉴", "음식", "브레이크타임", "예약", "단체", "좌석"),
-    ):
-        return "메뉴/예약 문의"
-    if industry == "government" and _has_any(
-        haystack,
-        ("구청", "청년복지", "복지", "신청", "민원", "서류", "지원금"),
-    ):
-        return "복지/행정 문의"
-    if industry == "finance" and _has_any(
-        haystack,
-        ("보험", "대출", "상품", "납부", "결제", "환불", "본인확인"),
-    ):
-        return "금융/계약 문의"
+    industry_category = _infer_industry_category(haystack, industry)
+    if industry_category:
+        return industry_category
+
+    hospital_like = _infer_hospital_like_category(haystack, industry_known=False)
+    if hospital_like:
+        return hospital_like
+    restaurant_like = _infer_restaurant_like_category(haystack, industry_known=False)
+    if restaurant_like:
+        return restaurant_like
+    government_like = _infer_government_like_category(haystack, industry_known=False)
+    if government_like:
+        return government_like
+    finance_like = _infer_finance_like_category(haystack, industry_known=False)
+    if finance_like:
+        return finance_like
 
     if _has_any(haystack, ("예약", "일정", "변경", "취소", "예약방법", "예약 방법")):
         return "예약/일정"
@@ -281,6 +281,101 @@ def infer_primary_category(
     if _has_any(haystack, ("상담원", "담당자", "연결", "콜백", "전화 주세요")):
         return "상담원 연결"
     return "기타"
+
+
+def _infer_industry_category(haystack: str, industry: str) -> str | None:
+    if industry == "hospital":
+        return _infer_hospital_like_category(haystack, industry_known=True)
+    if industry == "restaurant":
+        return _infer_restaurant_like_category(haystack, industry_known=True)
+    if industry == "government":
+        return _infer_government_like_category(haystack, industry_known=True)
+    if industry == "finance":
+        return _infer_finance_like_category(haystack, industry_known=True)
+    return None
+
+
+def _infer_hospital_like_category(haystack: str, *, industry_known: bool) -> str | None:
+    clinical_terms = (
+        "응급실",
+        "진료",
+        "병원",
+        "의료",
+        "외래",
+        "입원",
+        "퇴원",
+        "간호",
+        "의사",
+        "처방",
+        "검사",
+    )
+    facility_terms = (
+        "주차",
+        "주차장",
+        "주차요금",
+        "교통편",
+        "대중교통",
+        "면회",
+        "보호자",
+        "음식 판매",
+        "음식",
+        "편의시설",
+        "매점",
+        "식당",
+    )
+    has_clinical = _has_any(haystack, clinical_terms)
+    has_facility = _has_any(haystack, facility_terms)
+    if has_facility and (industry_known or has_clinical or _has_any(haystack, ("병원", "의료", "응급실"))):
+        return "의료/시설 문의"
+    if has_clinical:
+        return "의료/진료 문의"
+    return None
+
+
+def _infer_restaurant_like_category(haystack: str, *, industry_known: bool) -> str | None:
+    menu_terms = ("메뉴", "음식", "제철메뉴", "식당")
+    reservation_terms = ("예약", "좌석", "단체")
+    location_terms = ("브레이크타임", "영업시간", "위치", "주차")
+    has_restaurant_context = industry_known or _has_any(
+        haystack,
+        ("식당", "제철메뉴", "포장", "배달", "브레이크타임", "좌석", "단체"),
+    )
+    if not has_restaurant_context:
+        return None
+    if _has_any(haystack, reservation_terms) and _has_any(haystack, menu_terms):
+        return "메뉴/예약 문의"
+    if _has_any(haystack, menu_terms):
+        return "메뉴/예약 문의"
+    if _has_any(haystack, reservation_terms):
+        return "예약/일정"
+    if _has_any(haystack, location_terms):
+        return "운영시간/위치"
+    return None
+
+
+def _infer_government_like_category(haystack: str, *, industry_known: bool) -> str | None:
+    admin_terms = ("구청", "청년복지", "복지", "신청", "서류", "지원금", "행정", "접수", "증명서", "주민센터")
+    complaint_terms = ("민원", "불만", "항의")
+    if _has_any(haystack, complaint_terms):
+        return "민원/불만"
+    if industry_known or _has_any(haystack, ("구청", "청년복지", "복지", "지원금", "주민센터")):
+        if _has_any(haystack, admin_terms):
+            return "복지/행정 문의"
+    return None
+
+
+def _infer_finance_like_category(haystack: str, *, industry_known: bool) -> str | None:
+    contract_terms = ("보험", "대출", "금융", "상품", "계약", "청구", "계좌")
+    payment_terms = ("납부", "결제", "환불")
+    identity_terms = ("본인확인", "본인 확인", "인증")
+    if _has_any(haystack, identity_terms):
+        return "본인확인"
+    if industry_known or _has_any(haystack, contract_terms):
+        if _has_any(haystack, contract_terms):
+            return "금융/계약 문의"
+    if _has_any(haystack, payment_terms):
+        return "환불/결제"
+    return None
 
 
 def _infer_priority(priority_result: dict, fallback_context: dict) -> str:
@@ -317,17 +412,38 @@ def _infer_priority(priority_result: dict, fallback_context: dict) -> str:
 
 def _build_context(state: dict) -> dict:
     metadata = _as_dict(state.get("call_metadata"))
+    state_tenant = _as_dict(state.get("tenant"))
+    call_context = _as_dict(state.get("call_context"))
+    call_context_tenant = _as_dict(call_context.get("tenant"))
+    state_metadata = _as_dict(state.get("metadata"))
+    context = _as_dict(state.get("context"))
+    context_tenant = _as_dict(context.get("tenant"))
     tenant = _as_dict(metadata.get("tenant"))
     return {
         "call_id": _clean_str(state.get("call_id")),
         "tenant_id": _clean_str(state.get("tenant_id") or metadata.get("tenant_id")),
         "tenant_name": _clean_str(
-            state.get("tenant_name") or metadata.get("tenant_name") or tenant.get("name")
+            state.get("tenant_name")
+            or metadata.get("tenant_name")
+            or state_metadata.get("tenant_name")
+            or state_tenant.get("name")
+            or call_context_tenant.get("name")
+            or context_tenant.get("name")
+            or tenant.get("name")
         ),
         "tenant_industry": _clean_str(
             state.get("tenant_industry")
             or metadata.get("tenant_industry")
             or metadata.get("industry")
+            or state_metadata.get("tenant_industry")
+            or state_metadata.get("industry")
+            or call_context.get("tenant_industry")
+            or call_context.get("industry")
+            or context.get("tenant_industry")
+            or context.get("industry")
+            or state_tenant.get("industry")
+            or call_context_tenant.get("industry")
+            or context_tenant.get("industry")
             or tenant.get("industry")
         ),
     }
