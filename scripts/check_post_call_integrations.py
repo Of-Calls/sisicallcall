@@ -86,6 +86,68 @@ ACTION_PROVIDER_MAP: dict[str, str] = {
     "create_notion_call_record": "notion",
 }
 
+# Canonical provider name → tenant_integrations.provider candidates.
+#
+# OAuth callback (`app/api/v1/oauth.py`) stores Google integrations under
+# `google_gmail` / `google_calendar`, but action/tool layer references them as
+# `gmail` / `calendar`. This map lets readiness recognize a successful OAuth
+# even when the stored row uses the OAuth-route name.
+#
+# The canonical (action-layer) name is listed first so it wins when both rows
+# happen to exist.
+PROVIDER_ALIASES: dict[str, list[str]] = {
+    "slack":              ["slack"],
+    "calendar":           ["calendar", "google_calendar"],
+    "notion":             ["notion"],
+    "gmail":              ["gmail", "google_gmail"],
+    "sms":                ["sms"],
+    "jira":               ["jira"],
+    "company_db":         ["company_db"],
+    "internal_dashboard": ["internal_dashboard"],
+}
+
+
+def _resolve_integration_for_canonical(
+    canonical: str,
+    integrations_by_provider: dict[str, object],
+) -> tuple[object | None, str | None]:
+    """Pick the best integration row for a canonical provider.
+
+    Priority:
+      1. First candidate whose row is connected.
+      2. Otherwise, first candidate that has any row.
+      3. Otherwise, (None, None).
+
+    The candidate order in PROVIDER_ALIASES decides ties — connected canonical
+    names beat connected OAuth-route names. (Future: use updated_at as tie
+    breaker if conflicts become common.)
+    """
+    candidates = PROVIDER_ALIASES.get(canonical, [canonical])
+
+    connected = None
+    connected_source = None
+    fallback = None
+    fallback_source = None
+
+    for cand in candidates:
+        integration = integrations_by_provider.get(cand)
+        if integration is None:
+            continue
+        raw_status = getattr(integration, "status", None)
+        status_value = raw_status.value if hasattr(raw_status, "value") else str(raw_status or "")
+        if status_value == "connected" and connected is None:
+            connected = integration
+            connected_source = cand
+        elif fallback is None:
+            fallback = integration
+            fallback_source = cand
+
+    if connected is not None:
+        return connected, connected_source
+    if fallback is not None:
+        return fallback, fallback_source
+    return None, None
+
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
 
@@ -95,8 +157,13 @@ def _database_url() -> str:
 
 # ── Provider status normalization ─────────────────────────────────────────────
 
-def normalize_provider_status(provider: str, integration: object | None) -> dict:
-    """Return a normalized status dict for a single provider.
+def normalize_provider_status(
+    provider: str,
+    integration: object | None,
+    *,
+    source_provider: str | None = None,
+) -> dict:
+    """Return a normalized status dict for a single canonical provider.
 
     Output schema:
         {
@@ -105,14 +172,27 @@ def normalize_provider_status(provider: str, integration: object | None) -> dict
           "ready":  bool,
           "reason": str|None,
           "scopes": list[str],
+          "source_provider":     str|None,   # tenant_integrations row provider name
+          "provider_candidates": list[str],  # canonical + aliases tried
         }
+
+    ``source_provider`` is the actual ``tenant_integrations.provider`` value the
+    integration row used (e.g. ``google_gmail``). It differs from ``provider``
+    (the canonical action-layer name, e.g. ``gmail``) when an alias matched.
     """
+    candidates = PROVIDER_ALIASES.get(provider, [provider])
+    base_meta = {
+        "source_provider": source_provider,
+        "provider_candidates": list(candidates),
+    }
+
     if provider in INTERNAL_PROVIDERS:
         return {
             "status": "internal",
             "ready": True,
             "reason": "no OAuth required",
             "scopes": [],
+            **base_meta,
         }
     if provider in ENV_CONFIGURED_PROVIDERS:
         return {
@@ -120,6 +200,7 @@ def normalize_provider_status(provider: str, integration: object | None) -> dict
             "ready": True,
             "reason": "env/provider level config required",
             "scopes": [],
+            **base_meta,
         }
     if integration is None:
         return {
@@ -127,6 +208,7 @@ def normalize_provider_status(provider: str, integration: object | None) -> dict
             "ready": False,
             "reason": "no tenant integration row",
             "scopes": [],
+            **base_meta,
         }
 
     raw_status = getattr(integration, "status", None)
@@ -134,24 +216,32 @@ def normalize_provider_status(provider: str, integration: object | None) -> dict
     scopes = list(getattr(integration, "scopes", []) or [])
 
     if status_value == "connected":
-        return {"status": "connected", "ready": True, "reason": None, "scopes": scopes}
+        return {"status": "connected", "ready": True, "reason": None, "scopes": scopes, **base_meta}
     if status_value == "expired":
-        return {"status": "expired", "ready": False, "reason": "token expired", "scopes": scopes}
+        return {"status": "expired", "ready": False, "reason": "token expired", "scopes": scopes, **base_meta}
     if status_value == "disconnected":
         return {
             "status": "disconnected",
             "ready": False,
             "reason": "manually disconnected",
             "scopes": scopes,
+            **base_meta,
         }
     if status_value == "error":
-        return {"status": "invalid", "ready": False, "reason": "provider returned error", "scopes": scopes}
+        return {
+            "status": "invalid",
+            "ready": False,
+            "reason": "provider returned error",
+            "scopes": scopes,
+            **base_meta,
+        }
 
     return {
         "status": "unknown",
         "ready": False,
         "reason": f"status={status_value}",
         "scopes": scopes,
+        **base_meta,
     }
 
 
@@ -200,15 +290,23 @@ def check_tenant_readiness(
     tenant_id: str,
     repo: TenantIntegrationRepository,
 ) -> dict:
-    """Build provider statuses + action readiness for a single tenant."""
+    """Build provider statuses + action readiness for a single tenant.
+
+    Resolves canonical providers (`gmail`, `calendar`) against alias rows
+    (`google_gmail`, `google_calendar`) so a successful OAuth surfaces as
+    `connected` regardless of which name the row was stored under.
+    """
     integrations_by_provider: dict[str, object] = {}
     for integration in repo.list_integrations(tenant_id):
         integrations_by_provider[integration.provider] = integration
 
     provider_statuses: dict[str, dict] = {}
     for provider in ALL_PROVIDERS:
+        integration, source = _resolve_integration_for_canonical(
+            provider, integrations_by_provider,
+        )
         provider_statuses[provider] = normalize_provider_status(
-            provider, integrations_by_provider.get(provider),
+            provider, integration, source_provider=source,
         )
 
     return {
@@ -304,12 +402,22 @@ def print_readiness(readiness: dict) -> None:
         status = info.get("status", "unknown")
         scopes = info.get("scopes") or []
         reason = info.get("reason")
+        source = info.get("source_provider")
+        candidates = info.get("provider_candidates") or []
 
-        suffix_parts = []
+        suffix_parts: list[str] = []
+        # Show source only when it differs from the canonical provider — e.g.
+        # gmail row stored as google_gmail. Same-name source is implicit.
+        if source and source != provider:
+            suffix_parts.append(f"source={source}")
         if scopes:
             suffix_parts.append(f"scopes={','.join(scopes)}")
         if reason:
             suffix_parts.append(f"reason={reason}")
+        # When missing AND there were aliases beyond the canonical name,
+        # surface them so the operator knows what the lookup tried.
+        if status == "missing" and len(candidates) > 1:
+            suffix_parts.append(f"candidates={','.join(candidates)}")
         suffix = "  ".join(suffix_parts) if suffix_parts else ""
 
         color = _status_color(status)

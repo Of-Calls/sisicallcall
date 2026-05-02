@@ -270,6 +270,115 @@ class TestActionLogSummarySql:
         assert rows[1]["error_message"] == "tenant_integration_not_connected"
 
 
+# ── Provider alias resolution ─────────────────────────────────────────────────
+
+class TestProviderAliases:
+    def _repo(self) -> TenantIntegrationRepository:
+        return TenantIntegrationRepository(storage="memory")
+
+    def test_alias_map_contains_google_pairings(self):
+        from scripts.check_post_call_integrations import PROVIDER_ALIASES
+
+        assert "google_gmail" in PROVIDER_ALIASES["gmail"]
+        assert "google_calendar" in PROVIDER_ALIASES["calendar"]
+        # canonical name must come first so it wins ties
+        assert PROVIDER_ALIASES["gmail"][0] == "gmail"
+        assert PROVIDER_ALIASES["calendar"][0] == "calendar"
+
+    def test_google_gmail_row_resolves_to_gmail_connected(self):
+        from scripts.check_post_call_integrations import check_tenant_readiness
+
+        repo = self._repo()
+        repo.upsert_integration(TenantIntegration(
+            tenant_id="tid-a",
+            provider="google_gmail",
+            status=IntegrationStatus.connected,
+            scopes=["https://www.googleapis.com/auth/gmail.send"],
+        ))
+
+        result = check_tenant_readiness("tid-a", repo)
+
+        assert result["providers"]["gmail"]["status"] == "connected"
+        assert result["providers"]["gmail"]["ready"] is True
+        assert result["providers"]["gmail"]["source_provider"] == "google_gmail"
+        # send_manager_email action should reflect alias result
+        assert result["actions"]["send_manager_email"]["ready"] is True
+
+    def test_google_calendar_row_resolves_to_calendar_connected(self):
+        from scripts.check_post_call_integrations import check_tenant_readiness
+
+        repo = self._repo()
+        repo.upsert_integration(TenantIntegration(
+            tenant_id="tid-b",
+            provider="google_calendar",
+            status=IntegrationStatus.connected,
+            scopes=["https://www.googleapis.com/auth/calendar.events"],
+        ))
+
+        result = check_tenant_readiness("tid-b", repo)
+
+        assert result["providers"]["calendar"]["status"] == "connected"
+        assert result["providers"]["calendar"]["source_provider"] == "google_calendar"
+        # schedule_callback action should reflect alias result
+        assert result["actions"]["schedule_callback"]["ready"] is True
+
+    def test_provider_candidates_in_payload(self):
+        from scripts.check_post_call_integrations import check_tenant_readiness
+
+        result = check_tenant_readiness("tid-empty", self._repo())
+
+        assert result["providers"]["gmail"]["provider_candidates"] == ["gmail", "google_gmail"]
+        assert result["providers"]["calendar"]["provider_candidates"] == ["calendar", "google_calendar"]
+        # non-aliased canonical providers still expose a candidates list
+        assert result["providers"]["slack"]["provider_candidates"] == ["slack"]
+
+    def test_no_alias_row_keeps_missing_status(self):
+        from scripts.check_post_call_integrations import check_tenant_readiness
+
+        result = check_tenant_readiness("tid-empty", self._repo())
+
+        # No row at all → still missing for OAuth providers
+        assert result["providers"]["gmail"]["status"] == "missing"
+        assert result["providers"]["gmail"]["source_provider"] is None
+        assert result["actions"]["send_manager_email"]["ready"] is False
+
+    def test_canonical_row_wins_when_both_connected(self):
+        """If both `gmail` and `google_gmail` are connected, the canonical
+        name comes first in PROVIDER_ALIASES and therefore wins."""
+        from scripts.check_post_call_integrations import check_tenant_readiness
+
+        repo = self._repo()
+        repo.upsert_integration(TenantIntegration(
+            tenant_id="tid-c", provider="gmail",
+            status=IntegrationStatus.connected,
+        ))
+        repo.upsert_integration(TenantIntegration(
+            tenant_id="tid-c", provider="google_gmail",
+            status=IntegrationStatus.connected,
+        ))
+
+        result = check_tenant_readiness("tid-c", repo)
+        assert result["providers"]["gmail"]["source_provider"] == "gmail"
+
+    def test_connected_alias_beats_disconnected_canonical(self):
+        """`gmail` disconnected but `google_gmail` connected → use the alias."""
+        from scripts.check_post_call_integrations import check_tenant_readiness
+
+        repo = self._repo()
+        repo.upsert_integration(TenantIntegration(
+            tenant_id="tid-d", provider="gmail",
+            status=IntegrationStatus.disconnected,
+        ))
+        repo.upsert_integration(TenantIntegration(
+            tenant_id="tid-d", provider="google_gmail",
+            status=IntegrationStatus.connected,
+        ))
+
+        result = check_tenant_readiness("tid-d", repo)
+        assert result["providers"]["gmail"]["status"] == "connected"
+        assert result["providers"]["gmail"]["source_provider"] == "google_gmail"
+
+
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 class TestCli:
@@ -348,6 +457,14 @@ class TestMainJsonOutput:
         assert "recent_action_summary" in payload
         assert payload["providers"]["slack"]["status"] == "connected"
         assert payload["actions"]["send_slack_alert"]["ready"] is True
+
+        # Alias metadata must round-trip through the JSON path so external
+        # consumers can tell which row backed each canonical provider.
+        gmail = payload["providers"]["gmail"]
+        assert "source_provider" in gmail
+        assert gmail["provider_candidates"] == ["gmail", "google_gmail"]
+        calendar = payload["providers"]["calendar"]
+        assert calendar["provider_candidates"] == ["calendar", "google_calendar"]
 
 
 # ── run_post_call_from_db.py guard message ────────────────────────────────────

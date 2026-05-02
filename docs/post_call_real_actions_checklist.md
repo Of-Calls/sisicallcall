@@ -99,28 +99,43 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 | `company_db` | `COMPANY_DB_MCP_REAL` 또는 `MCP_COMPANY_DB_REAL` | (없음) | (구현체에 따라) |
 | `internal_dashboard` | (없음) | (없음) | (없음 — 항상 internal) |
 
-### 4-2. `_oauth_provider_name`과 `check_post_call_integrations.py`의 명명 차이 ⚠️
+### 4-2. `_oauth_provider_name`과 `check_post_call_integrations.py`의 명명 차이
 
-`scripts/check_post_call_integrations.py`의 `ALL_PROVIDERS`는
-`["slack", "calendar", "notion", "gmail", "sms", "jira", "company_db", "internal_dashboard"]`로
-정의되어 있다.
+OAuth callback이 저장하는 row의 `provider` 컬럼과 action/tool 레이어의
+canonical 이름이 다르다.
 
-하지만 **OAuth callback이 실제 저장하는 provider 이름은 다르다**:
+| OAuth 라우터 (`app/api/v1/oauth.py`) | tenant_integrations.provider | readiness canonical |
+|---|---|---|
+| `/api/v1/oauth/google_gmail/...` | `google_gmail` | `gmail` |
+| `/api/v1/oauth/google_calendar/...` | `google_calendar` | `calendar` |
+| `/api/v1/oauth/slack/...` | `slack` | `slack` |
+| `/api/v1/oauth/jira/...` | `jira` | `jira` |
 
-| OAuth 라우터 (`app/api/v1/oauth.py`) | tenant_integrations.provider |
-|---|---|
-| `/api/v1/oauth/google_gmail/...` | `google_gmail` |
-| `/api/v1/oauth/google_calendar/...` | `google_calendar` |
-| `/api/v1/oauth/slack/...` | `slack` |
-| `/api/v1/oauth/jira/...` | `jira` |
+`scripts/check_post_call_integrations.py`는 `PROVIDER_ALIASES` 맵으로
+이 차이를 흡수한다. canonical 이름이 우선이고, 동일 canonical 안에서는
+**connected → 그 외** 순으로 row를 선택한다.
 
-→ Gmail/Calendar의 경우 OAuth가 정상 완료되어도 readiness 스크립트는
-`gmail` / `calendar` 키로 조회하므로 **`missing`으로 잘못 표기된다.**
+```python
+PROVIDER_ALIASES = {
+    "gmail":    ["gmail", "google_gmail"],
+    "calendar": ["calendar", "google_calendar"],
+    # 그 외는 동일 이름만
+}
+```
 
-**검증 시 우회 방법** (스크립트 수정 전까지):
+콘솔 출력은 canonical 이름(`gmail` / `calendar`)을 그대로 유지하되
+실제 매칭된 row가 alias라면 `source=google_gmail` 같은 suffix를 붙인다.
+JSON 출력은 항상 `source_provider`와 `provider_candidates` 필드를 포함한다.
+
+```text
+gmail              connected             source=google_gmail  scopes=...
+calendar           connected             source=google_calendar  scopes=...
+gmail              missing               reason=no tenant integration row  candidates=gmail,google_gmail
+```
+
+**교차 검증** (alias 적용 외에도 확인하고 싶을 때):
 
 ```bash
-# OAuth 라우터의 status endpoint를 직접 호출해 실제 저장 여부 확인
 curl "http://localhost:8000/api/v1/oauth/google_gmail/status?tenant_id=<uuid>"
 curl "http://localhost:8000/api/v1/oauth/google_calendar/status?tenant_id=<uuid>"
 curl "http://localhost:8000/api/v1/oauth/slack/status?tenant_id=<uuid>"
@@ -129,8 +144,6 @@ curl "http://localhost:8000/api/v1/oauth/jira/status?tenant_id=<uuid>"
 
 또는 `.local/tenant_integrations.json`을 직접 열어 `tenant_id::google_gmail`
 키가 있는지 확인한다.
-
-후속 작업으로 readiness 스크립트에 alias map (`google_gmail` → `gmail`, `google_calendar` → `calendar`) 적용을 권장한다.
 
 ### 4-3. provider별 요약
 
@@ -551,8 +564,6 @@ real을 켰지만 OAuth/env 미충족이면 `success`가 아닌 `skipped` /
 
 ## 14. 후속 작업
 
-- `check_post_call_integrations.py`에 provider alias map 적용
-  (`google_gmail` → `gmail`, `google_calendar` → `calendar`)
 - `.env.example`에 `TOKEN_ENCRYPTION_KEY`, `TENANT_INTEGRATION_STORAGE`,
   `TENANT_INTEGRATION_FILE_PATH`, `MCP_USE_TENANT_OAUTH`,
   `MCP_ALLOW_ENV_FALLBACK`, `NOTION_*`, `SOLAPI_*` 보강
