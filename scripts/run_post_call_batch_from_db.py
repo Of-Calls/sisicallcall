@@ -6,14 +6,22 @@
     python scripts/run_post_call_batch_from_db.py --all-tenants --limit 10 --llm-mode mock
     python scripts/run_post_call_batch_from_db.py --tenant-id <uuid> --limit 5 --llm-mode mock --dry-run
     python scripts/run_post_call_batch_from_db.py --all-tenants --limit 10 --llm-mode mock --only-missing-results --dry-run
+
+export 예:
+    python scripts/run_post_call_batch_from_db.py --tenant-id <uuid> --limit 5 --llm-mode mock --output .local/reports/batch.json
+    python scripts/run_post_call_batch_from_db.py --tenant-id <uuid> --limit 5 --llm-mode mock --output .local/reports/batch.csv --output-format csv
+    python scripts/run_post_call_batch_from_db.py --tenant-id <uuid> --limit 5 --llm-mode mock --output .local/reports/batch.md --output-format md
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
+import csv
+import json
 import os
 import sys
 from collections import Counter
+from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -338,7 +346,203 @@ async def fetch_tenant_report(conn, tenant_id: str) -> dict:
     }
 
 
-# ── Output helpers ────────────────────────────────────────────────────────────
+# ── Export helpers ────────────────────────────────────────────────────────────
+
+_CSV_COLUMNS = [
+    "status",
+    "call_id",
+    "tenant_id",
+    "transcript_count",
+    "review_verdict",
+    "review_confidence",
+    "review_confidence_source",
+    "human_review_required",
+    "primary_category",
+    "customer_emotion",
+    "resolution_status",
+    "priority",
+    "sentiment",
+    "action_plan_count",
+    "executed_count",
+    "action_success",
+    "action_skipped",
+    "action_failed",
+    "error",
+]
+
+
+def _infer_output_format(path: str, explicit_format: str | None) -> str:
+    """Return the effective export format string (json | csv | md)."""
+    if explicit_format:
+        return explicit_format.lower()
+    ext = os.path.splitext(path)[1].lower()
+    return {".json": "json", ".csv": "csv", ".md": "md", ".markdown": "md"}.get(ext, "json")
+
+
+def _ensure_parent_dir(path: str) -> None:
+    parent = os.path.dirname(os.path.abspath(path))
+    os.makedirs(parent, exist_ok=True)
+
+
+def _serialize_row(row: dict) -> dict:
+    """Convert asyncpg row values to JSON-serializable primitives."""
+    result: dict = {}
+    for k, v in row.items():
+        result[k] = v.isoformat() if hasattr(v, "isoformat") else v
+    return result
+
+
+def _format_report_for_json(report: dict) -> dict:
+    return {
+        "call_type": report.get("call_type", {}),
+        "emotion": report.get("emotion", {}),
+        "priority": report.get("priority", {}),
+        "resolution": report.get("resolution", {}),
+        "data_quality": {
+            "missing_primary_category": report.get("missing_primary_category", 0),
+            "tenant_mismatch_summary": report.get("tenant_mismatch_summary", 0),
+            "tenant_mismatch_voc": report.get("tenant_mismatch_voc", 0),
+            "tenant_mismatch_action_logs": report.get("tenant_mismatch_action_logs", 0),
+        },
+    }
+
+
+def export_json(
+    path: str,
+    metadata: dict,
+    targets: list[dict],
+    records: list[dict],
+    tenant_reports: dict[str, dict],
+) -> None:
+    payload = {
+        "metadata": metadata,
+        "targets": [_serialize_row(t) for t in targets],
+        "records": records,
+        "tenant_reports": {
+            tid: _format_report_for_json(rep)
+            for tid, rep in tenant_reports.items()
+        },
+    }
+    _ensure_parent_dir(path)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2, default=str)
+
+
+def export_csv(path: str, records: list[dict]) -> None:
+    _ensure_parent_dir(path)
+    with open(path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=_CSV_COLUMNS, extrasaction="ignore", restval="")
+        writer.writeheader()
+        for r in records:
+            row = {
+                col: ("" if r.get(col) is None else r.get(col, ""))
+                for col in _CSV_COLUMNS
+            }
+            writer.writerow(row)
+
+
+def export_markdown(
+    path: str,
+    metadata: dict,
+    targets: list[dict],
+    records: list[dict],
+    tenant_reports: dict[str, dict],
+) -> None:
+    lines: list[str] = []
+    lines.append("# Post-call Batch Report\n")
+
+    # ── Metadata ─────────────────────────────────────────────────────────────
+    lines.append("## Metadata\n")
+    lines.append("| Field | Value |")
+    lines.append("|---|---|")
+    for k, v in metadata.items():
+        lines.append(f"| {k} | {v} |")
+    lines.append("")
+
+    # ── Call Results ──────────────────────────────────────────────────────────
+    lines.append("## Call Results\n")
+    lines.append(
+        "| Status | Call ID | Tenant | Category | Emotion | Priority | Review | Confidence | Actions |"
+    )
+    lines.append("|---|---|---|---|---|---|---|---|---|")
+    for r in records:
+        conf = r.get("review_confidence")
+        conf_str = f"{conf:.2f}" if isinstance(conf, float) else "—"
+        tenant_short = str(r.get("tenant_id", "—"))[:8] + "..."
+        lines.append(
+            f"| {r.get('status', '—')} "
+            f"| {r.get('call_id', '—')} "
+            f"| {tenant_short} "
+            f"| {r.get('primary_category', '—')} "
+            f"| {r.get('customer_emotion', '—')} "
+            f"| {r.get('priority', '—')} "
+            f"| {r.get('review_verdict', '—')} "
+            f"| {conf_str} "
+            f"| {r.get('action_plan_count', '—')} |"
+        )
+    lines.append("")
+
+    # ── Tenant Reports ────────────────────────────────────────────────────────
+    if tenant_reports:
+        lines.append("## Tenant Reports\n")
+        for tid, report in tenant_reports.items():
+            lines.append(f"### Tenant: {tid}\n")
+
+            for section_label, key in [
+                ("Call Type", "call_type"),
+                ("Emotion", "emotion"),
+                ("Priority", "priority"),
+                ("Resolution", "resolution"),
+            ]:
+                data = report.get(key, {})
+                lines.append(f"#### {section_label}\n")
+                lines.append("| Type | Count |")
+                lines.append("|---|---:|")
+                for label, cnt in data.items():
+                    lines.append(f"| {label} | {cnt} |")
+                lines.append("")
+
+            lines.append("#### Data Quality\n")
+            lines.append("| Check | Count |")
+            lines.append("|---|---:|")
+            for check in [
+                "missing_primary_category",
+                "tenant_mismatch_summary",
+                "tenant_mismatch_voc",
+                "tenant_mismatch_action_logs",
+            ]:
+                lines.append(f"| {check} | {report.get(check, 0)} |")
+            lines.append("")
+
+    _ensure_parent_dir(path)
+    # utf-8-sig: Windows CMD/메모장/Excel 계열 도구에서 한국어 BOM 인식 향상.
+    with open(path, "w", encoding="utf-8-sig") as f:
+        f.write("\n".join(lines))
+
+
+def write_report(
+    output: str,
+    output_format: str | None,
+    metadata: dict,
+    targets: list[dict],
+    records: list[dict],
+    tenant_reports: dict[str, dict],
+) -> None:
+    fmt = _infer_output_format(output, output_format)
+    try:
+        if fmt == "csv":
+            export_csv(output, records)
+        elif fmt == "md":
+            export_markdown(output, metadata, targets, records, tenant_reports)
+        else:
+            export_json(output, metadata, targets, records, tenant_reports)
+        print(f"\nReport written: {output}")
+    except Exception as exc:
+        print(f"\n{_c(_RED, 'Failed to write batch report')} output={output} err={exc}")
+        sys.exit(1)
+
+
+# ── Console output helpers ────────────────────────────────────────────────────
 
 def _print_sep(title: str = "") -> None:
     print()
@@ -412,10 +616,7 @@ def _print_tenant_report(
     _print_dist("priority", report["priority"])
     _print_dist("resolution", report["resolution"])
 
-    verdict_counts = Counter(
-        r.get("review_verdict", "—")
-        for r in ok_results
-    )
+    verdict_counts = Counter(r.get("review_verdict", "—") for r in ok_results)
     print("  review (이번 batch 기준):")
     if verdict_counts:
         for verdict, cnt in verdict_counts.items():
@@ -442,6 +643,8 @@ async def _main(
     dry_run: bool,
     only_missing_results: bool,
     trigger: str,
+    output: str | None = None,
+    output_format: str | None = None,
 ) -> None:
     effective_llm = _apply_llm_mode(llm_mode)
     if effective_llm == "real":
@@ -469,6 +672,9 @@ async def _main(
         print(f"  filter    : only-missing-results")
     if dry_run:
         print(f"\n  {_c(_YELLOW + _BOLD, 'DRY RUN: no post-call execution will be performed')}")
+    if output:
+        fmt = _infer_output_format(output, output_format)
+        print(f"  output    : {output}  ({fmt})")
     if effective_llm == "real" and not post_call_openai_key_available():
         print(
             f"  LLM warn  : {_c(_YELLOW, 'OPENAI_API_KEY is missing; real LLM will fall back to mock')}"
@@ -494,6 +700,18 @@ async def _main(
 
     print(f"  targets   : {len(calls)}")
 
+    # ── Metadata for export ──────────────────────────────────────────────────
+    metadata = {
+        "llm_mode": effective_llm,
+        "tenant_id": tenant_id,
+        "all_tenants": all_tenants,
+        "limit": limit,
+        "offset": offset,
+        "dry_run": dry_run,
+        "only_missing_results": only_missing_results,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
     # ── Print target list ────────────────────────────────────────────────────
     _print_sep("대상 calls")
     if not calls:
@@ -515,12 +733,16 @@ async def _main(
                 )
 
     if not calls:
+        if output:
+            write_report(output, output_format, metadata, calls, [], {})
         return
 
     # ── Execute (or dry-run) ─────────────────────────────────────────────────
     results = await run_batch(calls=calls, trigger=trigger, dry_run=dry_run)
 
     if dry_run:
+        if output:
+            write_report(output, output_format, metadata, calls, results, {})
         return
 
     ok_count = sum(1 for r in results if r["status"] == "ok")
@@ -533,31 +755,38 @@ async def _main(
     print(f"\n  합계: {ok_count} ok  {skip_count} skip  {fail_count} fail")
 
     # ── Tenant report ────────────────────────────────────────────────────────
+    all_tenant_reports: dict[str, dict] = {}
     tenant_ids: list[str] = _collect_tenant_ids(tenant_id, all_tenants, results)
-    if not tenant_ids:
-        return
 
-    _print_sep("tenant별 dashboard 원천 데이터 요약")
+    if tenant_ids:
+        _print_sep("tenant별 dashboard 원천 데이터 요약")
 
-    try:
-        conn = await asyncpg.connect(_database_url())
-    except Exception as exc:
-        print(f"\n{_c(_RED, 'DB connection failed for report:')} {exc}")
-        return
+        try:
+            conn = await asyncpg.connect(_database_url())
+        except Exception as exc:
+            print(f"\n{_c(_RED, 'DB connection failed for report:')} {exc}")
+            if output:
+                write_report(output, output_format, metadata, calls, results, {})
+            return
 
-    try:
-        for tid in tenant_ids:
-            ok_for_tenant = [
-                r for r in results
-                if r.get("tenant_id") == tid and r["status"] == "ok"
-            ]
-            try:
-                report = await fetch_tenant_report(conn, tid)
-                _print_tenant_report(tid, report, ok_for_tenant)
-            except Exception as exc:
-                print(f"  tenant_id={tid}  report_error={exc}")
-    finally:
-        await conn.close()
+        try:
+            for tid in tenant_ids:
+                ok_for_tenant = [
+                    r for r in results
+                    if r.get("tenant_id") == tid and r["status"] == "ok"
+                ]
+                try:
+                    report = await fetch_tenant_report(conn, tid)
+                    all_tenant_reports[tid] = report
+                    _print_tenant_report(tid, report, ok_for_tenant)
+                except Exception as exc:
+                    print(f"  tenant_id={tid}  report_error={exc}")
+        finally:
+            await conn.close()
+
+    # ── Export ────────────────────────────────────────────────────────────────
+    if output:
+        write_report(output, output_format, metadata, calls, results, all_tenant_reports)
 
 
 def _collect_tenant_ids(
@@ -613,6 +842,18 @@ def main() -> None:
         default="call_ended",
         choices=["call_ended", "escalation_immediate", "manual"],
     )
+    parser.add_argument(
+        "--output",
+        default=None,
+        metavar="PATH",
+        help="report 저장 경로 (.json / .csv / .md). 부모 디렉터리가 없으면 자동 생성",
+    )
+    parser.add_argument(
+        "--output-format",
+        choices=["json", "csv", "md"],
+        default=None,
+        help="저장 형식. 미지정 시 --output 확장자로 자동 추론, 기본값 json",
+    )
     args = parser.parse_args()
 
     asyncio.run(
@@ -625,6 +866,8 @@ def main() -> None:
             dry_run=args.dry_run,
             only_missing_results=args.only_missing_results,
             trigger=args.trigger,
+            output=args.output,
+            output_format=args.output_format,
         )
     )
 

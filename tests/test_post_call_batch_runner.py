@@ -1,8 +1,10 @@
 """Tests for scripts/run_post_call_batch_from_db.py"""
 from __future__ import annotations
 
-import sys
+import csv
+import json
 import os
+import sys
 
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -421,6 +423,261 @@ class TestCollectTenantIds:
         assert ids == []
 
 
+# ── Report export ────────────────────────────────────────────────────────────
+
+class TestReportExport:
+    # format inference
+    def test_infer_format_json_extension(self):
+        from scripts.run_post_call_batch_from_db import _infer_output_format
+        assert _infer_output_format("report.json", None) == "json"
+
+    def test_infer_format_csv_extension(self):
+        from scripts.run_post_call_batch_from_db import _infer_output_format
+        assert _infer_output_format("report.csv", None) == "csv"
+
+    def test_infer_format_md_extension(self):
+        from scripts.run_post_call_batch_from_db import _infer_output_format
+        assert _infer_output_format("report.md", None) == "md"
+
+    def test_infer_format_markdown_extension(self):
+        from scripts.run_post_call_batch_from_db import _infer_output_format
+        assert _infer_output_format("report.markdown", None) == "md"
+
+    def test_infer_format_unknown_extension_defaults_to_json(self):
+        from scripts.run_post_call_batch_from_db import _infer_output_format
+        assert _infer_output_format("report.txt", None) == "json"
+        assert _infer_output_format("report", None) == "json"
+
+    def test_explicit_format_overrides_extension(self):
+        from scripts.run_post_call_batch_from_db import _infer_output_format
+        assert _infer_output_format("report.json", "csv") == "csv"
+        assert _infer_output_format("report.csv", "md") == "md"
+
+    # JSON export
+    def test_export_json_contains_required_keys(self, tmp_path):
+        from scripts.run_post_call_batch_from_db import export_json
+
+        output = str(tmp_path / "report.json")
+        export_json(
+            path=output,
+            metadata={"llm_mode": "mock", "tenant_id": "tid-a"},
+            targets=[{"call_id": "c1", "tenant_id": "tid-a", "transcript_count": 5}],
+            records=[_ok_record()],
+            tenant_reports={"tid-a": _ok_tenant_report()},
+        )
+
+        data = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))
+        assert "metadata" in data
+        assert "targets" in data
+        assert "records" in data
+        assert "tenant_reports" in data
+        assert data["metadata"]["llm_mode"] == "mock"
+        assert len(data["records"]) == 1
+        assert "tid-a" in data["tenant_reports"]
+
+    def test_export_json_tenant_report_has_data_quality(self, tmp_path):
+        from scripts.run_post_call_batch_from_db import export_json
+
+        output = str(tmp_path / "report.json")
+        export_json(
+            path=output,
+            metadata={},
+            targets=[],
+            records=[],
+            tenant_reports={"tid-a": _ok_tenant_report()},
+        )
+
+        data = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))
+        tid_report = data["tenant_reports"]["tid-a"]
+        assert "data_quality" in tid_report
+        assert "missing_primary_category" in tid_report["data_quality"]
+        assert "tenant_mismatch_action_logs" in tid_report["data_quality"]
+
+    # CSV export
+    def test_export_csv_contains_required_columns(self, tmp_path):
+        from scripts.run_post_call_batch_from_db import export_csv
+
+        output = str(tmp_path / "report.csv")
+        export_csv(path=output, records=[_ok_record()])
+
+        with open(output, encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            columns = reader.fieldnames or []
+
+        required = [
+            "status", "call_id", "tenant_id", "transcript_count",
+            "review_verdict", "review_confidence", "primary_category",
+            "customer_emotion", "resolution_status", "priority",
+            "action_plan_count", "executed_count",
+            "action_success", "action_skipped", "action_failed",
+            "error",
+        ]
+        for col in required:
+            assert col in columns, f"Missing CSV column: {col}"
+
+    def test_export_csv_utf8_sig_encoding(self, tmp_path):
+        from scripts.run_post_call_batch_from_db import export_csv
+
+        output = str(tmp_path / "report.csv")
+        export_csv(path=output, records=[_ok_record()])
+
+        raw = (tmp_path / "report.csv").read_bytes()
+        assert raw[:3] == b"\xef\xbb\xbf", "CSV must start with UTF-8 BOM (utf-8-sig)"
+
+    def test_export_csv_dry_run_records(self, tmp_path):
+        from scripts.run_post_call_batch_from_db import export_csv
+
+        records = [
+            {"call_id": "c1", "tenant_id": "tid-a", "transcript_count": 5, "status": "dry_run"},
+        ]
+        output = str(tmp_path / "dry_run.csv")
+        export_csv(path=output, records=records)
+
+        with open(output, encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            rows = list(reader)
+
+        assert len(rows) == 1
+        assert rows[0]["status"] == "dry_run"
+        assert rows[0]["call_id"] == "c1"
+
+    def test_export_csv_none_values_become_empty_string(self, tmp_path):
+        from scripts.run_post_call_batch_from_db import export_csv
+
+        record = {**_ok_record(), "error": None, "review_confidence": None}
+        output = str(tmp_path / "report.csv")
+        export_csv(path=output, records=[record])
+
+        with open(output, encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            rows = list(reader)
+
+        assert rows[0]["error"] == ""
+        assert rows[0]["review_confidence"] == ""
+
+    # Markdown export
+    def test_export_markdown_contains_required_sections(self, tmp_path):
+        from scripts.run_post_call_batch_from_db import export_markdown
+
+        output = str(tmp_path / "report.md")
+        export_markdown(
+            path=output,
+            metadata={"llm_mode": "mock"},
+            targets=[],
+            records=[_ok_record()],
+            tenant_reports={"tid-a": _ok_tenant_report()},
+        )
+
+        content = (tmp_path / "report.md").read_text(encoding="utf-8")
+        assert "# Post-call Batch Report" in content
+        assert "## Metadata" in content
+        assert "## Call Results" in content
+        assert "## Tenant Reports" in content
+        assert "#### Data Quality" in content
+
+    def test_export_markdown_utf8_sig_encoding(self, tmp_path):
+        """Markdown export must start with UTF-8 BOM for Windows tooling."""
+        from scripts.run_post_call_batch_from_db import export_markdown
+
+        output = str(tmp_path / "report.md")
+        export_markdown(
+            path=output,
+            metadata={"llm_mode": "mock"},
+            targets=[],
+            records=[_ok_record()],
+            tenant_reports={"tid-a": _ok_tenant_report()},
+        )
+
+        raw = (tmp_path / "report.md").read_bytes()
+        assert raw[:3] == b"\xef\xbb\xbf", "Markdown must start with UTF-8 BOM (utf-8-sig)"
+
+    def test_export_markdown_preserves_korean_strings(self, tmp_path):
+        """Korean characters in records and tenant reports must round-trip intact."""
+        from scripts.run_post_call_batch_from_db import export_markdown
+
+        output = str(tmp_path / "report.md")
+        export_markdown(
+            path=output,
+            metadata={},
+            targets=[],
+            records=[_ok_record()],
+            tenant_reports={"tid-a": _ok_tenant_report()},
+        )
+
+        # utf-8-sig decoding strips the BOM transparently
+        content = (tmp_path / "report.md").read_text(encoding="utf-8-sig")
+        assert "예약/일정" in content
+        assert "neutral" in content
+
+    def test_export_markdown_empty_tenant_reports_omits_section(self, tmp_path):
+        from scripts.run_post_call_batch_from_db import export_markdown
+
+        output = str(tmp_path / "report.md")
+        export_markdown(
+            path=output,
+            metadata={},
+            targets=[],
+            records=[],
+            tenant_reports={},
+        )
+
+        content = (tmp_path / "report.md").read_text(encoding="utf-8")
+        assert "## Tenant Reports" not in content
+
+    # Parent directory creation
+    def test_output_parent_dir_created_for_json(self, tmp_path):
+        from scripts.run_post_call_batch_from_db import export_json
+
+        output = str(tmp_path / "nested" / "deep" / "report.json")
+        export_json(path=output, metadata={}, targets=[], records=[], tenant_reports={})
+
+        assert os.path.isfile(output)
+
+    def test_output_parent_dir_created_for_csv(self, tmp_path):
+        from scripts.run_post_call_batch_from_db import export_csv
+
+        output = str(tmp_path / "sub" / "report.csv")
+        export_csv(path=output, records=[])
+
+        assert os.path.isfile(output)
+
+    def test_output_parent_dir_created_for_markdown(self, tmp_path):
+        from scripts.run_post_call_batch_from_db import export_markdown
+
+        output = str(tmp_path / "sub" / "report.md")
+        export_markdown(path=output, metadata={}, targets=[], records=[], tenant_reports={})
+
+        assert os.path.isfile(output)
+
+    # write_report dispatcher
+    def test_write_report_dispatches_json_by_extension(self, tmp_path):
+        from scripts.run_post_call_batch_from_db import write_report
+
+        output = str(tmp_path / "out.json")
+        write_report(output, None, {}, [], [], {})
+
+        data = json.loads((tmp_path / "out.json").read_text(encoding="utf-8"))
+        assert "metadata" in data
+
+    def test_write_report_dispatches_csv_by_explicit_format(self, tmp_path):
+        from scripts.run_post_call_batch_from_db import write_report
+
+        output = str(tmp_path / "out.csv")
+        write_report(output, "csv", {}, [], [_ok_record()], {})
+
+        raw = (tmp_path / "out.csv").read_bytes()
+        assert raw[:3] == b"\xef\xbb\xbf"
+
+    def test_write_report_dispatches_md_by_extension(self, tmp_path):
+        from scripts.run_post_call_batch_from_db import write_report
+
+        output = str(tmp_path / "out.md")
+        write_report(output, None, {"llm_mode": "mock"}, [], [], {})
+
+        content = (tmp_path / "out.md").read_text(encoding="utf-8")
+        assert "# Post-call Batch Report" in content
+
+
 # ── helpers ───────────────────────────────────────────────────────────────────
 
 def _ok_outcome() -> dict:
@@ -452,4 +709,43 @@ def _ok_outcome() -> dict:
             "partial_success": False,
         },
         "error": None,
+    }
+
+
+def _ok_record() -> dict:
+    """Flat result record as returned by extract_call_result (status=ok)."""
+    return {
+        "status": "ok",
+        "call_id": "call-001",
+        "tenant_id": "tid-a",
+        "transcript_count": 10,
+        "review_verdict": "pass",
+        "review_confidence": 0.92,
+        "review_confidence_source": "llm",
+        "human_review_required": False,
+        "primary_category": "예약/일정",
+        "customer_emotion": "neutral",
+        "resolution_status": "resolved",
+        "priority": "medium",
+        "sentiment": "neutral",
+        "action_plan_count": 1,
+        "executed_count": 2,
+        "action_success": 1,
+        "action_skipped": 1,
+        "action_failed": 0,
+        "error": None,
+    }
+
+
+def _ok_tenant_report() -> dict:
+    """Tenant report dict as returned by fetch_tenant_report."""
+    return {
+        "call_type": {"예약/일정": 1},
+        "emotion": {"neutral": 1},
+        "priority": {"medium": 1},
+        "resolution": {"resolved": 1},
+        "missing_primary_category": 0,
+        "tenant_mismatch_summary": 0,
+        "tenant_mismatch_voc": 0,
+        "tenant_mismatch_action_logs": 0,
     }
