@@ -143,6 +143,16 @@ async def _run(
     connector_modes = _apply_connector_modes(real_actions, only_tool)
     _print_connector_modes(connector_modes)
 
+    if real_actions:
+        print(
+            f"\n  {_c(_YELLOW, 'Real actions enabled.')} "
+            f"Make sure tenant integrations are connected."
+        )
+        print(
+            f"  Run: python scripts/check_post_call_integrations.py "
+            f"--tenant-id {tenant_id} --show-actions"
+        )
+
     effective_llm_mode = _apply_llm_mode(llm_mode)
     if effective_llm_mode == "real":
         print(f"\n  LLM       : {_c(_GREEN, describe_post_call_llm())}")
