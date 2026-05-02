@@ -33,6 +33,7 @@ import asyncpg  # noqa: E402
 
 from app.agents.post_call import completed_call_runner as runner_mod  # noqa: E402
 from app.agents.post_call.llm_caller import (  # noqa: E402
+    compute_estimated_cost_usd,
     describe_post_call_llm,
     get_post_call_llm_mode,
     post_call_openai_key_available,
@@ -131,6 +132,24 @@ async def fetch_target_calls(
 
 # ── Per-call result extraction ────────────────────────────────────────────────
 
+def _usage_tokens(usage: dict | None) -> tuple[int | None, int | None, int | None]:
+    """Return (prompt_tokens, completion_tokens, total_tokens) from a usage dict."""
+    if not isinstance(usage, dict):
+        return None, None, None
+    return (
+        usage.get("prompt_tokens"),
+        usage.get("completion_tokens"),
+        usage.get("total_tokens"),
+    )
+
+
+def _sum_optional(*values: int | None) -> int | None:
+    """Sum integers ignoring None. Returns None if all values are None."""
+    if all(v is None for v in values):
+        return None
+    return sum(int(v) for v in values if v is not None)
+
+
 def extract_call_result(
     call_id: str,
     tenant_id: str,
@@ -156,6 +175,31 @@ def extract_call_result(
     executed = result.get("executed_actions") or []
     actions = (result.get("action_plan") or {}).get("actions") or []
 
+    # ── LLM usage 추출 (real LLM 모드에서만 채워짐) ───────────────────────────
+    analysis_usage = result.get("analysis_llm_usage")
+    review_usage = result.get("review_llm_usage")
+
+    a_pt, a_ct, a_tt = _usage_tokens(analysis_usage)
+    r_pt, r_ct, r_tt = _usage_tokens(review_usage)
+
+    total_pt = _sum_optional(a_pt, r_pt)
+    total_ct = _sum_optional(a_ct, r_ct)
+    total_tt = _sum_optional(a_tt, r_tt)
+
+    model = None
+    for usage in (analysis_usage, review_usage):
+        if isinstance(usage, dict) and usage.get("model"):
+            model = usage["model"]
+            break
+
+    estimated_cost = compute_estimated_cost_usd(total_pt, total_ct, model)
+
+    fallback = bool(
+        (isinstance(analysis_usage, dict) and analysis_usage.get("fallback"))
+        or (isinstance(review_usage, dict) and review_usage.get("fallback"))
+        or (review_result.get("llm_fallback"))
+    )
+
     return {
         **base,
         "status": "ok",
@@ -176,6 +220,19 @@ def extract_call_result(
         "primary_category": intent_result.get("primary_category") or "—",
         "priority": priority_result.get("priority") or "—",
         "sentiment": sentiment_result.get("sentiment") or "—",
+        # ── LLM usage / cost / fallback ─────────────────────────────────────
+        "llm_model": model,
+        "llm_fallback": fallback,
+        "analysis_prompt_tokens": a_pt,
+        "analysis_completion_tokens": a_ct,
+        "analysis_total_tokens": a_tt,
+        "review_prompt_tokens": r_pt,
+        "review_completion_tokens": r_ct,
+        "review_total_tokens": r_tt,
+        "total_prompt_tokens": total_pt,
+        "total_completion_tokens": total_ct,
+        "total_tokens": total_tt,
+        "estimated_cost_usd": estimated_cost,
         "error": None,
     }
 
@@ -367,8 +424,83 @@ _CSV_COLUMNS = [
     "action_success",
     "action_skipped",
     "action_failed",
+    # ── LLM usage / cost / fallback ─────────────────────────────────────────
+    "llm_model",
+    "llm_mode",
+    "llm_fallback",
+    "analysis_prompt_tokens",
+    "analysis_completion_tokens",
+    "analysis_total_tokens",
+    "review_prompt_tokens",
+    "review_completion_tokens",
+    "review_total_tokens",
+    "total_prompt_tokens",
+    "total_completion_tokens",
+    "total_tokens",
+    "estimated_cost_usd",
     "error",
 ]
+
+
+def compute_usage_summary(records: list[dict]) -> dict:
+    """Aggregate per-call usage into a batch-wide summary.
+
+    Only ``status == "ok"`` records contribute. Mock-mode records have
+    ``total_tokens == None`` and contribute zero to the totals while still
+    counting toward ``calls_with_usage`` only when actual tokens are present.
+    """
+    a_pt = a_ct = a_tt = 0
+    r_pt = r_ct = r_tt = 0
+    calls_with_usage = 0
+    fallback_calls = 0
+    model: str | None = None
+
+    for r in records:
+        if r.get("status") != "ok":
+            continue
+        if r.get("llm_fallback"):
+            fallback_calls += 1
+        if r.get("total_tokens") is not None:
+            calls_with_usage += 1
+        if not model and r.get("llm_model"):
+            model = r["llm_model"]
+
+        a_pt += r.get("analysis_prompt_tokens") or 0
+        a_ct += r.get("analysis_completion_tokens") or 0
+        a_tt += r.get("analysis_total_tokens") or 0
+        r_pt += r.get("review_prompt_tokens") or 0
+        r_ct += r.get("review_completion_tokens") or 0
+        r_tt += r.get("review_total_tokens") or 0
+
+    total_pt = a_pt + r_pt
+    total_ct = a_ct + r_ct
+    total_tt = a_tt + r_tt
+
+    estimated_cost = (
+        compute_estimated_cost_usd(total_pt, total_ct, model) if model else None
+    )
+
+    return {
+        "model": model,
+        "calls_with_usage": calls_with_usage,
+        "fallback_calls": fallback_calls,
+        "analysis": {
+            "prompt_tokens": a_pt,
+            "completion_tokens": a_ct,
+            "total_tokens": a_tt,
+        },
+        "review": {
+            "prompt_tokens": r_pt,
+            "completion_tokens": r_ct,
+            "total_tokens": r_tt,
+        },
+        "total": {
+            "prompt_tokens": total_pt,
+            "completion_tokens": total_ct,
+            "total_tokens": total_tt,
+            "estimated_cost_usd": estimated_cost,
+        },
+    }
 
 
 def _infer_output_format(path: str, explicit_format: str | None) -> str:
@@ -413,6 +545,7 @@ def export_json(
     targets: list[dict],
     records: list[dict],
     tenant_reports: dict[str, dict],
+    usage_summary: dict | None = None,
 ) -> None:
     payload = {
         "metadata": metadata,
@@ -422,6 +555,7 @@ def export_json(
             tid: _format_report_for_json(rep)
             for tid, rep in tenant_reports.items()
         },
+        "usage_summary": usage_summary or compute_usage_summary(records),
     }
     _ensure_parent_dir(path)
     with open(path, "w", encoding="utf-8") as f:
@@ -447,6 +581,7 @@ def export_markdown(
     targets: list[dict],
     records: list[dict],
     tenant_reports: dict[str, dict],
+    usage_summary: dict | None = None,
 ) -> None:
     lines: list[str] = []
     lines.append("# Post-call Batch Report\n")
@@ -462,25 +597,73 @@ def export_markdown(
     # ── Call Results ──────────────────────────────────────────────────────────
     lines.append("## Call Results\n")
     lines.append(
-        "| Status | Call ID | Tenant | Category | Emotion | Priority | Review | Confidence | Actions |"
+        "| Status | Call ID | Tenant | Category | Priority | Review | Tokens | Cost | Fallback |"
     )
-    lines.append("|---|---|---|---|---|---|---|---|---|")
+    lines.append("|---|---|---|---|---|---|---:|---:|---|")
     for r in records:
         conf = r.get("review_confidence")
         conf_str = f"{conf:.2f}" if isinstance(conf, float) else "—"
+        review_combined = (
+            f"{r.get('review_verdict', '—')} / {conf_str}"
+            if r.get("review_verdict")
+            else "—"
+        )
         tenant_short = str(r.get("tenant_id", "—"))[:8] + "..."
+
+        tokens = r.get("total_tokens")
+        tokens_str = f"{tokens:,}" if isinstance(tokens, int) else "—"
+        cost = r.get("estimated_cost_usd")
+        cost_str = f"${cost:.4f}" if isinstance(cost, float) else "—"
+        fallback_str = "true" if r.get("llm_fallback") else "false"
+
         lines.append(
             f"| {r.get('status', '—')} "
             f"| {r.get('call_id', '—')} "
             f"| {tenant_short} "
             f"| {r.get('primary_category', '—')} "
-            f"| {r.get('customer_emotion', '—')} "
             f"| {r.get('priority', '—')} "
-            f"| {r.get('review_verdict', '—')} "
-            f"| {conf_str} "
-            f"| {r.get('action_plan_count', '—')} |"
+            f"| {review_combined} "
+            f"| {tokens_str} "
+            f"| {cost_str} "
+            f"| {fallback_str} |"
         )
     lines.append("")
+
+    # ── LLM Usage Summary ─────────────────────────────────────────────────────
+    summary = usage_summary if usage_summary is not None else compute_usage_summary(records)
+    lines.append("## LLM Usage Summary\n")
+    if summary.get("calls_with_usage", 0) == 0 and (metadata.get("llm_mode") != "real"):
+        lines.append("usage unavailable in mock mode")
+        lines.append("")
+    else:
+        lines.append("| Field | Value |")
+        lines.append("|---|---|")
+        lines.append(f"| model | {summary.get('model') or '—'} |")
+        lines.append(f"| calls_with_usage | {summary.get('calls_with_usage', 0)} |")
+        lines.append(f"| fallback_calls | {summary.get('fallback_calls', 0)} |")
+        lines.append("")
+
+        for section in ("analysis", "review"):
+            data = summary.get(section, {}) or {}
+            lines.append(f"### {section}\n")
+            lines.append("| Tokens | Count |")
+            lines.append("|---|---:|")
+            lines.append(f"| prompt_tokens | {data.get('prompt_tokens', 0):,} |")
+            lines.append(f"| completion_tokens | {data.get('completion_tokens', 0):,} |")
+            lines.append(f"| total_tokens | {data.get('total_tokens', 0):,} |")
+            lines.append("")
+
+        total = summary.get("total", {}) or {}
+        cost = total.get("estimated_cost_usd")
+        cost_str = f"${cost:.4f} (estimated)" if isinstance(cost, float) else "—"
+        lines.append("### total\n")
+        lines.append("| Field | Value |")
+        lines.append("|---|---:|")
+        lines.append(f"| prompt_tokens | {total.get('prompt_tokens', 0):,} |")
+        lines.append(f"| completion_tokens | {total.get('completion_tokens', 0):,} |")
+        lines.append(f"| total_tokens | {total.get('total_tokens', 0):,} |")
+        lines.append(f"| estimated_cost_usd | {cost_str} |")
+        lines.append("")
 
     # ── Tenant Reports ────────────────────────────────────────────────────────
     if tenant_reports:
@@ -527,15 +710,16 @@ def write_report(
     targets: list[dict],
     records: list[dict],
     tenant_reports: dict[str, dict],
+    usage_summary: dict | None = None,
 ) -> None:
     fmt = _infer_output_format(output, output_format)
     try:
         if fmt == "csv":
             export_csv(output, records)
         elif fmt == "md":
-            export_markdown(output, metadata, targets, records, tenant_reports)
+            export_markdown(output, metadata, targets, records, tenant_reports, usage_summary)
         else:
-            export_json(output, metadata, targets, records, tenant_reports)
+            export_json(output, metadata, targets, records, tenant_reports, usage_summary)
         print(f"\nReport written: {output}")
     except Exception as exc:
         print(f"\n{_c(_RED, 'Failed to write batch report')} output={output} err={exc}")
@@ -602,6 +786,37 @@ def _print_dist(label: str, data: dict[str, int]) -> None:
             print(f"    {k}  {v}")
     else:
         print("    (데이터 없음)")
+
+
+def _print_usage_summary(metadata: dict, summary: dict) -> None:
+    print()
+    print(_SEP)
+    print("LLM Usage Summary")
+    print(_SEP)
+
+    if summary.get("calls_with_usage", 0) == 0 and metadata.get("llm_mode") != "real":
+        print("  usage unavailable in mock mode")
+        return
+
+    print(f"  model              : {summary.get('model') or '—'}")
+    print(f"  calls with usage   : {summary.get('calls_with_usage', 0)}")
+    print(f"  fallback calls     : {summary.get('fallback_calls', 0)}")
+
+    for section in ("analysis", "review"):
+        data = summary.get(section, {}) or {}
+        print(f"\n  {section}:")
+        print(f"    prompt_tokens     : {data.get('prompt_tokens', 0):,}")
+        print(f"    completion_tokens : {data.get('completion_tokens', 0):,}")
+        print(f"    total_tokens      : {data.get('total_tokens', 0):,}")
+
+    total = summary.get("total", {}) or {}
+    cost = total.get("estimated_cost_usd")
+    cost_str = f"${cost:.4f} (estimated)" if isinstance(cost, float) else "—"
+    print("\n  total:")
+    print(f"    prompt_tokens     : {total.get('prompt_tokens', 0):,}")
+    print(f"    completion_tokens : {total.get('completion_tokens', 0):,}")
+    print(f"    total_tokens      : {total.get('total_tokens', 0):,}")
+    print(f"    estimated_cost    : {cost_str}")
 
 
 def _print_tenant_report(
@@ -740,6 +955,11 @@ async def _main(
     # ── Execute (or dry-run) ─────────────────────────────────────────────────
     results = await run_batch(calls=calls, trigger=trigger, dry_run=dry_run)
 
+    # llm_mode is metadata, not a runner output — stamp it on each record so
+    # CSV/JSON consumers can correlate token counts with the active mode.
+    for r in results:
+        r["llm_mode"] = effective_llm
+
     if dry_run:
         if output:
             write_report(output, output_format, metadata, calls, results, {})
@@ -754,6 +974,10 @@ async def _main(
         _print_result_row(r)
     print(f"\n  합계: {ok_count} ok  {skip_count} skip  {fail_count} fail")
 
+    # ── LLM usage summary ────────────────────────────────────────────────────
+    usage_summary = compute_usage_summary(results)
+    _print_usage_summary(metadata, usage_summary)
+
     # ── Tenant report ────────────────────────────────────────────────────────
     all_tenant_reports: dict[str, dict] = {}
     tenant_ids: list[str] = _collect_tenant_ids(tenant_id, all_tenants, results)
@@ -766,7 +990,10 @@ async def _main(
         except Exception as exc:
             print(f"\n{_c(_RED, 'DB connection failed for report:')} {exc}")
             if output:
-                write_report(output, output_format, metadata, calls, results, {})
+                write_report(
+                    output, output_format, metadata, calls, results, {},
+                    usage_summary=usage_summary,
+                )
             return
 
         try:
@@ -786,7 +1013,10 @@ async def _main(
 
     # ── Export ────────────────────────────────────────────────────────────────
     if output:
-        write_report(output, output_format, metadata, calls, results, all_tenant_reports)
+        write_report(
+            output, output_format, metadata, calls, results, all_tenant_reports,
+            usage_summary=usage_summary,
+        )
 
 
 def _collect_tenant_ids(

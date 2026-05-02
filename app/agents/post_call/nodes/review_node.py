@@ -144,6 +144,7 @@ async def review_node(state: PostCallAgentState) -> dict:
             "priority_result": {},
         }
         reason = str(raw.get("reason") or "")
+        llm_usage = raw.get("_llm_usage") if isinstance(raw.get("_llm_usage"), dict) else None
         review_result = {
             "verdict": verdict,
             "confidence": confidence,
@@ -155,6 +156,7 @@ async def review_node(state: PostCallAgentState) -> dict:
             "reason": reason,
             "llm_fallback": bool(raw.get("_llm_fallback")),
             "llm_fallback_reason": str(raw.get("_llm_fallback_reason") or ""),
+            "llm_usage": llm_usage,
         }
 
         blocked_actions: list[str] = review_result["blocked_actions"]
@@ -196,6 +198,7 @@ async def review_node(state: PostCallAgentState) -> dict:
             "review_verdict": verdict,
             "blocked_actions": blocked_actions,
             "human_review_required": human_review_required,
+            "review_llm_usage": llm_usage,
         }
 
     except Exception as exc:
@@ -206,4 +209,5 @@ async def review_node(state: PostCallAgentState) -> dict:
             "review_verdict": "fail",
             "blocked_actions": [],
             "human_review_required": True,
+            "review_llm_usage": None,
         }

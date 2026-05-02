@@ -678,7 +678,251 @@ class TestReportExport:
         assert "# Post-call Batch Report" in content
 
 
+# ── LLM usage in batch records ────────────────────────────────────────────────
+
+class TestUsageInRecords:
+    def test_extract_call_result_includes_usage_fields(self):
+        from scripts.run_post_call_batch_from_db import extract_call_result
+
+        outcome = _outcome_with_usage(
+            analysis_usage={
+                "purpose": "analysis", "model": "gpt-4o-mini",
+                "prompt_tokens": 1000, "completion_tokens": 200, "total_tokens": 1200,
+                "source": "openai", "fallback": False,
+            },
+            review_usage={
+                "purpose": "review", "model": "gpt-4o-mini",
+                "prompt_tokens": 800, "completion_tokens": 150, "total_tokens": 950,
+                "source": "openai", "fallback": False,
+            },
+        )
+        r = extract_call_result("c1", "t1", 5, outcome)
+
+        assert r["llm_model"] == "gpt-4o-mini"
+        assert r["llm_fallback"] is False
+        assert r["analysis_total_tokens"] == 1200
+        assert r["review_total_tokens"] == 950
+        assert r["total_tokens"] == 2150
+        assert r["total_prompt_tokens"] == 1800
+        assert r["total_completion_tokens"] == 350
+        assert isinstance(r["estimated_cost_usd"], float)
+
+    def test_extract_call_result_mock_mode_usage_none(self):
+        from scripts.run_post_call_batch_from_db import extract_call_result
+
+        outcome = _outcome_with_usage(analysis_usage=None, review_usage=None)
+        r = extract_call_result("c1", "t1", 5, outcome)
+
+        assert r["llm_model"] is None
+        assert r["total_tokens"] is None
+        assert r["estimated_cost_usd"] is None
+
+    def test_extract_call_result_fallback_marked_from_usage(self):
+        from scripts.run_post_call_batch_from_db import extract_call_result
+
+        outcome = _outcome_with_usage(
+            analysis_usage={
+                "purpose": "analysis", "model": "gpt-4o-mini",
+                "prompt_tokens": None, "completion_tokens": None, "total_tokens": None,
+                "source": "fallback", "fallback": True,
+            },
+            review_usage=None,
+        )
+        r = extract_call_result("c1", "t1", 5, outcome)
+
+        assert r["llm_fallback"] is True
+
+
+class TestComputeUsageSummary:
+    def test_aggregates_analysis_and_review_tokens(self):
+        from scripts.run_post_call_batch_from_db import compute_usage_summary
+
+        records = [
+            _record_with_usage(a_pt=100, a_ct=20, a_tt=120, r_pt=80, r_ct=15, r_tt=95, model="gpt-4o-mini"),
+            _record_with_usage(a_pt=200, a_ct=40, a_tt=240, r_pt=160, r_ct=30, r_tt=190, model="gpt-4o-mini"),
+        ]
+        summary = compute_usage_summary(records)
+
+        assert summary["model"] == "gpt-4o-mini"
+        assert summary["calls_with_usage"] == 2
+        assert summary["analysis"]["prompt_tokens"] == 300
+        assert summary["analysis"]["total_tokens"] == 360
+        assert summary["review"]["total_tokens"] == 285
+        assert summary["total"]["total_tokens"] == 645
+        assert summary["total"]["estimated_cost_usd"] is not None
+
+    def test_fallback_calls_counted(self):
+        from scripts.run_post_call_batch_from_db import compute_usage_summary
+
+        ok_record = _record_with_usage(model="gpt-4o-mini")
+        fallback_record = {**ok_record, "llm_fallback": True}
+        summary = compute_usage_summary([ok_record, fallback_record])
+
+        assert summary["fallback_calls"] == 1
+
+    def test_mock_mode_summary_zero_usage(self):
+        from scripts.run_post_call_batch_from_db import compute_usage_summary
+
+        mock_record = {
+            "status": "ok", "call_id": "c1", "tenant_id": "t1",
+            "llm_fallback": False, "llm_model": None, "total_tokens": None,
+            "analysis_prompt_tokens": None, "analysis_completion_tokens": None,
+            "analysis_total_tokens": None,
+            "review_prompt_tokens": None, "review_completion_tokens": None,
+            "review_total_tokens": None,
+        }
+        summary = compute_usage_summary([mock_record])
+
+        assert summary["calls_with_usage"] == 0
+        assert summary["model"] is None
+        assert summary["total"]["total_tokens"] == 0
+        assert summary["total"]["estimated_cost_usd"] is None
+
+    def test_skipped_records_not_counted(self):
+        from scripts.run_post_call_batch_from_db import compute_usage_summary
+
+        records = [
+            _record_with_usage(a_tt=100, r_tt=50, model="gpt-4o-mini"),
+            {"status": "skip", "call_id": "c2"},
+            {"status": "fail", "call_id": "c3", "error": "x"},
+        ]
+        summary = compute_usage_summary(records)
+
+        assert summary["calls_with_usage"] == 1
+        assert summary["analysis"]["total_tokens"] == 100
+
+
+class TestUsageInExports:
+    def test_csv_export_includes_usage_columns(self, tmp_path):
+        from scripts.run_post_call_batch_from_db import _CSV_COLUMNS, export_csv
+
+        for col in [
+            "llm_model", "llm_mode", "llm_fallback",
+            "analysis_prompt_tokens", "analysis_completion_tokens", "analysis_total_tokens",
+            "review_prompt_tokens", "review_completion_tokens", "review_total_tokens",
+            "total_prompt_tokens", "total_completion_tokens", "total_tokens",
+            "estimated_cost_usd",
+        ]:
+            assert col in _CSV_COLUMNS, f"Missing CSV usage column: {col}"
+
+        record = _record_with_usage(model="gpt-4o-mini", a_tt=100, r_tt=50)
+        record["llm_mode"] = "real"
+        record["estimated_cost_usd"] = 0.0001
+        record["total_tokens"] = 150
+
+        output = str(tmp_path / "report.csv")
+        export_csv(path=output, records=[record])
+
+        with open(output, encoding="utf-8-sig") as f:
+            row = list(csv.DictReader(f))[0]
+
+        assert row["llm_model"] == "gpt-4o-mini"
+        assert row["llm_mode"] == "real"
+        assert row["total_tokens"] == "150"
+
+    def test_json_export_includes_usage_summary(self, tmp_path):
+        from scripts.run_post_call_batch_from_db import export_json
+
+        output = str(tmp_path / "report.json")
+        records = [_record_with_usage(model="gpt-4o-mini", a_tt=100, r_tt=50)]
+        export_json(
+            path=output, metadata={"llm_mode": "real"},
+            targets=[], records=records, tenant_reports={},
+        )
+
+        data = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))
+        assert "usage_summary" in data
+        usage = data["usage_summary"]
+        assert usage["model"] == "gpt-4o-mini"
+        assert usage["calls_with_usage"] == 1
+        assert usage["total"]["total_tokens"] == 150
+
+    def test_markdown_export_real_mode_includes_usage_summary(self, tmp_path):
+        from scripts.run_post_call_batch_from_db import export_markdown
+
+        output = str(tmp_path / "report.md")
+        records = [_record_with_usage(model="gpt-4o-mini", a_tt=100, r_tt=50)]
+        export_markdown(
+            path=output, metadata={"llm_mode": "real"},
+            targets=[], records=records, tenant_reports={},
+        )
+
+        content = (tmp_path / "report.md").read_text(encoding="utf-8-sig")
+        assert "## LLM Usage Summary" in content
+        assert "gpt-4o-mini" in content
+        assert "estimated_cost_usd" in content
+
+    def test_markdown_export_mock_mode_shows_unavailable(self, tmp_path):
+        from scripts.run_post_call_batch_from_db import export_markdown
+
+        output = str(tmp_path / "report.md")
+        # mock mode record (no usage)
+        record = {
+            "status": "ok", "call_id": "c1", "tenant_id": "t1",
+            "llm_fallback": False, "llm_model": None, "total_tokens": None,
+            "analysis_total_tokens": None, "review_total_tokens": None,
+            "estimated_cost_usd": None,
+        }
+        export_markdown(
+            path=output, metadata={"llm_mode": "mock"},
+            targets=[], records=[record], tenant_reports={},
+        )
+
+        content = (tmp_path / "report.md").read_text(encoding="utf-8-sig")
+        assert "## LLM Usage Summary" in content
+        assert "usage unavailable in mock mode" in content
+
+
 # ── helpers ───────────────────────────────────────────────────────────────────
+
+def _outcome_with_usage(analysis_usage: dict | None, review_usage: dict | None) -> dict:
+    return {
+        "ok": True,
+        "result": {
+            "review_verdict": "pass",
+            "review_result": {"confidence": 0.9, "confidence_source": "llm", "corrected_keys": []},
+            "human_review_required": False,
+            "executed_actions": [],
+            "action_plan": {"actions": []},
+            "summary": {"summary_short": "ok", "customer_emotion": "neutral", "resolution_status": "resolved"},
+            "priority_result": {"priority": "low"},
+            "voc_analysis": {
+                "intent_result": {"primary_category": "category"},
+                "sentiment_result": {"sentiment": "neutral"},
+            },
+            "partial_success": False,
+            "analysis_llm_usage": analysis_usage,
+            "review_llm_usage": review_usage,
+        },
+        "error": None,
+    }
+
+
+def _record_with_usage(
+    *,
+    a_pt: int = 100, a_ct: int = 20, a_tt: int = 120,
+    r_pt: int = 80,  r_ct: int = 15, r_tt: int = 95,
+    model: str = "gpt-4o-mini",
+    fallback: bool = False,
+) -> dict:
+    return {
+        "status": "ok",
+        "call_id": "c1",
+        "tenant_id": "tid-a",
+        "transcript_count": 5,
+        "llm_model": model,
+        "llm_fallback": fallback,
+        "analysis_prompt_tokens": a_pt,
+        "analysis_completion_tokens": a_ct,
+        "analysis_total_tokens": a_tt,
+        "review_prompt_tokens": r_pt,
+        "review_completion_tokens": r_ct,
+        "review_total_tokens": r_tt,
+        "total_prompt_tokens": a_pt + r_pt,
+        "total_completion_tokens": a_ct + r_ct,
+        "total_tokens": a_tt + r_tt,
+    }
+
 
 def _ok_outcome() -> dict:
     return {

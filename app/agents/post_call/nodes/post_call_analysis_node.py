@@ -189,6 +189,9 @@ async def post_call_analysis_node(state: PostCallAgentState) -> dict:
             user_message=user_msg,
             max_tokens=1800,
         )
+        # _validate_analysis() strips out keys outside the analysis schema, so
+        # capture LLM metadata before validation.
+        llm_usage = raw.get("_llm_usage") if isinstance(raw, dict) else None
         analysis = _validate_analysis(raw)
         logger.info(
             "post_call_analysis 완료 call_id=%s emotion=%s priority=%s action_required=%s",
@@ -202,6 +205,7 @@ async def post_call_analysis_node(state: PostCallAgentState) -> dict:
             "summary": analysis["summary"],
             "voc_analysis": analysis["voc_analysis"],
             "priority_result": analysis["priority_result"],
+            "analysis_llm_usage": llm_usage,
         }
 
     except Exception as exc:
@@ -212,6 +216,7 @@ async def post_call_analysis_node(state: PostCallAgentState) -> dict:
             "summary": None,
             "voc_analysis": None,
             "priority_result": None,
+            "analysis_llm_usage": None,
             "errors": errors,
             "partial_success": True,
         }

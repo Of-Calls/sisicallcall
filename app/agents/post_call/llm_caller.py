@@ -21,10 +21,80 @@ _MODE_REAL = "real"
 _DEFAULT_MODEL = "gpt-4o-mini"
 
 
+# ── Token usage helpers ───────────────────────────────────────────────────────
+#
+# Estimated development-only pricing. Verify against OpenAI billing/pricing
+# before using for production reporting. Prices are per 1M tokens (USD).
+MODEL_PRICING_USD_PER_1M: dict[str, dict[str, float]] = {
+    "gpt-4o-mini": {"input": 0.15, "output": 0.60},
+    "gpt-4o":      {"input": 2.50, "output": 10.00},
+    "gpt-4-turbo": {"input": 10.00, "output": 30.00},
+}
+
+
+def _empty_usage() -> dict:
+    return {"prompt_tokens": None, "completion_tokens": None, "total_tokens": None}
+
+
+def extract_openai_usage(response: object) -> dict:
+    """Extract token usage from an OpenAI chat completion response.
+
+    Supports both attribute access (typical SDK objects) and dict shape.
+    Missing fields are returned as None. Never raises.
+    """
+    try:
+        usage = getattr(response, "usage", None)
+        if usage is None and isinstance(response, dict):
+            usage = response.get("usage")
+        if usage is None:
+            return _empty_usage()
+        if isinstance(usage, dict):
+            return {
+                "prompt_tokens": usage.get("prompt_tokens"),
+                "completion_tokens": usage.get("completion_tokens"),
+                "total_tokens": usage.get("total_tokens"),
+            }
+        return {
+            "prompt_tokens": getattr(usage, "prompt_tokens", None),
+            "completion_tokens": getattr(usage, "completion_tokens", None),
+            "total_tokens": getattr(usage, "total_tokens", None),
+        }
+    except Exception:
+        return _empty_usage()
+
+
+def compute_estimated_cost_usd(
+    prompt_tokens: int | None,
+    completion_tokens: int | None,
+    model: str | None,
+) -> float | None:
+    """Estimate USD cost for a (prompt, completion, model) tuple.
+
+    Returns None when the model is unknown or token counts are missing.
+    Cost is rounded to 6 decimal places.
+    """
+    if not model:
+        return None
+    pricing = MODEL_PRICING_USD_PER_1M.get(model)
+    if not pricing:
+        return None
+    pt = prompt_tokens or 0
+    ct = completion_tokens or 0
+    if pt == 0 and ct == 0:
+        return None
+    cost = (pt / 1_000_000) * pricing["input"] + (ct / 1_000_000) * pricing["output"]
+    return round(cost, 6)
+
+
 # ── 실제 LLM 래퍼 ─────────────────────────────────────────────────────────────
 
 class PostCallLLMCaller:
-    """BaseLLMService 래퍼 — JSON 응답 파싱 + 1회 재시도."""
+    """BaseLLMService 래퍼 — JSON 응답 파싱 + 1회 재시도.
+
+    Provider가 ``_last_usage`` 속성으로 토큰 사용량을 노출하면 (예:
+    ``PostCallOpenAIService``), 결과 dict에 ``_llm_usage`` 메타데이터를
+    덧붙여 후속 노드가 batch report에 집계할 수 있도록 한다.
+    """
 
     def __init__(
         self,
@@ -43,6 +113,9 @@ class PostCallLLMCaller:
         user_message: str,
         max_tokens: int = 1024,
     ) -> dict:
+        accumulated = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        has_usage = False
+
         try:
             raw = await self._provider.generate(
                 system_prompt=system_prompt,
@@ -50,8 +123,11 @@ class PostCallLLMCaller:
                 temperature=0.0,
                 max_tokens=max_tokens,
             )
+            has_usage = self._accumulate_provider_usage(accumulated) or has_usage
+
             result, ok = _try_parse(raw)
             if ok:
+                self._attach_usage(result, accumulated, has_usage, fallback=False)
                 return result
 
             logger.warning("post_call real LLM JSON parse failed; retrying raw_preview=%r", raw[:200])
@@ -61,8 +137,11 @@ class PostCallLLMCaller:
                 temperature=0.0,
                 max_tokens=max_tokens,
             )
+            has_usage = self._accumulate_provider_usage(accumulated) or has_usage
+
             result2, ok2 = _try_parse(raw2)
             if ok2:
+                self._attach_usage(result2, accumulated, has_usage, fallback=False)
                 return result2
 
             raise ValueError(f"LLM JSON parse failed twice. last_raw={raw2[:300]!r}")
@@ -82,8 +161,54 @@ class PostCallLLMCaller:
                     fallback_result = copy.deepcopy(fallback_result)
                     fallback_result["_llm_fallback"] = True
                     fallback_result["_llm_fallback_reason"] = str(exc)
+                    self._attach_usage(fallback_result, accumulated, has_usage, fallback=True)
                 return fallback_result
             raise
+
+    def _accumulate_provider_usage(self, accumulated: dict) -> bool:
+        """Pull provider's last usage into the accumulator. Returns True if any tokens were added."""
+        usage = getattr(self._provider, "_last_usage", None)
+        if not isinstance(usage, dict):
+            return False
+        added = False
+        for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            value = usage.get(key)
+            if value is not None:
+                accumulated[key] = (accumulated[key] or 0) + int(value)
+                added = True
+        return added
+
+    def _attach_usage(
+        self,
+        result: object,
+        accumulated: dict,
+        has_usage: bool,
+        *,
+        fallback: bool,
+    ) -> None:
+        if not isinstance(result, dict):
+            return
+        model = getattr(self._provider, "model", None)
+        if has_usage:
+            result["_llm_usage"] = {
+                "purpose": self._purpose,
+                "model": model,
+                "prompt_tokens": accumulated["prompt_tokens"],
+                "completion_tokens": accumulated["completion_tokens"],
+                "total_tokens": accumulated["total_tokens"],
+                "source": "openai",
+                "fallback": fallback,
+            }
+        elif fallback:
+            result["_llm_usage"] = {
+                "purpose": self._purpose,
+                "model": model,
+                "prompt_tokens": None,
+                "completion_tokens": None,
+                "total_tokens": None,
+                "source": "fallback",
+                "fallback": True,
+            }
 
 
 class PostCallOpenAIService(BaseLLMService):
@@ -92,6 +217,9 @@ class PostCallOpenAIService(BaseLLMService):
     def __init__(self, model: str | None = None) -> None:
         self.model = model or get_post_call_llm_model()
         self._client = None
+        # Last response token usage (set after each generate() call). Read by
+        # PostCallLLMCaller to attach to result dicts as `_llm_usage`.
+        self._last_usage: dict | None = None
 
     def _api_key(self) -> str:
         return os.environ.get("OPENAI_API_KEY") or settings.openai_api_key
@@ -122,6 +250,7 @@ class PostCallOpenAIService(BaseLLMService):
             max_tokens=max_tokens,
             response_format={"type": "json_object"},
         )
+        self._last_usage = extract_openai_usage(response)
         return response.choices[0].message.content or ""
 
 
