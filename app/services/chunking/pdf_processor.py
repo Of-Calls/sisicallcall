@@ -471,6 +471,10 @@ class PDFProcessor:
                         "llm_summary": llm_meta.get("summary", ""),
                         "llm_keywords": keywords_str,
                         "llm_topic": llm_meta.get("topic", "기타"),
+                        # 권한 게이트 플래그 — PDF 임베딩 시점은 항상 False.
+                        # 추후 프론트 admin UI 에서 청크별 토글 (title/summary 보고 사람이 결정).
+                        "is_auth": False,
+                        "is_vision": False,
                         # 디버그/검증용 — ChromaDB metadata 1KB 제한 회피로 800자 컷.
                         "polished_text": polished[:800],
                     },

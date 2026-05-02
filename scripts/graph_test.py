@@ -29,7 +29,7 @@ async def main():
     session = RedisSessionService()
 
     call_id = str(uuid.uuid4())
-    tenant_id = "test_tenant"
+    tenant_id = "ba2bf499-6fcc-4340-b3dd-9341f8bcc915"  # 한밭식당 (검증용 임시값)
 
     print(f"call_id={call_id} tenant_id={tenant_id}")
     print("종료: 'exit' 또는 Ctrl+C")

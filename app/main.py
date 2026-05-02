@@ -1,3 +1,5 @@
+from contextlib import asynccontextmanager
+
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -7,15 +9,25 @@ from app.core.config import APP_DESCRIPTION, APP_TITLE, APP_VERSION
 from app.core.middleware import RequestLoggingMiddleware
 from app.api.v1 import auth, call, post_call, summary, tenant, dashboard
 from app.api.v1.oauth import router as oauth_router
+from app.services.embedding import get_embedder
 from app.utils.logger import get_logger
 
 _logger = get_logger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    _logger.info("startup: loading BGE-M3 embedding model...")
+    get_embedder()
+    _logger.info("startup: embedding model ready")
+    yield
 
 
 app = FastAPI(
     title=APP_TITLE,
     version=APP_VERSION,
     description=APP_DESCRIPTION,
+    lifespan=lifespan,
 )
 
 app.add_middleware(RequestLoggingMiddleware)
