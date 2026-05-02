@@ -99,6 +99,8 @@ async def test_real_llm_parse_failure_falls_back_to_mock(monkeypatch):
     assert "summary" in result
     assert "voc_analysis" in result
     assert result["priority_result"]["priority"] == "low"
+    assert result["_llm_fallback"] is True
+    assert "LLM JSON parse failed" in result["_llm_fallback_reason"]
 
 
 @pytest.mark.asyncio

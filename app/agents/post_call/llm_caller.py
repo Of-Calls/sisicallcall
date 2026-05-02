@@ -73,11 +73,16 @@ class PostCallLLMCaller:
                     self._purpose,
                     exc,
                 )
-                return await self._fallback.call_json(
+                fallback_result = await self._fallback.call_json(
                     system_prompt=system_prompt,
                     user_message=user_message,
                     max_tokens=max_tokens,
                 )
+                if isinstance(fallback_result, dict):
+                    fallback_result = copy.deepcopy(fallback_result)
+                    fallback_result["_llm_fallback"] = True
+                    fallback_result["_llm_fallback_reason"] = str(exc)
+                return fallback_result
             raise
 
 

@@ -271,7 +271,12 @@ verdict 기준:
 - pass       : 분석 결과가 녹취에 충분히 근거함, action 실행 가능
 - correctable: 일부 필드 교정 후 진행 가능, corrections 에 수정 내용 포함
 - retry      : 재분석 시 개선 가능 (1회 한정)
-- fail       : 외부 action 실행 위험이 큼, human review 필요"""
+- fail       : 외부 action 실행 위험이 큼, human review 필요
+
+추가 규칙:
+- confidence 는 반드시 0.0 이상 1.0 이하의 숫자로 반환하세요.
+- correctable verdict 일 때는 reason 과 corrections 를 반드시 포함하세요.
+- reason 은 검토 판단 근거를 한 문장으로 설명하세요."""
 
 REVIEW_USER = """\
 [통화 녹취]
