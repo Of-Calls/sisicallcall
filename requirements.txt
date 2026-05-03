@@ -63,6 +63,8 @@ Pillow==10.4.0
 # Face Auth (M3+) — ArcFace via insightface + ONNX Runtime (CPU)
 insightface==0.7.3
 onnxruntime==1.19.2
+# PyTorch 2.6+ torch.onnx.export(…, dynamo=…) 경로에서 필요 — 없으면 NeMo model.export 폴백만 되고 T가 그래프에 박힐 수 있음
+onnxscript>=0.1.0
 opencv-python-headless==4.10.0.84
 
 # Async Worker (TBD: Celery or Redis Stream)

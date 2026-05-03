@@ -4,8 +4,8 @@
     1. 모델 로딩 확인
     2. voiceprint 등록 (extract_and_store)
     3. 동일 목소리 검증 (verify -> True 예상)
-    4. bypass 동작 (미등록 시 True 반환)
-    5. cleanup 후 bypass 복원
+    4. 미등록 call_id 검증 (False 예상)
+    5. cleanup 후 미등록 (False 예상)
 
 사용:
     venv/Scripts/python.exe scripts/test_speaker_verify.py
@@ -77,24 +77,27 @@ async def main():
     print(f"    verified:   {is_verified} [{result}]")
     print(f"    latency:    {elapsed:.1f}ms")
 
-    # Test 4: bypass (미등록 call_id)
-    print("\n[4] bypass 동작 (미등록 call_id)...")
+    # Test 4: 미등록 call_id
+    print("\n[4] 미등록 call_id 검증...")
     is_bypass, sim_bypass = await svc.verify(audio_2s, "unknown_call")
-    result4 = "PASS" if is_bypass else "FAIL"
-    print(f"    verified:   {is_bypass} (True 예상) [{result4}]")
+    result4 = "PASS" if not is_bypass else "FAIL"
+    print(f"    verified:   {is_bypass} (False 예상) sim={sim_bypass} [{result4}]")
 
-    # Test 5: cleanup 후 bypass
-    print("\n[5] cleanup 후 bypass 복원...")
+    # Test 5: cleanup 후 미등록
+    print("\n[5] cleanup 후 미등록...")
     svc.cleanup(call_id)
-    is_after, _ = await svc.verify(audio_2s, call_id)
-    result5 = "PASS" if is_after else "FAIL"
-    print(f"    cleanup 후: {is_after} (True 예상) [{result5}]")
+    is_after, sim_after = await svc.verify(audio_2s, call_id)
+    result5 = "PASS" if not is_after else "FAIL"
+    print(f"    cleanup 후: {is_after} (False 예상) sim={sim_after} [{result5}]")
+
+    from app.utils.config import settings
 
     print("\n" + "=" * 55)
     print("테스트 완료")
-    print(f"  similarity={similarity:.4f}  threshold=0.40")
-    if similarity < 0.40:
-        print("  [주의] similarity 낮음 - threshold 조정 검토 필요")
+    thr = settings.speaker_verify_threshold
+    print(f"  similarity={similarity:.4f}  threshold={thr}")
+    if similarity < thr:
+        print("  [주의] similarity < threshold — 통화 파이프라인에서 STT 생략됨")
     print("=" * 55)
 
 
