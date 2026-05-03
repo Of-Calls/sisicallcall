@@ -47,9 +47,17 @@ async def call_ws(websocket: WebSocket):
                 _logger.info("[WS] connected")
 
             elif event == "start":
-                stream_sid = msg["start"]["streamSid"]
+                start = msg.get("start") or {}
+                stream_sid = start.get("streamSid") or msg.get("streamSid")
+                call_sid = start.get("callSid")
                 triple.reset()
-                _logger.info("[WS] start streamSid=%s", stream_sid)
+                _logger.info("[WS] start streamSid=%s callSid=%s", stream_sid, call_sid)
+                try:
+                    await triple.prepare_deepgram_streaming(
+                        stream_sid if isinstance(stream_sid, str) else "no-stream"
+                    )
+                except Exception as e:
+                    _logger.exception("[WS] Deepgram 스트리밍 준비 실패: %s", e)
 
             elif event == "media":
                 mulaw = base64.b64decode(msg["media"]["payload"])
@@ -63,6 +71,7 @@ async def call_ws(websocket: WebSocket):
     except WebSocketDisconnect:
         _logger.info("[WS] 연결 끊김")
     finally:
+        await triple.shutdown_deepgram_streaming()
         if stream_sid:
             log_call_stt_latency_summary(triple.stt_latency, stream_sid=stream_sid)
             get_finetuned_onnx_service().cleanup(stream_sid)

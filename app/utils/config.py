@@ -3,7 +3,7 @@ from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
-    # Twilio
+    # Twilio — REST/검증에 쓰는 키 이름(대문자)은 pydantic-settings 가 필드명에서 유도: twilio_account_sid → TWILIO_ACCOUNT_SID
     twilio_account_sid: str = ""
     twilio_auth_token: str = ""
     twilio_phone_number: str = ""
@@ -14,6 +14,12 @@ class Settings(BaseSettings):
 
     # Deepgram
     deepgram_api_key: str = ""
+    # True: Twilio μ-law → Deepgram live WebSocket (nova-3), is_final 마다 화자 검증·로그.
+    # False: Silero VAD 발화 경계 + asyncprerecorded 파일 전사(기존).
+    deepgram_use_streaming: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("DEEPGRAM_USE_STREAMING"),
+    )
 
     # PostgreSQL
     postgres_user: str = "sisicallcall"
@@ -42,7 +48,7 @@ class Settings(BaseSettings):
     # TitaNet 화자 검증 — onnxruntime + 로컬 ONNX. mel 은 torchaudio 기본, 선택 시 NeMo preprocessor(.nemo).
     # 코사인 유사도 ≥ threshold 일 때만 검증 통과. 짧은 발화·전화 음질에 따라 본인 거절(FRR)↑ 가능.
     speaker_verify_threshold: float = Field(
-        default=0.50,
+        default=0.40,
         validation_alias=AliasChoices(
             "SPEAKER_VERIFY_THRESHOLD",
             "TITANET_SIMILARITY_THRESHOLD",
@@ -57,7 +63,13 @@ class Settings(BaseSettings):
         default=None,
         validation_alias=AliasChoices("SPEAKER_VERIFY_FINETUNED_THRESHOLD"),
     )
-    titanet_enrollment_sec: float = 3.0  # voiceprint 등록에 사용할 첫 발화 누적 시간
+    titanet_enrollment_sec: float = 3.0  # 레거시(초 단위 PCM 누적). 등록 로직은 enroll_utt_count 발화 기준.
+    # enrollment: STT 성공 발화마다 medium·finetuned 각각 임베딩 수집 → N개 도달 시 평균·L2 정규화 후 저장.
+    enroll_utt_count: int = Field(
+        default=3,
+        ge=1,
+        validation_alias=AliasChoices("ENROLL_UTT_COUNT"),
+    )
     # ONNX mel: "torchaudio"(기본) | "nemo" — nemo 시 학습과 동일 preprocessor(.nemo) 사용.
     titanet_mel_backend: str = Field(
         default="torchaudio",
@@ -68,8 +80,10 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("TITANET_SPEAKER_NEMO_PATH"),
     )
     # finetuned ONNX만: 긴 발화 PCM 상한(초). mel 계산·메모리 완화. 0 이하면 상한 없음.
+    # STFT center·hop 정렬 때문에 이 한도만으로 mel T 가 ONNX 내부 상한과 일치하지 않을 수 있음 → TITANET_FINETUNED_ONNX_MAX_MEL_FRAMES.
     titanet_finetuned_infer_max_sec: float = 12.0
-    # finetuned ONNX mel 시간축 T 상한(프레임). 0=미적용. 구 export(Where T~600 고정) 깨짐 방지용으로 600 등.
+    # finetuned ONNX mel 시간축 T 상한(프레임). 0 이면 런타임 안전 기본 1200 사용(Where 1200×1201 방지).
+    # 더 큰 T 가 필요하면 명시적으로 큰 값(예: 2000)을 두고, 재export 로 그래프를 고치는 것이 근본 해결.
     titanet_finetuned_onnx_max_mel_frames: int = Field(
         default=0,
         validation_alias=AliasChoices("TITANET_FINETUNED_ONNX_MAX_MEL_FRAMES"),

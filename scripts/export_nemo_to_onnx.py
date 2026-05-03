@@ -14,8 +14,8 @@ mel 스펙트로그를 받는다 (서비스 ONNX 계약과 동일).
   입력:  app/models/speaker_verification/titanet_small_finetuned_final.nemo
   출력:  app/models/speaker_verification/titanet_small_finetuned_final.onnx
 
-기본은 `torch.onnx.export`(더미 mel T=300, `dynamic_axes`) 후 T=300/600 onnxruntime 검증
-(NeMo `model.export` 폴백 그래프는 종종 내부 시간축이 ~600으로 박혀 T=1200에서 Where 오류가 난다).
+기본은 `torch.onnx.export`(더미 mel T=300, `dynamic_axes`) 후 T=300,600,1200,1201 onnxruntime 검증
+(1201 은 hop 정렬로 생기는 T+1 경계; 구 그래프는 여기서 Where 1200×1201 실패할 수 있음. 앱은 런타임 mel T 캡으로 완화).
 `pip install onnxscript` 가 되어 있으면 torch 경로 성공 확률이 높다. 실패 시 NeMo `model.export` 로 폴백한다.
 
 사용 예 (레포 루트):
@@ -103,7 +103,7 @@ def verify_onnx_mel_time_axis(
     onnx_path: Path,
     *,
     n_mels: int = 80,
-    time_frames: tuple[int, ...] = (300, 600),
+    time_frames: tuple[int, ...] = (300, 600, 1200, 1201),
 ) -> bool:
     """재export 한 ONNX가 서로 다른 mel 시간 길이 T에서 shape 오류 없이 돌아가는지 확인.
 
@@ -184,8 +184,8 @@ def main() -> None:
     parser.add_argument(
         "--verify-time-frames",
         type=str,
-        default="300,600,1200",
-        help="export 후 onnxruntime 검증 T 목록(쉼표). 통화 12s급 mel≈1200 — 여기서 실패하면 재export 필요",
+        default="300,600,1200,1201",
+        help="export 후 onnxruntime 검증 T 목록(쉼표). 1201=경계+1(PCM 자르기·hop 정렬로 T+1 재현)",
     )
     parser.add_argument(
         "--nemo-export-fallback",

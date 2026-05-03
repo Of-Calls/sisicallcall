@@ -42,7 +42,7 @@ class _ColorFormatter(logging.Formatter):
         "app.services.tts.twilio_channel":                 "tts.twilio",
         "app.services.tts.azure":                          "tts.azure",
         "app.services.stt.deepgram_streaming":             "stt.stream",
-        "app.services.stt.deepgram_prerecorded":           "stt.prerec",
+        "app.services.stt.deepgram":                       "stt.prerec",
         "app.services.speaker_verify.titanet":             "verify.titanet",
         "app.services.cache.semantic_cache":               "cache.sem",
         "app.services.embedding.local":                    "embed.local",
