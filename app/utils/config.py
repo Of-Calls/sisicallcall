@@ -114,15 +114,14 @@ class Settings(BaseSettings):
             "SPEAKER_VERIFY_NEMO_ONNX_COMPARE_ON_CALL",
         ),
     )
-    # 순정·파인튜닝 ONNX 동시 추론·CSV. STT 통과 여부는 오직 speaker_verify_gate_model 쪽만 threshold와 비교;
-    # 반대 모델 점수는 baseline_ok/finetuned_ok·CSV로만 남김(순정 대비 개선 분석용).
+    # 순정·파인튜닝 ONNX 동시 추론·CSV. 경로별 STT는 각 모델 임계값(baseline_ok / finetuned_ok)만 사용.
     speaker_verify_compare_enabled: bool = Field(
         default=False,
         validation_alias=AliasChoices("SPEAKER_VERIFY_COMPARE_ENABLED"),
     )
     speaker_verify_gate_model: Literal["baseline", "finetuned"] = Field(
         default="finetuned",
-        description="이중 ONNX 비교 시 STT 게이트에 쓸 모델. 반대 모델은 점수 기록만.",
+        description="레거시·.env 호환. 이중 ONNX compare 스냅샷·CSV에서는 미사용.",
         validation_alias=AliasChoices("SPEAKER_VERIFY_GATE_MODEL"),
     )
     speaker_verify_compare_log_path: str = Field(

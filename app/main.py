@@ -160,7 +160,7 @@ async def lifespan(app: FastAPI):
         )
         _logger.info(
             "startup: SPEAKER_VERIFY_COMPARE_ENABLED — baseline ONNX 워커에서 백그라운드 로드 (%s). "
-            "완료 전에는 compare·CSV·baseline 게이트 비활성( finetuned ONNX 만 )",
+            "완료 전에는 이중 ONNX 비교·CSV 비활성(파인튜닝 ONNX만)",
             bl_src,
         )
 
@@ -176,7 +176,7 @@ async def lifespan(app: FastAPI):
                 )
                 if svc.load_error:
                     _logger.error(
-                        "startup: titanet_compare baseline ONNX 실패 — 비교·게이트는 finetuned 경로로 폴백: %s",
+                        "startup: titanet_compare baseline ONNX 실패 — 비교는 finetuned 경로로 폴백: %s",
                         svc.load_error,
                     )
                 else:

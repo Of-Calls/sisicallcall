@@ -121,7 +121,6 @@ async def debug_twilio_webhook_hint(request: Request) -> JSONResponse:
             "speaker_verify_nemo_baseline_nemo_path": (
                 (settings.speaker_verify_nemo_baseline_nemo_path or "").strip() or None
             ),
-            "gate_model": settings.speaker_verify_gate_model,
             "view_csv_table_in_browser": f"{base}/call/debug/verify-compare?format=html",
             "view_csv_json": f"{base}/call/debug/verify-compare?format=json&tail=100",
         }

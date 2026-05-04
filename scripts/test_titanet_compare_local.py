@@ -30,7 +30,8 @@ def _snap_dict(s: object) -> dict:
         "bypass": s.bypass,
         "baseline_similarity": s.baseline_similarity,
         "finetuned_similarity": s.finetuned_similarity,
-        "verified": s.verified,
+        "baseline_ok": s.baseline_ok,
+        "finetuned_ok": s.finetuned_ok,
     }
 
 
@@ -179,7 +180,6 @@ async def async_main() -> None:
         assert d["bypass"] is True
         assert d["baseline_similarity"] == -1.0
         assert d["finetuned_similarity"] == -1.0
-        assert d["verified"] is True
         t4 = "PASS"
     except Exception as e:
         t4_extra = str(e)
@@ -261,11 +261,8 @@ async def async_main() -> None:
                     "bypass",
                     "baseline_similarity",
                     "finetuned_similarity",
-                    "threshold",
-                    "gate_model",
                     "baseline_ok",
                     "finetuned_ok",
-                    "verified",
                     "stt_executed",
                     "transcript",
                     "stt_finetuned_executed",

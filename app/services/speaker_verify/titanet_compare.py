@@ -112,11 +112,8 @@ _COMPARE_CSV_FIELDNAMES: tuple[str, ...] = (
     "bypass",
     "baseline_similarity",
     "finetuned_similarity",
-    "threshold",
-    "gate_model",
     "baseline_ok",
     "finetuned_ok",
-    "verified",
     "stt_executed",
     "transcript",
     "stt_finetuned_executed",
@@ -135,11 +132,9 @@ def _cosine_l2(a: np.ndarray, b: np.ndarray) -> float:
 
 @dataclass(frozen=True)
 class CompareSnapshot:
-    """검증 직후 스냅샷 — STT 후 transcript / stt_executed 만 채워 CSV 기록.
+    """검증 직후 스냅샷 — STT 후 transcript 컬럼·CSV 기록.
 
-    - ``verified``: ``gate_model``이 가리키는 모델 유사도만 ``threshold``와 비교해 STT 진행 여부를 결정.
-    - ``baseline_ok`` / ``finetuned_ok``: 각 모델이 **자기 임계값**을 넘었는지(로그·CSV·개선도 분석용).
-      순정이 낮아도 파인튜닝 게이트가 통과하면 ``verified``는 True일 수 있음.
+    ``baseline_ok`` / ``finetuned_ok``: 각 모델이 자기 임계값을 넘었는지(STT 경로·분석용).
     """
 
     call_id: str
@@ -151,11 +146,8 @@ class CompareSnapshot:
     bypass: bool
     baseline_similarity: float
     finetuned_similarity: float
-    threshold: float
-    gate_model: str
     baseline_ok: bool
     finetuned_ok: bool
-    verified: bool
     inter_emb_cosine: float | None = None
     bypass_reason: str | None = None
 
@@ -180,8 +172,6 @@ def format_compare_snapshot_log_block(snap: CompareSnapshot) -> str:
                 f"call_id={snap.call_id}",
                 f"baseline={snap.baseline_similarity:.4f}  ok={snap.baseline_ok}",
                 f"finetuned={snap.finetuned_similarity:.4f} ok={snap.finetuned_ok}",
-                f"gate={snap.gate_model}",
-                "verified=True",
                 f"reason={snap.bypass_reason}",
             ]
         )
@@ -192,9 +182,6 @@ def format_compare_snapshot_log_block(snap: CompareSnapshot) -> str:
                 f"call_id={snap.call_id}",
                 f"baseline={snap.baseline_similarity:.4f}  ok={snap.baseline_ok}",
                 f"finetuned={snap.finetuned_similarity:.4f} ok={snap.finetuned_ok}",
-                f"gate={snap.gate_model}",
-                f"threshold={snap.threshold:.4f}",
-                f"verified={snap.verified}",
             ]
         )
     return "\n".join(parts)
@@ -203,9 +190,7 @@ def format_compare_snapshot_log_block(snap: CompareSnapshot) -> str:
 class TitaNetCompareSpeakerVerifyService:
     """baseline ONNX(순정) + 파인튜닝 ONNX를 동일 mel로 점수 산출.
 
-    STT 진행(``verified``)은 ``settings.speaker_verify_gate_model``이 가리키는 쪽만
-    ``threshold``와 비교한다. 반대쪽 점수는 ``baseline_ok`` / ``finetuned_ok``로
-    로그·CSV에 남겨 순정 대비 개선 여부를 본다.
+    경로별 STT는 ``baseline_ok`` / ``finetuned_ok``(각 모델 임계값)만 따른다.
     """
 
     def __init__(self) -> None:
@@ -457,10 +442,6 @@ class TitaNetCompareSpeakerVerifyService:
         turn_index: int,
         onnx_finetuned: Any,
     ) -> CompareSnapshot:
-        gate = (settings.speaker_verify_gate_model or "finetuned").strip().lower()
-        if gate not in ("baseline", "finetuned"):
-            gate = "finetuned"
-        thr = _threshold_for_gate_model(gate)
         thr_bl = _threshold_for_gate_model("baseline")
         thr_ft = _threshold_for_gate_model("finetuned")
         audio_bytes = len(pcm16)
@@ -485,11 +466,8 @@ class TitaNetCompareSpeakerVerifyService:
                 bypass=True,
                 baseline_similarity=-1.0,
                 finetuned_similarity=-1.0,
-                threshold=thr,
-                gate_model=gate,
                 baseline_ok=False,
                 finetuned_ok=False,
-                verified=False,
             )
 
         if not (bl_has and ft_has):
@@ -503,11 +481,8 @@ class TitaNetCompareSpeakerVerifyService:
                 bypass=True,
                 baseline_similarity=-1.0,
                 finetuned_similarity=-1.0,
-                threshold=thr,
-                gate_model=gate,
                 baseline_ok=False,
                 finetuned_ok=False,
-                verified=True,
                 bypass_reason="no_voiceprint",
             )
 
@@ -545,17 +520,12 @@ class TitaNetCompareSpeakerVerifyService:
                 bypass=True,
                 baseline_similarity=-1.0,
                 finetuned_similarity=-1.0,
-                threshold=thr,
-                gate_model=gate,
                 baseline_ok=False,
                 finetuned_ok=False,
-                verified=False,
             )
 
-        gate_sim = bl_sim if gate == "baseline" else float(ft_sim)
         baseline_ok = _similarity_passes_threshold(bl_sim, thr_bl)
         finetuned_ok = _similarity_passes_threshold(float(ft_sim), thr_ft)
-        verified = bool(gate_sim >= thr)
 
         return CompareSnapshot(
             call_id=call_id,
@@ -567,11 +537,8 @@ class TitaNetCompareSpeakerVerifyService:
             bypass=False,
             baseline_similarity=bl_sim,
             finetuned_similarity=float(ft_sim),
-            threshold=thr,
-            gate_model=gate,
             baseline_ok=baseline_ok,
             finetuned_ok=finetuned_ok,
-            verified=verified,
             inter_emb_cosine=inter_cos,
         )
 
@@ -605,11 +572,8 @@ class TitaNetCompareSpeakerVerifyService:
             "bypass": snap.bypass,
             "baseline_similarity": f"{snap.baseline_similarity:.6f}",
             "finetuned_similarity": f"{snap.finetuned_similarity:.6f}",
-            "threshold": f"{snap.threshold:.6f}",
-            "gate_model": snap.gate_model,
             "baseline_ok": snap.baseline_ok,
             "finetuned_ok": snap.finetuned_ok,
-            "verified": snap.verified,
             "stt_executed": stt_any,
             "transcript": legacy_t,
             "stt_finetuned_executed": stt_finetuned_executed,
