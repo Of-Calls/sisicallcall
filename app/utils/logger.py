@@ -44,6 +44,7 @@ class _ColorFormatter(logging.Formatter):
         "app.services.stt.deepgram_streaming":             "stt.stream",
         "app.services.stt.deepgram":                       "stt.prerec",
         "app.services.speaker_verify.titanet":             "verify.titanet",
+        "app.services.speaker_verify.titanet_compare":     "verify.compare",
         "app.services.cache.semantic_cache":               "cache.sem",
         "app.services.embedding.local":                    "embed.local",
         "app.services.rag.chroma":                         "rag.chroma",

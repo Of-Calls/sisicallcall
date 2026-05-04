@@ -1,4 +1,6 @@
-from pydantic import AliasChoices, Field
+from typing import Literal
+
+from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings
 
 
@@ -54,17 +56,12 @@ class Settings(BaseSettings):
             "TITANET_SIMILARITY_THRESHOLD",
         ),
     )
-    # 미설정(None)이면 speaker_verify_threshold 와 동일. medium/finetuned 갈래별로 다르게 줄 때 사용.
-    speaker_verify_medium_threshold: float | None = Field(
-        default=None,
-        validation_alias=AliasChoices("SPEAKER_VERIFY_MEDIUM_THRESHOLD"),
-    )
     speaker_verify_finetuned_threshold: float | None = Field(
         default=None,
         validation_alias=AliasChoices("SPEAKER_VERIFY_FINETUNED_THRESHOLD"),
     )
     titanet_enrollment_sec: float = 3.0  # 레거시(초 단위 PCM 누적). 등록 로직은 enroll_utt_count 발화 기준.
-    # enrollment: STT 성공 발화마다 medium·finetuned 각각 임베딩 수집 → N개 도달 시 평균·L2 정규화 후 저장.
+    # enrollment: STT 성공 발화마다 finetuned 임베딩 수집 → N개 도달 시 평균·L2 정규화 후 저장.
     enroll_utt_count: int = Field(
         default=3,
         ge=1,
@@ -93,14 +90,7 @@ class Settings(BaseSettings):
         default="",
         validation_alias=AliasChoices("TITANET_FINETUNED_ONNX_PATH"),
     )
-    titanet_pipeline_onnx_path: str = Field(
-        default="",
-        validation_alias=AliasChoices(
-            "TITANET_PIPELINE_ONNX_PATH",
-            "TITANET_ONNX_PATH",  # .env.example·구 문서 호환
-        ),
-    )  # [medium] 파이프라인·get_titanet_service()
-    # True면 기동 시 파인튜닝 ONNX까지 동시 로드. False면 medium만 즉시, 파인튜닝은 백그라운드.
+    # True면 기동 시 파인튜닝 ONNX까지 동시 로드. False면 NeMo mel(설정 시)만 즉시, 파인튜닝은 백그라운드.
     # (환경 변수명 PRELOAD_FINETUNED_NEMO_AT_STARTUP는 기존 .env 호환용)
     preload_finetuned_nemo_at_startup: bool = False
     # TITANET_MEL_BACKEND=nemo 일 때만 해당. False(기본)=NeMo restore 는 첫 mel 사용 시(기동 빠름).
@@ -124,8 +114,58 @@ class Settings(BaseSettings):
             "SPEAKER_VERIFY_NEMO_ONNX_COMPARE_ON_CALL",
         ),
     )
+    # 순정·파인튜닝 ONNX 동시 추론·CSV. STT 통과 여부는 오직 speaker_verify_gate_model 쪽만 threshold와 비교;
+    # 반대 모델 점수는 baseline_ok/finetuned_ok·CSV로만 남김(순정 대비 개선 분석용).
+    speaker_verify_compare_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("SPEAKER_VERIFY_COMPARE_ENABLED"),
+    )
+    speaker_verify_gate_model: Literal["baseline", "finetuned"] = Field(
+        default="finetuned",
+        description="이중 ONNX 비교 시 STT 게이트에 쓸 모델. 반대 모델은 점수 기록만.",
+        validation_alias=AliasChoices("SPEAKER_VERIFY_GATE_MODEL"),
+    )
+    speaker_verify_compare_log_path: str = Field(
+        default="logs/speaker_verify_compare.csv",
+        validation_alias=AliasChoices("SPEAKER_VERIFY_COMPARE_LOG_PATH"),
+    )
+    # 비교 baseline: 순정(또는 비파인튜닝) TitaNet ONNX. 비우면 models/speech_verification/titanet-s.onnx
+    speaker_verify_compare_baseline_onnx_path: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "SPEAKER_VERIFY_COMPARE_BASELINE_ONNX_PATH",
+        ),
+    )
+    # 비어 있으면 from_pretrained("titanet_small") — 캐시/허브. 로컬 .nemo 절대·상대 경로면 다운로드 없이 복원.
+    speaker_verify_nemo_baseline_nemo_path: str = Field(
+        default="",
+        validation_alias=AliasChoices("SPEAKER_VERIFY_NEMO_BASELINE_NEMO_PATH"),
+    )
+    # True면 원격 체크포인트 캐시 갱신(이름 로드 시). 로컬 .nemo 경로일 때는 보통 불필요.
+    speaker_verify_nemo_baseline_refresh_cache: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("SPEAKER_VERIFY_NEMO_BASELINE_REFRESH_CACHE"),
+    )
+    # True: NeMo 로드 전 CUDA_VISIBLE_DEVICES=-1 (CPU 전용·torch CUDA 미초기화 시에만 효과). GPU 서버에서는 false 유지.
+    speaker_verify_nemo_force_cpu: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("SPEAKER_VERIFY_NEMO_FORCE_CPU"),
+    )
+
+    @field_validator("speaker_verify_gate_model", mode="before")
+    @classmethod
+    def _normalize_speaker_verify_gate_model(cls, v: object) -> object:
+        if isinstance(v, str):
+            return v.strip().lower()
+        return v
+
     # True면 서버 기동 시 in-memory voiceprint·enrollment 전역을 비움 (오염 임베딩 제거).
     reset_voiceprint_on_startup: bool = False
+    # Twilio 로컬 테스트 시 화자검증 CSV·웹훅 안내용 디버그 GET (운영에서는 false).
+    call_debug_routes_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("CALL_DEBUG_ROUTES_ENABLED"),
+    )
 
     # Silero VAD (v6.2+, 2026-04-30 채택 — 짧은 발화 + 긴 trailing silence reject 해결).
     # logs/2026-04-30/server_100651.log Turn 4/5 사례: "예약은어떻게해요" 0.5s + trailing 1.3s

@@ -15,12 +15,14 @@ mel 스펙트로그를 받는다 (서비스 ONNX 계약과 동일).
   출력:  app/models/speaker_verification/titanet_small_finetuned_final.onnx
 
 기본은 `torch.onnx.export`(더미 mel T=300, `dynamic_axes`) 후 T=300,600,1200,1201 onnxruntime 검증
-(1201 은 hop 정렬로 생기는 T+1 경계; 구 그래프는 여기서 Where 1200×1201 실패할 수 있음. 앱은 런타임 mel T 캡으로 완화).
+(1201 은 hop 정렬로 생기는 T+1 경계; NeMo `model.export` 폴백 그래프는 여기서 Where 1200×1201 실패할 수 있음.
+그럴 때 `--verify-time-frames 300,600,1200` 로 검증하거나 `scripts/export_speech_verification_onnx_batch.py` 참고.)
 `pip install onnxscript` 가 되어 있으면 torch 경로 성공 확률이 높다. 실패 시 NeMo `model.export` 로 폴백한다.
 
 사용 예 (레포 루트):
   python scripts/export_nemo_to_onnx.py
   python scripts/export_nemo_to_onnx.py --nemo-in path/to/model.nemo --onnx-out out.onnx
+  python scripts/export_nemo_to_onnx.py --nemo-in models/speech_verification/titanet-s.nemo --onnx-out models/speech_verification/titanet-s.onnx --verify-time-frames 300,600,1200
   python scripts/export_nemo_to_onnx.py --onnx-out out.onnx --verify-only
 """
 from __future__ import annotations

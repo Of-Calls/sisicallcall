@@ -1,4 +1,4 @@
-"""Twilio μ-law 청크를 3개 VAD 상태에 동기 fan-out → 발화 단위로 3갈래 STT·로그.
+"""Twilio μ-law 청크를 2개 VAD 상태에 동기 fan-out → 발화 단위로 finetuned·no_verify STT·로그.
 
 각 파이프라인에 `asyncio.gather`로 청크를 동시에 넣어 VAD 경계를 일치시킨다.
 """
@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import audioop
 import asyncio
+import functools
 import math
 import time
 from dataclasses import dataclass, field
@@ -16,7 +17,11 @@ from app.services.speaker_verify.nemo_onnx_runtime_compare import (
     spawn_nemo_vs_onnx_compare_task,
 )
 from app.services.speaker_verify.onnx_pipeline import get_finetuned_onnx_service_async
-from app.services.speaker_verify.onnx_pipeline import get_onnx_pipeline_service
+from app.services.speaker_verify.titanet_compare import (
+    CompareSnapshot,
+    format_compare_snapshot_log_block,
+    get_titanet_compare_speaker_verify_service_async,
+)
 from app.services.stt.deepgram import DeepgramSTTService
 from app.services.stt.deepgram_streaming import DeepgramLiveMulawSession
 from app.services.vad.silero_vad import SileroVADService
@@ -84,18 +89,24 @@ def _stt_text(result: str | BaseException) -> str:
     return result or ""
 
 
-def _pair_from_branch_gather(res: Any) -> tuple[str, str | None]:
-    """branch_finetuned / branch_medium 의 gather 결과 → (stt_text, 검증_스킵_사유)."""
+def _triple_from_branch_finetuned(res: Any) -> tuple[str, str | None, CompareSnapshot | None]:
+    """branch_finetuned gather 결과 → (stt_text, 검증_스킵_사유, NeMo 비교 스냅샷)."""
     if isinstance(res, BaseException):
-        return "", f"처리 예외: {res!s}"
+        return "", f"처리 예외: {res!s}", None
+    if isinstance(res, tuple) and len(res) == 3:
+        a, b, c = res[0], res[1], res[2]
+        snap = c if isinstance(c, CompareSnapshot) or c is None else None
+        return (a if isinstance(a, str) else ""), (
+            b if isinstance(b, str) or b is None else None
+        ), snap
     if isinstance(res, tuple) and len(res) == 2:
         a, b = res[0], res[1]
         return (a if isinstance(a, str) else ""), (
             b if isinstance(b, str) or b is None else None
-        )
+        ), None
     if isinstance(res, str):
-        return res, None
-    return "", "알 수 없는 branch 반환"
+        return res, None, None
+    return "", "알 수 없는 branch 반환", None
 
 
 def _onnx_branch_ready(svc: Any, call_id: str) -> bool:
@@ -115,12 +126,10 @@ class SttLatencyAccumulator:
     """
 
     finetuned: list[float] = field(default_factory=list)
-    medium: list[float] = field(default_factory=list)
     no_verify: list[float] = field(default_factory=list)
 
     def clear(self) -> None:
         self.finetuned.clear()
-        self.medium.clear()
         self.no_verify.clear()
 
 
@@ -135,11 +144,10 @@ def log_call_stt_latency_summary(acc: SttLatencyAccumulator, *, stream_sid: str)
 
     mode = "deepgram_stream" if settings.deepgram_use_streaming else "vad_prerecorded"
     _logger.info(
-        "[WS] 통화 종료 STT 레이턴시 요약 mode=%s streamSid=%s — %s | %s | %s",
+        "[WS] 통화 종료 STT 레이턴시 요약 mode=%s streamSid=%s — %s | %s",
         mode,
         stream_sid,
         part("finetuned", acc.finetuned),
-        part("medium", acc.medium),
         part("no_verify", acc.no_verify),
     )
 
@@ -164,10 +172,10 @@ async def on_utterance_triple(
     mulaw_utt: bytes,
     call_id: str,
     stt_finetuned: DeepgramSTTService,
-    stt_medium: DeepgramSTTService,
     stt_no_verify: DeepgramSTTService,
     latency_acc: SttLatencyAccumulator | None = None,
     *,
+    stt_baseline_compare: DeepgramSTTService | None = None,
     utt_seq: int = 0,
     transcript_override: str | None = None,
     stream_stt_latency_sec: float | None = None,
@@ -175,11 +183,38 @@ async def on_utterance_triple(
     # VAD 발화 경계 직후(파이프라인 진입) — 각 갈래 STT 완료까지 동일 기준점
     t0 = time.perf_counter()
     finetuned = await get_finetuned_onnx_service_async()
-    medium_svc = get_onnx_pipeline_service()
     pcm_utt = mulaw_to_pcm16_16k(mulaw_utt)
+    cmp_compare = None
+    if settings.speaker_verify_compare_enabled:
+        cmp_compare = await get_titanet_compare_speaker_verify_service_async()
+
+    async def _flush_compare_row(
+        snap: CompareSnapshot | None,
+        *,
+        transcript_finetuned: str = "",
+        transcript_baseline: str = "",
+        transcript_no_verify: str = "",
+        stt_finetuned_executed: bool = False,
+        stt_baseline_executed: bool = False,
+    ) -> None:
+        if snap is None or cmp_compare is None:
+            return
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            None,
+            functools.partial(
+                cmp_compare.flush_csv_row_sync,
+                snap,
+                transcript_finetuned=transcript_finetuned,
+                transcript_baseline=transcript_baseline,
+                transcript_no_verify=transcript_no_verify,
+                stt_finetuned_executed=stt_finetuned_executed,
+                stt_baseline_executed=stt_baseline_executed,
+            ),
+        )
+
     gated = bool(settings.speaker_verify_enabled)
     b_ft = latency_acc.finetuned if latency_acc is not None else None
-    b_md = latency_acc.medium if latency_acc is not None else None
     b_nv = latency_acc.no_verify if latency_acc is not None else None
 
     if (
@@ -187,13 +222,11 @@ async def on_utterance_triple(
         and stream_stt_latency_sec is not None
         and latency_acc is not None
     ):
-        for bucket in (latency_acc.finetuned, latency_acc.medium, latency_acc.no_verify):
+        for bucket in (latency_acc.finetuned, latency_acc.no_verify):
             bucket.append(stream_stt_latency_sec)
 
     def enrollment_done() -> bool:
-        return _onnx_branch_ready(finetuned, call_id) and _onnx_branch_ready(
-            medium_svc, call_id
-        )
+        return _onnx_branch_ready(finetuned, call_id)
 
     async def _text_or_transcribe(
         stt: DeepgramSTTService, mulaw: bytes, bucket: list[float] | None
@@ -202,66 +235,94 @@ async def on_utterance_triple(
             return transcript_override
         return await _timed_transcribe(stt, mulaw, t0=t0, bucket=bucket)
 
-    async def branch_finetuned(done: bool) -> tuple[str, str | None]:
-        """(STT 텍스트 또는 빈 문자열, 검증·모델 사유 — None 이면 STT 경로까지 진행)."""
+    async def branch_finetuned(done: bool) -> tuple[str, str | None, CompareSnapshot | None]:
+        """(STT 텍스트, 검증·모델 사유, baseline/finetuned ONNX 비교 스냅샷 — CSV 기록용)."""
         if finetuned.load_error:
-            return "", "모델 로드 실패"
+            return "", "모델 로드 실패", None
         if gated and not done:
-            return "", "enrollment 미완료"
+            return "", "enrollment 미완료", None
         if not gated:
             t = await _text_or_transcribe(stt_finetuned, mulaw_utt, b_ft)
-            return t, None
+            return t, None, None
         if not finetuned.has_voiceprint(call_id):
-            return "", "voiceprint 미등록"
+            return "", "voiceprint 미등록", None
         try:
             ok, sim = await finetuned.verify(pcm_utt, call_id)
         except Exception as e:
-            return "", f"검증 예외: {e}"
+            return "", f"검증 예외: {e}", None
         if not ok:
             if isinstance(sim, float) and math.isnan(sim):
-                return "", "화자 불일치 (similarity=nan)"
-            return "", f"화자 불일치 (similarity={float(sim):.4f})"
+                return "", "화자 불일치 (similarity=nan)", None
+            return "", f"화자 불일치 (similarity={float(sim):.4f})", None
         t = await _text_or_transcribe(stt_finetuned, mulaw_utt, b_ft)
-        return t, None
-
-    async def branch_medium(done: bool) -> tuple[str, str | None]:
-        if medium_svc.load_error:
-            return "", "모델 로드 실패"
-        if gated and not done:
-            return "", "enrollment 미완료"
-        if not gated:
-            t = await _text_or_transcribe(stt_medium, mulaw_utt, b_md)
-            return t, None
-        if not medium_svc.has_voiceprint(call_id):
-            return "", "voiceprint 미등록"
-        try:
-            ok, sim = await medium_svc.verify(pcm_utt, call_id)
-        except Exception as e:
-            return "", f"검증 예외: {e}"
-        if not ok:
-            if isinstance(sim, float) and math.isnan(sim):
-                return "", "화자 불일치 (similarity=nan)"
-            return "", f"화자 불일치 (similarity={float(sim):.4f})"
-        t = await _text_or_transcribe(stt_medium, mulaw_utt, b_md)
-        return t, None
+        return t, None, None
 
     async def branch_no_verify_transcribe() -> str:
         return await _text_or_transcribe(stt_no_verify, mulaw_utt, b_nv)
 
     done_flag = enrollment_done()
+    t_baseline_path = ""
+    skip_baseline: str | None = None
+
+    async def _parallel_verify_and_stt() -> tuple[
+        str, str | None, str, str | None, str, CompareSnapshot
+    ]:
+        """검증 1회 → Path A(finetuned)·Path B(baseline)는 각각 임계 통과 시만 STT(동시). no_verify 는 이후 순차."""
+        assert cmp_compare is not None and stt_baseline_compare is not None
+        snap = await cmp_compare.verify_compare_async(
+            pcm_utt, call_id, utt_seq, finetuned
+        )
+
+        async def path_finetuned() -> tuple[str, str | None, bool]:
+            if snap.bypass:
+                return "", None, False
+            if not snap.finetuned_ok:
+                gs = snap.finetuned_similarity
+                if isinstance(gs, float) and math.isnan(gs):
+                    return "", "화자 불일치 (finetuned similarity=nan)", False
+                return "", f"화자 불일치 (finetuned similarity={float(gs):.4f})", False
+            t = await _text_or_transcribe(stt_finetuned, mulaw_utt, b_ft)
+            return t, None, True
+
+        async def path_baseline() -> tuple[str, str | None, bool]:
+            if snap.bypass:
+                return "", None, False
+            if not snap.baseline_ok:
+                gs = snap.baseline_similarity
+                if isinstance(gs, float) and math.isnan(gs):
+                    return "", "화자 불일치 (baseline similarity=nan)", False
+                return "", f"화자 불일치 (baseline similarity={float(gs):.4f})", False
+            t = await _text_or_transcribe(stt_baseline_compare, mulaw_utt, None)
+            return t, None, True
+
+        r_ft, r_bl = await asyncio.gather(path_finetuned(), path_baseline())
+        t_ft, sk_ft, ex_ft = r_ft
+        t_bl, sk_bl, ex_bl = r_bl
+
+        async def branch_no_verify_inner() -> str:
+            t = await _text_or_transcribe(stt_no_verify, mulaw_utt, b_nv)
+            if gated and not enrollment_done():
+                await voice_enrollment.accumulate(call_id, pcm_utt, t)
+            return t
+
+        t3 = await branch_no_verify_inner()
+        await _flush_compare_row(
+            snap,
+            transcript_finetuned=t_ft,
+            transcript_baseline=t_bl,
+            transcript_no_verify=t3,
+            stt_finetuned_executed=ex_ft,
+            stt_baseline_executed=ex_bl,
+        )
+        return t_ft, sk_ft, t_bl, sk_bl, t3, snap
 
     if gated and not done_flag:
         t3 = await branch_no_verify_transcribe()
         if t3 and not t3.startswith("STT 실패"):
             await voice_enrollment.accumulate(call_id, pcm_utt, t3)
         done_flag = enrollment_done()
-        r1, r2 = await asyncio.gather(
-            branch_finetuned(done_flag),
-            branch_medium(done_flag),
-            return_exceptions=True,
-        )
-        t1, skip1 = _pair_from_branch_gather(r1)
-        t2, skip2 = _pair_from_branch_gather(r2)
+        r1 = await branch_finetuned(done_flag)
+        t1, skip1, cmp_snap = _triple_from_branch_finetuned(r1)
     else:
         async def branch_no_verify() -> str:
             t = await branch_no_verify_transcribe()
@@ -269,15 +330,29 @@ async def on_utterance_triple(
                 await voice_enrollment.accumulate(call_id, pcm_utt, t)
             return t
 
-        r1, r2, r3 = await asyncio.gather(
-            branch_finetuned(done_flag),
-            branch_medium(done_flag),
-            branch_no_verify(),
-            return_exceptions=True,
+        parallel_ok = (
+            settings.speaker_verify_compare_enabled
+            and cmp_compare is not None
+            and cmp_compare.models_ready
+            and cmp_compare.compare_gate_ready(call_id, finetuned)
+            and gated
+            and done_flag
+            and not finetuned.load_error
+            and finetuned.has_voiceprint(call_id)
+            and stt_baseline_compare is not None
         )
-        t1, skip1 = _pair_from_branch_gather(r1)
-        t2, skip2 = _pair_from_branch_gather(r2)
-        t3 = _stt_text(r3)
+        if parallel_ok:
+            t1, skip1, t_baseline_path, skip_baseline, t3, cmp_snap = (
+                await _parallel_verify_and_stt()
+            )
+        else:
+            r1, r3 = await asyncio.gather(
+                branch_finetuned(done_flag),
+                branch_no_verify(),
+                return_exceptions=True,
+            )
+            t1, skip1, cmp_snap = _triple_from_branch_finetuned(r1)
+            t3 = _stt_text(r3)
 
     def _log_model_branch(tag: str, text: str, skip: str | None) -> None:
         if skip:
@@ -288,36 +363,118 @@ async def on_utterance_triple(
             return
         _logger.info("[utt=%d] [%s] %s", utt_seq, tag, text if text.strip() else "(빈 인식)")
 
-    _log_model_branch("finetuned", t1, skip1)
-    _log_model_branch("medium", t2, skip2)
-    if t3.startswith("STT 실패"):
-        _logger.info("[utt=%d] [no_verify] %s", utt_seq, t3)
+    def _finetuned_line() -> str:
+        if skip1:
+            return f"[finetuned] 검증 실패 — {skip1}"
+        if t1.startswith("STT 실패"):
+            return f"[finetuned] {t1}"
+        return f"[finetuned] {t1 if t1.strip() else '(빈 인식)'}"
+
+    def _no_verify_line() -> str:
+        if t3.startswith("STT 실패"):
+            return f"[no_verify] {t3}"
+        return f"[no_verify] {t3 if t3.strip() else '(빈 인식)'}"
+
+    use_compare_bundle = (
+        settings.speaker_verify_compare_enabled and cmp_snap is not None
+    )
+    if use_compare_bundle:
+        body_lines: list[str] = []
+        cmp_txt = format_compare_snapshot_log_block(cmp_snap)
+        if cmp_txt:
+            body_lines.append(cmp_txt)
+
+        def _path_finetuned_line() -> str:
+            if skip1:
+                return f"[path_finetuned] 검증 실패 — {skip1}"
+            if t1.startswith("STT 실패"):
+                return f"[path_finetuned] {t1}"
+            return f"[path_finetuned] {t1 if t1.strip() else '(빈 인식)'}"
+
+        def _path_baseline_line() -> str:
+            if skip_baseline:
+                return f"[path_baseline] 검증 실패 — {skip_baseline}"
+            if (t_baseline_path or "").startswith("STT 실패"):
+                return f"[path_baseline] {t_baseline_path}"
+            if t_baseline_path:
+                return (
+                    f"[path_baseline] "
+                    f"{t_baseline_path if t_baseline_path.strip() else '(빈 인식)'}"
+                )
+            return ""
+
+        body_lines.append(_path_finetuned_line())
+        pbl = _path_baseline_line()
+        if pbl:
+            body_lines.append(pbl)
+        elif cmp_compare is not None:
+            t1s = (t1 or "").strip()
+            t3s = (t3 or "").strip()
+            if t1s and not (t1 or "").startswith("STT 실패"):
+                bl_stt = t1
+            elif t3s and not (t3 or "").startswith("STT 실패"):
+                bl_stt = t3 if t3.strip() else "(빈 인식)"
+            else:
+                bl_stt = await _text_or_transcribe(stt_finetuned, mulaw_utt, None)
+            if (bl_stt or "").startswith("STT 실패"):
+                body_lines.append(f"[baseline] {bl_stt}")
+            else:
+                body_lines.append(
+                    f"[baseline] {bl_stt if (bl_stt or '').strip() else '(빈 인식)'}"
+                )
+        body_lines.append(_no_verify_line())
+        body_lines.append("====================")
+        _logger.info("[utt=%d]\n%s", utt_seq, "\n".join(body_lines))
     else:
-        _logger.info(
-            "[utt=%d] [no_verify] %s",
-            utt_seq,
-            t3 if t3.strip() else "(빈 인식)",
-        )
+        _log_model_branch("finetuned", t1, skip1)
+        if t3.startswith("STT 실패"):
+            _logger.info("[utt=%d] [no_verify] %s", utt_seq, t3)
+        else:
+            _logger.info(
+                "[utt=%d] [no_verify] %s",
+                utt_seq,
+                t3 if t3.strip() else "(빈 인식)",
+            )
+        if settings.speaker_verify_compare_enabled and cmp_compare is not None:
+            t1s = (t1 or "").strip()
+            t3s = (t3 or "").strip()
+            if t1s and not (t1 or "").startswith("STT 실패"):
+                bl_stt = t1
+            elif t3s and not (t3 or "").startswith("STT 실패"):
+                bl_stt = t3 if t3.strip() else "(빈 인식)"
+            else:
+                bl_stt = await _text_or_transcribe(stt_finetuned, mulaw_utt, None)
+            if (bl_stt or "").startswith("STT 실패"):
+                _logger.info("[utt=%d] [baseline] %s", utt_seq, bl_stt)
+            else:
+                _logger.info(
+                    "[utt=%d] [baseline] %s",
+                    utt_seq,
+                    bl_stt if (bl_stt or "").strip() else "(빈 인식)",
+                )
+        _logger.info("[utt=%d] ====================", utt_seq)
     spawn_nemo_vs_onnx_compare_task(pcm_utt, call_id=call_id, utt_seq=utt_seq)
 
 
 @dataclass
 class TripleStreamContext:
-    """한 WebSocket 연결에 대해 3 VAD + 3 STT (인스턴스 분리로 STT race 방지)."""
+    """한 WebSocket 연결에 대해 2 VAD + 3 STT (finetuned / no_verify / baseline_compare 병렬 경로용)."""
 
-    states: tuple[VADPipelineState, VADPipelineState, VADPipelineState] = field(
-        default_factory=lambda: (VADPipelineState(), VADPipelineState(), VADPipelineState())
+    states: tuple[VADPipelineState, VADPipelineState] = field(
+        default_factory=lambda: (VADPipelineState(), VADPipelineState())
     )
-    vads: tuple[SileroVADService, SileroVADService, SileroVADService] = field(
+    vads: tuple[SileroVADService, SileroVADService] = field(
         default_factory=lambda: (
-            SileroVADService(),
             SileroVADService(),
             SileroVADService(),
         )
     )
     stt_finetuned: DeepgramSTTService = field(default_factory=DeepgramSTTService)
-    stt_medium: DeepgramSTTService = field(default_factory=DeepgramSTTService)
     stt_no_verify: DeepgramSTTService = field(default_factory=DeepgramSTTService)
+    # 이중 ONNX 병렬 경로: Path A(stt_finetuned)와 동시 STT 시 stt_no_verify 와 충돌 방지
+    stt_baseline_compare: DeepgramSTTService = field(
+        default_factory=DeepgramSTTService
+    )
     stt_latency: SttLatencyAccumulator = field(default_factory=SttLatencyAccumulator)
     utterance_seq: int = 0
     _dg_live: DeepgramLiveMulawSession | None = field(default=None, repr=False)
@@ -365,9 +522,9 @@ class TripleStreamContext:
                     mulaw_seg,
                     cid,
                     triple.stt_finetuned,
-                    triple.stt_medium,
                     triple.stt_no_verify,
                     triple.stt_latency,
+                    stt_baseline_compare=triple.stt_baseline_compare,
                     utt_seq=triple.utterance_seq,
                     transcript_override=transcript,
                     stream_stt_latency_sec=e2e,
@@ -384,26 +541,25 @@ class TripleStreamContext:
                 await self._dg_live.feed(mulaw)
                 return
 
-        o1, o2, o3 = await asyncio.gather(
+        o1, o2 = await asyncio.gather(
             self.states[0].feed_chunk(mulaw, self.vads[0]),
             self.states[1].feed_chunk(mulaw, self.vads[1]),
-            self.states[2].feed_chunk(mulaw, self.vads[2]),
         )
-        utt = o1 if o1 is not None else o2 if o2 is not None else o3
+        utt = o1 if o1 is not None else o2
         if utt is None:
             return
-        if o1 != o2 or o2 != o3:
+        if o1 != o2:
             _logger.warning(
                 "VAD 발화 경계 불일치 (비트 동일 아님) — 첫 비어있지 않은 값 사용"
             )
-            utt = o1 or o2 or o3
+            utt = o1 or o2
         self.utterance_seq += 1
         await on_utterance_triple(
             utt,
             call_id,
             self.stt_finetuned,
-            self.stt_medium,
             self.stt_no_verify,
             self.stt_latency,
+            stt_baseline_compare=self.stt_baseline_compare,
             utt_seq=self.utterance_seq,
         )

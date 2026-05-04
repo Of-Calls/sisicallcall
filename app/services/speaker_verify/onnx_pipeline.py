@@ -1,7 +1,6 @@
-"""ONNXRuntime(mel 입력) 화자 검증 — 병렬 파이프라인용.
+"""ONNXRuntime(mel 입력) 화자 검증 — 파인튜닝 ONNX 단일 싱글톤.
 
-파인튜닝·medium 등 **모델 파일만 다르고** 추론 계약은 동일:
-  mel [B, n_mels, T] + length → logits / embedding (`titanet.py` ONNX 분기와 동일).
+mel [B, n_mels, T] + length → logits / embedding (`titanet.py` ONNX 분기와 동일).
 """
 
 from __future__ import annotations
@@ -166,7 +165,7 @@ class OnnxMelSpeakerVerifyService(BaseSpeakerVerifyService):
 
     @property
     def session(self):
-        """onnxruntime InferenceSession (기동 시 medium≠finetuned 세션 id 확인용)."""
+        """onnxruntime InferenceSession (진단용)."""
         return self._ort_sess
 
     @property
@@ -175,9 +174,6 @@ class OnnxMelSpeakerVerifyService(BaseSpeakerVerifyService):
         return self.onnx_resolved_path or ""
 
     def _similarity_threshold(self) -> float:
-        if self._settings_field == "titanet_pipeline_onnx_path":
-            v = settings.speaker_verify_medium_threshold
-            return settings.speaker_verify_threshold if v is None else float(v)
         if self._settings_field == "titanet_finetuned_onnx_path":
             v = settings.speaker_verify_finetuned_threshold
             return settings.speaker_verify_threshold if v is None else float(v)
@@ -339,12 +335,40 @@ class OnnxMelSpeakerVerifyService(BaseSpeakerVerifyService):
             logger.error("[%s] verify 실패 call_id=%s: %s", self._log_tag, call_id, e)
             return False, 0.0
 
+    def verify_with_precomputed_mel(
+        self, mel: np.ndarray, call_id: str
+    ) -> tuple[bool, float]:
+        """`verify` 와 동일 유사도 공식이나 mel 은 호출자가 넘김(다른 경로와 동일 mel 공유용)."""
+        if self.load_error or self._ort_sess is None:
+            return False, 0.0
+        if call_id not in self._voiceprints:
+            return False, 0.0
+        try:
+            embedding = self._embedding_from_mel_np(mel)
+            embedding = np.asarray(embedding, dtype=np.float32).reshape(-1).copy()
+            voiceprint = self._voiceprints[call_id]
+            similarity = float(
+                np.dot(embedding, voiceprint)
+                / (np.linalg.norm(embedding) * np.linalg.norm(voiceprint))
+            )
+            thr = self._similarity_threshold()
+            is_verified = similarity >= thr
+            return is_verified, similarity
+        except Exception as e:
+            logger.error(
+                "[%s] verify_with_precomputed_mel 실패 call_id=%s: %s",
+                self._log_tag,
+                call_id,
+                e,
+            )
+            return False, 0.0
+
     def has_voiceprint(self, call_id: str) -> bool:
         """등록 완료 여부(검증 전제)."""
         return call_id in self._voiceprints
 
     def debug_voiceprint_array_id(self, call_id: str) -> int | None:
-        """등록된 voiceprint ndarray 의 id — medium vs finetuned 공유 참조 진단용."""
+        """등록된 voiceprint ndarray 의 id (진단용)."""
         vp = self._voiceprints.get(call_id)
         return id(vp) if vp is not None else None
 
@@ -357,7 +381,7 @@ class OnnxMelSpeakerVerifyService(BaseSpeakerVerifyService):
         return str([float(x) for x in flat])
 
     def voiceprint_store_dict_id(self) -> int:
-        """call_id → ndarray 저장 dict 객체 id (medium vs finetuned 별도 dict 확인)."""
+        """call_id → ndarray 저장 dict 객체 id."""
         return id(self._voiceprints)
 
     def cleanup(self, call_id: str) -> bool:
@@ -365,7 +389,7 @@ class OnnxMelSpeakerVerifyService(BaseSpeakerVerifyService):
         return self._voiceprints.pop(call_id, None) is not None
 
     def ort_inference_session_id(self) -> int | None:
-        """onnxruntime InferenceSession 객체 id (기동 시 medium≠finetuned 확인용)."""
+        """onnxruntime InferenceSession 객체 id."""
         return id(self._ort_sess) if self._ort_sess is not None else None
 
     def clear_all_voiceprints(self) -> int:
@@ -377,31 +401,12 @@ class OnnxMelSpeakerVerifyService(BaseSpeakerVerifyService):
 
 
 _singleton_lock = threading.Lock()
-_singleton_medium: OnnxMelSpeakerVerifyService | None = None
 _singleton_finetuned: OnnxMelSpeakerVerifyService | None = None
-
-
-def get_onnx_pipeline_service() -> OnnxMelSpeakerVerifyService:
-    """medium 학습 ONNX (`titanet_small_medium_5epoch_lr5e5.onnx` 기본)."""
-    global _singleton_medium, _singleton_finetuned
-    if _singleton_medium is None:
-        with _singleton_lock:
-            if _singleton_medium is None:
-                _singleton_medium = OnnxMelSpeakerVerifyService(
-                    settings_field="titanet_pipeline_onnx_path",
-                    default_filename="titanet_small_medium_5epoch_lr5e5.onnx",
-                    log_tag="medium ONNX",
-                )
-                if _singleton_finetuned is not None and _singleton_medium is _singleton_finetuned:
-                    raise RuntimeError(
-                        "ONNX 싱글톤 버그: medium 이 finetuned 와 동일 인스턴스입니다."
-                    )
-    return _singleton_medium
 
 
 def get_finetuned_onnx_service() -> OnnxMelSpeakerVerifyService:
     """파인튜닝 ONNX (`titanet_small_finetuned_final.onnx` 기본)."""
-    global _singleton_finetuned, _singleton_medium
+    global _singleton_finetuned
     if _singleton_finetuned is None:
         with _singleton_lock:
             if _singleton_finetuned is None:
@@ -411,10 +416,6 @@ def get_finetuned_onnx_service() -> OnnxMelSpeakerVerifyService:
                     log_tag="finetuned ONNX",
                     infer_max_pcm_sec=settings.titanet_finetuned_infer_max_sec,
                 )
-                if _singleton_medium is not None and _singleton_finetuned is _singleton_medium:
-                    raise RuntimeError(
-                        "ONNX 싱글톤 버그: finetuned 가 medium 과 동일 인스턴스입니다."
-                    )
     return _singleton_finetuned
 
 
@@ -427,8 +428,7 @@ async def get_finetuned_onnx_service_async() -> OnnxMelSpeakerVerifyService:
 
 
 def clear_all_onnx_voiceprints() -> None:
-    """medium·finetuned 싱글톤의 in-memory voiceprint 전부 삭제 (기동 옵션·관리 API)."""
-    get_onnx_pipeline_service().clear_all_voiceprints()
+    """finetuned 싱글톤의 in-memory voiceprint 전부 삭제 (기동 옵션·관리 API)."""
     get_finetuned_onnx_service().clear_all_voiceprints()
 
 
@@ -440,57 +440,18 @@ def _session_id_log(sess: object | None) -> str:
 
 
 def log_onnx_inference_session_check() -> None:
-    """medium·finetuned 가 서로 다른 InferenceSession·파일을 쓰는지 기동 시 한 번 로그."""
-    md = get_onnx_pipeline_service()
+    """finetuned ONNX InferenceSession·경로 기동 시 한 번 로그."""
     ft = get_finetuned_onnx_service()
-    sid_m = md.ort_inference_session_id()
     sid_f = ft.ort_inference_session_id()
-    path_m = md.onnx_resolved_path or "(미로드)"
     path_f = ft.onnx_resolved_path or "(미로드)"
-
-    if md is ft:
-        logger.error(
-            "ONNX 싱글톤 치명 오류: medium 과 finetuned 가 동일 파이썬 객체(id=%s)입니다.",
-            id(md),
-        )
     logger.info("finetuned onnx_path: %s", ft.onnx_path or path_f)
-    logger.info("medium    onnx_path: %s", md.onnx_path or path_m)
     logger.info("finetuned session id: %s", _session_id_log(ft.session))
-    logger.info("medium    session id: %s", _session_id_log(md.session))
     logger.info(
-        "ONNX verifier 인스턴스 id: medium=%d finetuned=%d (같으면 동일 객체)",
-        id(md),
-        id(ft),
-    )
-    logger.info("medium InferenceSession id:    %s", sid_m)
-    logger.info("finetuned InferenceSession id: %s", sid_f)
-    logger.info(
-        "startup ONNX Runtime: medium session_id=%s path=%s | finetuned session_id=%s path=%s",
-        sid_m,
-        path_m,
+        "startup ONNX Runtime: finetuned session_id=%s path=%s",
         sid_f,
         path_f,
     )
-    if md is not ft and md.session is not None and ft.session is not None and md.session is ft.session:
-        logger.error(
-            "medium·finetuned 가 서로 다른 서비스 객체인데 동일 InferenceSession 을 공유합니다."
-        )
-    if sid_m is not None and sid_f is not None and sid_m == sid_f:
-        logger.error(
-            "medium·finetuned 가 동일 InferenceSession(id)를 공유합니다. "
-            "싱글톤/초기화 버그를 확인하세요."
-        )
-    if path_m == path_f and path_m not in ("", "(미로드)"):
-        logger.warning(
-            "medium·finetuned ONNX 파일 경로가 동일합니다 (%s). "
-            "유사도가 항상 같게 나올 수 있습니다.",
-            path_m,
-        )
-    logger.info(
-        "voiceprint 저장 dict id: medium=%d finetuned=%d (다르면 별도 저장소)",
-        md.voiceprint_store_dict_id(),
-        ft.voiceprint_store_dict_id(),
-    )
+    logger.info("voiceprint 저장 dict id: finetuned=%d", ft.voiceprint_store_dict_id())
 
 
 # 하위 호환(이전 클래스명)

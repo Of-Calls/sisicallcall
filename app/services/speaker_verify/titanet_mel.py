@@ -1,6 +1,6 @@
 """PCM16 linear / WAV float → log-mel [1, n_mels, T] (ONNX TitaNet-Small mel 입력).
 
-ONNX `titanet_small_medium_5epoch_lr5e5.onnx` 는 레포에 **학습 hparams.yaml이 없음**.
+학습 ONNX는 레포에 **학습 hparams.yaml이 없을 수 있음**.
 mel 스펙은 NeMo `AudioToMelSpectrogramPreprocessor` + TitaNet 관례(16k, 25ms/10ms, 80 mel)와
 동일하게 두고, `app.utils.config` (`TITANET_ONNX_MEL_*`) 로 덮어쓴다.
 
