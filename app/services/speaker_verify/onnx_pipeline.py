@@ -37,6 +37,11 @@ def _app_root() -> Path:
     return Path(__file__).resolve().parent.parent.parent
 
 
+def _repo_root() -> Path:
+    """레포지토리 루트 (`app/` 상위). ONNX 기본: `models/speech_verification/`."""
+    return Path(__file__).resolve().parent.parent.parent.parent
+
+
 def _onnx_embedding_from_output(out: np.ndarray) -> np.ndarray:
     """ONNX 출력 텐서 → 1D 임베딩 (`titanet.py`와 동일).
 
@@ -62,7 +67,7 @@ def _resolve_onnx_path(settings_field: str, default_filename: str) -> Path | Non
     p = (
         Path(raw)
         if raw
-        else _app_root() / "models" / "speaker_verification" / default_filename
+        else _repo_root() / "models" / "speech_verification" / default_filename
     )
     if p.is_file():
         return p

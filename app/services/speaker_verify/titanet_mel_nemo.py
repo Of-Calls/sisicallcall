@@ -36,6 +36,10 @@ def _app_root() -> Path:
     return Path(__file__).resolve().parent.parent.parent
 
 
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parent.parent.parent.parent
+
+
 def _mel_torch_to_numpy_b1ct(mel: torch.Tensor) -> tuple[np.ndarray, int]:
     """preprocessor 출력 → ([1, n_mels, T], n_mels)."""
     x = mel.float().detach().cpu()
@@ -58,7 +62,14 @@ def get_shared_nemo_preprocessor(device: torch.device) -> torch.nn.Module:
     with _lock:
         if _speaker_model is None:
             raw = (settings.titanet_speaker_nemo_path or "").strip()
-            path = Path(raw) if raw else _app_root() / "models" / "speaker_verification" / "titanet_small_finetuned_final.nemo"
+            path = (
+                Path(raw)
+                if raw
+                else _repo_root()
+                / "models"
+                / "speech_verification"
+                / "titanet_small_finetuned_final.nemo"
+            )
             if not path.is_file():
                 raise FileNotFoundError(f"TITANET_SPEAKER_NEMO_PATH 없음 또는 파일 없음: {path}")
             from nemo.collections.asr.models import EncDecSpeakerLabelModel

@@ -4,7 +4,7 @@ raw wav 는 ONNX에 넣지 않음. NeMo `get_embedding` 과 동일하게 mel 전
 
 CLI 스모크 테스트:
     python -m app.services.speaker_verify.titanet_onnx_verifier ^
-      --model-path app/models/speaker_verification/titanet_small_finetuned_final.onnx ^
+      --model-path models/speech_verification/titanet_small_finetuned_final.onnx ^
       --enroll-wav path/to/enroll.wav ^
       --verify-wav path/to/verify.wav ^
       --threshold 0.48
@@ -207,7 +207,7 @@ def _cli_main() -> None:
     ap.add_argument(
         "--model-path",
         type=Path,
-        default=Path("app/models/speaker_verification/titanet_small_finetuned_final.onnx"),
+        default=Path("models/speech_verification/titanet_small_finetuned_final.onnx"),
         help="ONNX 파일 경로",
     )
     ap.add_argument("--enroll-wav", type=Path, required=True, help="등록용 WAV")

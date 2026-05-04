@@ -85,7 +85,7 @@ class Settings(BaseSettings):
         default=0,
         validation_alias=AliasChoices("TITANET_FINETUNED_ONNX_MAX_MEL_FRAMES"),
     )
-    # 병렬 통화 / enrollment — 빈 문자열이면 app/models/speaker_verification/ 기본 파일 사용
+    # 병렬 통화 / enrollment — 빈 문자열이면 레포 models/speech_verification/ 기본 ONNX
     titanet_finetuned_onnx_path: str = Field(
         default="",
         validation_alias=AliasChoices("TITANET_FINETUNED_ONNX_PATH"),
