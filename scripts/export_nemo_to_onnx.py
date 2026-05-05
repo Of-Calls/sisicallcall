@@ -101,6 +101,127 @@ _ONNX_DYNAMIC_AXES_INPUTS_ONLY = {
 }
 
 
+def export_loaded_encdec_speaker_model(
+    model,
+    onnx_out: Path,
+    *,
+    device_s: str | None,
+    opset: int,
+    n_mels: int,
+    t_frames: int,
+    verify_times: tuple[int, ...],
+    nemo_export_fallback: bool,
+    no_verify: bool,
+) -> int:
+    """이미 로드된 `EncDecSpeakerLabelModel`을 mel 입력 ONNX로 내보낸다.
+
+    Returns:
+        0 성공, 1 검증 실패 또는 예외
+    """
+    import torch
+
+    device_s_resolved = device_s or ("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(device_s_resolved)
+
+    model.eval()
+    model.to(device)
+
+    onnx_out.parent.mkdir(parents=True, exist_ok=True)
+
+    input_example = None
+    for kwargs in (
+        {"max_batch": 1, "max_dim": 256},
+        {"max_batch": 1, "max_dim": 128},
+        {},
+    ):
+        if not hasattr(model, "input_example"):
+            break
+        try:
+            input_example = (
+                model.input_example(**kwargs) if kwargs else model.input_example()
+            )
+        except TypeError:
+            continue
+        except Exception:
+            input_example = None
+            continue
+        if input_example is not None:
+            if isinstance(input_example, tuple):
+                input_example = tuple(
+                    x.to(device) if hasattr(x, "to") else x for x in input_example
+                )
+            print(f"input_example OK kwargs={kwargs or 'none'}")
+            break
+
+    if input_example is None:
+        print(
+            "input_example 없음/실패 - NeMo fallback 시 더미 mel [1, n_mels, T] 사용 "
+            f"(n_mels={n_mels}, T={t_frames})"
+        )
+        input_example = _default_mel_batch(device, n_mels, t_frames)
+
+    print(f"export → {onnx_out} (device={device_s_resolved}, opset={opset})")
+    exported = False
+    with torch.no_grad():
+        if not nemo_export_fallback:
+            try:
+                export_torch_onnx_export(
+                    model,
+                    onnx_out,
+                    device=device,
+                    opset=opset,
+                    n_mels=n_mels,
+                    t_frames=t_frames,
+                )
+                print(
+                    "torch.onnx.export 완료 (dynamic_axes: audio_signal time + length batch)."
+                )
+                exported = True
+            except Exception as e:
+                err = str(e).lower()
+                hint = ""
+                if "onnxscript" in err:
+                    hint = "  → `pip install onnxscript` 후 재시도하면 torch 경로가 살아날 수 있습니다.\n"
+                print(
+                    f"torch.onnx.export 실패: {e}\n{hint}  → NeMo model.export 로 재시도합니다."
+                )
+
+        if not exported:
+            try:
+                model.export(
+                    str(onnx_out),
+                    input_example=input_example,
+                    onnx_opset_version=opset,
+                    check_trace=False,
+                    dynamic_axes=_ONNX_DYNAMIC_AXES_FULL,
+                )
+            except Exception as e:
+                print(
+                    f"dynamic_axes(입력+출력) NeMo export 실패: {e}\n"
+                    "  → 입력 축만 동적으로 재시도합니다."
+                )
+                model.export(
+                    str(onnx_out),
+                    input_example=input_example,
+                    onnx_opset_version=opset,
+                    check_trace=False,
+                    dynamic_axes=_ONNX_DYNAMIC_AXES_INPUTS_ONLY,
+                )
+            print("NeMo model.export 완료.")
+    print("export 완료 (파일 쓰기 끝).")
+    if not no_verify:
+        ok = verify_onnx_mel_time_axis(
+            onnx_out, n_mels=n_mels, time_frames=verify_times
+        )
+        if not ok:
+            print(
+                "종료 코드 1: export 산출물은 있으나 검증 실패. "
+                "통과하는 T 범위의 ONNX로 교체하거나 onnxscript 설치 후 torch 재export를 권장합니다."
+            )
+            return 1
+    return 0
+
+
 def verify_onnx_mel_time_axis(
     onnx_path: Path,
     *,
@@ -219,111 +340,22 @@ def main() -> None:
     if not args.nemo_in.is_file():
         raise SystemExit(f".nemo 파일 없음: {args.nemo_in}")
 
-    import torch
     from nemo.collections.asr.models import EncDecSpeakerLabelModel
-
-    device_s = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    device = torch.device(device_s)
 
     print(f"restore_from: {args.nemo_in}")
     model = EncDecSpeakerLabelModel.restore_from(restore_path=str(args.nemo_in))
-    model.eval()
-    model.to(device)
-
-    args.onnx_out.parent.mkdir(parents=True, exist_ok=True)
-
-    input_example = None
-    for kwargs in (
-        {"max_batch": 1, "max_dim": 256},
-        {"max_batch": 1, "max_dim": 128},
-        {},
-    ):
-        if not hasattr(model, "input_example"):
-            break
-        try:
-            input_example = (
-                model.input_example(**kwargs) if kwargs else model.input_example()
-            )
-        except TypeError:
-            continue
-        except Exception:
-            input_example = None
-            continue
-        if input_example is not None:
-            if isinstance(input_example, tuple):
-                input_example = tuple(
-                    x.to(device) if hasattr(x, "to") else x for x in input_example
-                )
-            print(f"input_example OK kwargs={kwargs or 'none'}")
-            break
-
-    if input_example is None:
-        print(
-            "input_example 없음/실패 - NeMo fallback 시 더미 mel [1, n_mels, T] 사용 "
-            f"(n_mels={args.n_mels}, T={args.t_frames})"
-        )
-        input_example = _default_mel_batch(device, args.n_mels, args.t_frames)
-
-    print(f"export → {args.onnx_out} (device={device_s}, opset={args.opset})")
-    exported = False
-    with torch.no_grad():
-        if not args.nemo_export_fallback:
-            try:
-                export_torch_onnx_export(
-                    model,
-                    args.onnx_out,
-                    device=device,
-                    opset=args.opset,
-                    n_mels=args.n_mels,
-                    t_frames=args.t_frames,
-                )
-                print(
-                    "torch.onnx.export 완료 (dynamic_axes: audio_signal time + length batch)."
-                )
-                exported = True
-            except Exception as e:
-                err = str(e).lower()
-                hint = ""
-                if "onnxscript" in err:
-                    hint = "  → `pip install onnxscript` 후 재시도하면 torch 경로가 살아날 수 있습니다.\n"
-                print(
-                    f"torch.onnx.export 실패: {e}\n{hint}  → NeMo model.export 로 재시도합니다."
-                )
-
-        if not exported:
-            try:
-                model.export(
-                    str(args.onnx_out),
-                    input_example=input_example,
-                    onnx_opset_version=args.opset,
-                    check_trace=False,
-                    dynamic_axes=_ONNX_DYNAMIC_AXES_FULL,
-                )
-            except Exception as e:
-                print(
-                    f"dynamic_axes(입력+출력) NeMo export 실패: {e}\n"
-                    "  → 입력 축만 동적으로 재시도합니다."
-                )
-                model.export(
-                    str(args.onnx_out),
-                    input_example=input_example,
-                    onnx_opset_version=args.opset,
-                    check_trace=False,
-                    dynamic_axes=_ONNX_DYNAMIC_AXES_INPUTS_ONLY,
-                )
-            print("NeMo model.export 완료.")
-    print("export 완료 (파일 쓰기 끝).")
-    if not args.no_verify:
-        ok = verify_onnx_mel_time_axis(
-            args.onnx_out, n_mels=args.n_mels, time_frames=verify_times
-        )
-        if not ok:
-            print(
-                "종료 코드 1: export 산출물은 있으나 검증 실패. "
-                "통과하는 T 범위의 ONNX로 교체하거나 onnxscript 설치 후 torch 재export를 권장합니다."
-            )
-            raise SystemExit(1)
-    raise SystemExit(0)
+    code = export_loaded_encdec_speaker_model(
+        model,
+        args.onnx_out,
+        device_s=args.device,
+        opset=args.opset,
+        n_mels=args.n_mels,
+        t_frames=args.t_frames,
+        verify_times=verify_times,
+        nemo_export_fallback=args.nemo_export_fallback,
+        no_verify=args.no_verify,
+    )
+    raise SystemExit(code)
 
 
 if __name__ == "__main__":
