@@ -11,7 +11,6 @@ from app.utils.logger import get_logger
 _logger = get_logger(__name__)
 
 _FILLER_TEXTS = [
-    "네, 알겠습니다",
     "잠시만요",
     "확인해드릴게요",
 ]
