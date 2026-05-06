@@ -102,125 +102,15 @@ async def _background_warm_finetuned_onnx() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    loop = asyncio.get_running_loop()
-    stop_hb = asyncio.Event()
+    _logger.info("startup: loading BGE-M3 embedding model...")
+    get_embedder()
+    _logger.info("startup: embedding model ready")
 
-    async def _heartbeat() -> None:
-        n = 0
-        while True:
-            try:
-                await asyncio.wait_for(stop_hb.wait(), timeout=45)
-                return
-            except asyncio.TimeoutError:
-                n += 1
-                _logger.warning(
-                    "모델 로딩 중… (%d회째, 경과≈%ds)",
-                    n,
-                    n * 45,
-                )
+    _logger.info("startup: warming up speaker verify (ONNX)...")
+    from app.services.speaker_verify import get_speaker_verify_service
 
-    if settings.preload_finetuned_nemo_at_startup:
-        _logger.info(
-            "startup: 파인튜닝 ONNX(+선택 NeMo mel) 동시 로딩… "
-            "(끄려면 PRELOAD_FINETUNED_NEMO_AT_STARTUP=false)"
-        )
-        hb_task = asyncio.create_task(_heartbeat())
-        try:
-            await loop.run_in_executor(None, _preload_finetuned_and_parallel_onnx_sync)
-        finally:
-            stop_hb.set()
-        await hb_task
-        _logger.info("startup: ONNX 통화 파이프라인 준비 완료")
-    else:
-        _logger.info(
-            "startup: NeMo mel(설정 시)만 즉시 — 파인튜닝 ONNX는 백그라운드 "
-            "(기동 시 ONNX까지 즉시 올리려면 PRELOAD_FINETUNED_NEMO_AT_STARTUP=true)"
-        )
-        await loop.run_in_executor(None, _preload_nemo_mel_only_sync)
-        asyncio.create_task(_background_warm_finetuned_onnx())
-        _logger.info("startup: 서버 수신 가능 — 파인튜닝 ONNX는 백그라운드에서 로드됨")
-
-    from app.services.speaker_verify.titanet_mel_nemo import nemo_mel_backend_enabled
-
-    if nemo_mel_backend_enabled() and not settings.warmup_nemo_mel_at_startup:
-        _logger.info(
-            "startup: TITANET_MEL_BACKEND=nemo — NeMo 는 첫 mel 사용 시 restore "
-            "(기동 단축). 기동 시 미리 올리려면 WARMUP_NEMO_MEL_AT_STARTUP=true"
-        )
-
-    from app.services.speaker_verify.onnx_pipeline import (
-        log_onnx_inference_session_check,
-    )
-
-    log_onnx_inference_session_check()
-
-    if settings.speaker_verify_compare_enabled:
-        from app.services.speaker_verify.titanet_compare import (
-            get_titanet_compare_speaker_verify_service,
-        )
-
-        bl_onnx = (settings.speaker_verify_compare_baseline_onnx_path or "").strip()
-        bl_src = (
-            bl_onnx if bl_onnx else "models/speech_verification/titanet-s.onnx (기본)"
-        )
-        _logger.info(
-            "startup: SPEAKER_VERIFY_COMPARE_ENABLED — baseline ONNX 워커에서 백그라운드 로드 (%s). "
-            "완료 전에는 이중 ONNX 비교·CSV 비활성(파인튜닝 ONNX만)",
-            bl_src,
-        )
-
-        async def _load_compare_baseline_background() -> None:
-            try:
-                svc = get_titanet_compare_speaker_verify_service()
-                _logger.info(
-                    "startup: baseline ONNX 백그라운드 로드 — 전용 스레드 풀(1)에 제출"
-                )
-                await loop.run_in_executor(
-                    _nemo_compare_baseline_executor(),
-                    svc.load_baseline_model,
-                )
-                if svc.load_error:
-                    _logger.error(
-                        "startup: titanet_compare baseline ONNX 실패 — 비교는 finetuned 경로로 폴백: %s",
-                        svc.load_error,
-                    )
-                else:
-                    _logger.info(
-                        "startup: titanet_compare baseline ONNX 백그라운드 로드 완료 "
-                        "(순정 ONNX + finetuned ONNX 비교·게이트 사용 가능)"
-                    )
-            except Exception:
-                _logger.exception(
-                    "startup: titanet_compare baseline ONNX 백그라운드 로드 예외"
-                )
-
-        asyncio.create_task(_load_compare_baseline_background())
-
-    if settings.call_debug_routes_enabled:
-        from app.services.speaker_verify.titanet_compare import (
-            _resolve_compare_csv_path,
-        )
-
-        _logger.info(
-            "startup: CALL_DEBUG_ROUTES_ENABLED — 통화 후 결과: 브라우저 "
-            "`/call/debug/verify-compare?format=html` | 웹훅 안내 `/call/debug/twilio-webhook-hint` | "
-            "CSV=%s",
-            _resolve_compare_csv_path(),
-        )
-
-    if settings.reset_voiceprint_on_startup:
-        from app.services.speaker_verify import enrollment as voice_enrollment_reset
-        from app.services.speaker_verify.onnx_pipeline import clear_all_onnx_voiceprints
-        from app.services.speaker_verify.titanet_compare import (
-            clear_all_compare_voiceprints,
-        )
-
-        clear_all_onnx_voiceprints()
-        clear_all_compare_voiceprints()
-        voice_enrollment_reset.reset_all_enrollment_state()
-        _logger.info(
-            "startup: RESET_VOICEPRINT_ON_STARTUP=true — ONNX voiceprint·enrollment 전역 비움"
-        )
+    await get_speaker_verify_service().warmup()
+    _logger.info("startup: speaker verify ready")
 
     yield
 

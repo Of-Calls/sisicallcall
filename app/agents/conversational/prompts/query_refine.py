@@ -133,6 +133,15 @@ rewritten_query 를 정확히 "사용자가 직전 안내 반복 요청" 으로 
 주의: "방금 말한 X 알려주세요" 처럼 구체적인 항목/대상 명시가 있으면
 일반 발화로 처리하라 (재질문이 아니라 후속 정보 요청).
 
+[핵심 규칙 6 — 작별/통화 종료 의사 감지]
+사용자 발화가 명시적 또는 완곡한 작별 인사 / 통화 종료 의사 표시면 → is_goodbye=true.
+- 명시적: "안녕히 계세요", "안녕히 가세요", "끊을게요", "이만 끊겠습니다", "수고하세요"
+- 완곡: "이제 됐어요", "그만하시면 돼요", "다음에 또 연락드릴게요"
+- 단순 감사만 단독 ("고맙습니다", "감사합니다") 으로 후속 요청 없으면 → is_goodbye=true
+- 후속 요청과 함께면 is_goodbye=false (예: "감사합니다, 하나 더 여쭤볼게요")
+주의: "네", "알겠어요", "괜찮아요" 같은 단순 동의/거부는 is_goodbye=false (규칙 3 적용).
+is_goodbye=true 면 is_clear=true 와 동시 가능. rewritten_query 는 빈값 허용.
+
 [일반 규칙]
 - 그 외의 지시대명사("그거", "저거", "이거") → 이전 대화에서 referent 찾아 치환
 - 의도 자체가 모호한 단발 발화("어...", "잠깐만", "음") → is_clear=false
@@ -140,8 +149,9 @@ rewritten_query 를 정확히 "사용자가 직전 안내 반복 요청" 으로 
   의도 명확하므로 여기 해당하지 않음. is_clear=true.
 
 [출력 — 순수 JSON 객체만 출력. 다른 텍스트 절대 금지]
-{{"is_clear": true|false, "rewritten_query": "...", "missing_info": "..."}}
+{{"is_clear": true|false, "rewritten_query": "...", "missing_info": "...", "is_goodbye": true|false}}
 
 - 마크다운 블록(```json ... ```)을 절대 사용하지 마세요. 첫 글자는 반드시 '{{' 로 시작해야 합니다.
 - is_clear=true: rewritten_query 채움, missing_info 는 빈 문자열
-- is_clear=false: rewritten_query 는 빈 문자열, missing_info 에 무엇이 부족한지 (예: "무엇을 지칭하시는지", "어떤 말씀이신지")"""
+- is_clear=false: rewritten_query 는 빈 문자열, missing_info 에 무엇이 부족한지 (예: "무엇을 지칭하시는지", "어떤 말씀이신지")
+- is_goodbye=true: 작별/종료 의사 감지 (규칙 6). rewritten_query 빈값 허용. 평소엔 false."""

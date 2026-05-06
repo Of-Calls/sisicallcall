@@ -213,6 +213,31 @@ class ChromaRAGService(BaseRAGService):
         await loop.run_in_executor(None, _delete)
         logger.info("chroma delete doc_id=%s tenant=%s", doc_id, tenant_id)
 
+    async def list_chunks(self, tenant_id: str) -> list[dict]:
+        """tenant 컬렉션의 모든 청크 GET — BM25 코퍼스 build 용. embedding 은 제외해 메모리 절약."""
+        import asyncio
+
+        loop = asyncio.get_event_loop()
+
+        def _list():
+            col = self._client.get_or_create_collection(self._collection_name(tenant_id))
+            result = col.get(include=["documents", "metadatas"])
+            ids = result.get("ids") or []
+            docs = result.get("documents") or []
+            metas = result.get("metadatas") or []
+            out: list[dict] = []
+            for i, doc in enumerate(docs):
+                meta = metas[i] if i < len(metas) else {}
+                out.append({
+                    "id": ids[i] if i < len(ids) else "",
+                    "document": doc or "",
+                    "metadata": meta or {},
+                    "chunk_index": (meta or {}).get("chunk_index"),
+                })
+            return out
+
+        return await loop.run_in_executor(None, _list)
+
     async def delete_by_document(self, document_id: str, tenant_id: str) -> None:
         """document_id에 속한 모든 청크 삭제 — 문서 교체/삭제 시 사용."""
         import asyncio

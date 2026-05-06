@@ -39,19 +39,23 @@ async def query_refine_node(state: CallState) -> dict:
         is_clear = bool(parsed.get("is_clear", True))
         rewritten = str(parsed.get("rewritten_query", "")).strip()
         missing = str(parsed.get("missing_info", "")).strip()
+        is_goodbye = bool(parsed.get("is_goodbye", False))
     except (json.JSONDecodeError, ValueError, AttributeError):
-        # 파싱 실패: 원본 그대로 통과
+        # 파싱 실패: 원본 그대로 통과 (goodbye 신호도 없음)
         is_clear = True
         rewritten = user_text
         missing = ""
+        is_goodbye = False
 
-    # 안전장치: is_clear=True 인데 rewritten 비어있으면 원본 사용
-    if is_clear and not rewritten:
+    # 안전장치: is_clear=True + 일반 분기 (goodbye 아님) 인데 rewritten 비어있으면 원본 사용
+    # is_goodbye=True 면 rewritten 빈값 허용 (라우팅에 영향 없음)
+    if is_clear and not is_goodbye and not rewritten:
         rewritten = user_text
 
-    print(f"[query_refine] is_clear={is_clear} rewritten='{rewritten}' missing='{missing}'")
+    print(f"[query_refine] is_clear={is_clear} rewritten='{rewritten}' missing='{missing}' goodbye={is_goodbye}")
     return {
         "rewritten_query": rewritten,
         "is_clear": is_clear,
         "missing_info": missing,
+        "is_goodbye": is_goodbye,
     }

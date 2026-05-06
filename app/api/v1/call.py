@@ -1,32 +1,101 @@
+import asyncio
+import audioop
 import base64
 import csv
 import html
 import json
+import os
+import time
+import traceback
+from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import Response
+from twilio.rest import Client as TwilioRestClient
 
-from fastapi import APIRouter, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse, Response
-
-from app.pipeline.runner import TripleStreamContext, log_call_stt_latency_summary
-from app.services.speaker_verify import enrollment as voice_enrollment
-from app.services.speaker_verify.onnx_pipeline import get_finetuned_onnx_service
-from app.services.speaker_verify.titanet_compare import cleanup_compare_for_call
-from app.services.speaker_verify.titanet_compare import _resolve_compare_csv_path
+from app.agents.conversational.graph import build_graph
+from app.agents.post_call.runner import run_post_call_agent_safely
+from app.repositories.call_repo import finalize_call, insert_call
+from app.repositories.transcript_repo import insert_transcript
+from app.services.session.redis_session import RedisSessionService
+from app.services.speaker_verify import enrollment as voiceprint_enrollment
+from app.services.speaker_verify import get_speaker_verify_service
+from app.services.stt.deepgram import DeepgramSTTService
+from app.services.tenant import (
+    DEFAULT_INDUSTRY,
+    DEFAULT_NAME,
+    get_greeting,
+    get_tenant_meta,
+    resolve_tenant_id,
+)
+from app.services.tts.azure import AzureTTSService
+from app.services.vad.silero_vad import SileroVADService
 from app.utils.config import settings
-from app.utils.logger import get_logger
 
 router = APIRouter()
-_logger = get_logger(__name__)
+_stt = DeepgramSTTService()
+_tts = AzureTTSService()
+_vad = SileroVADService()
+_verifier = get_speaker_verify_service()
+_graph = build_graph()
+_session = RedisSessionService()
+_twilio_rest = (
+    TwilioRestClient(settings.twilio_account_sid, settings.twilio_auth_token)
+    if settings.twilio_account_sid and settings.twilio_auth_token
+    else None
+)
+
+# Stage 4a — graph 통합 (echo 회귀 환경변수)
+_GRAPH_ENABLED = os.getenv("GRAPH_INTEGRATION_ENABLED", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
+_VAD_FRAME_BYTES = 1024  # linear16 16kHz, 512 samples
+_SILENCE_THRESHOLD = 50  # 연속 침묵 VAD 프레임 수 (~1600ms)
+_TWILIO_CHUNK_BYTES = 160  # 20ms mulaw 8kHz — Twilio 권장 단위
+
+
+def _extract_caller_number(caller: str) -> str:
+    """SIP URI 의 user part 또는 e164 그대로. caller_number VARCHAR(20) 제약."""
+    if caller.startswith("sip:"):
+        user = caller[4:].split("@", 1)[0].split(";", 1)[0]
+        return user[:20]
+    return caller[:20]
+
+
+def _intent_to_response_path(intent: str | None) -> str | None:
+    """graph intent → transcripts.response_path (CHECK 'cache','faq','task','auth','escalation').
+    매핑 외 (clarify/repeat/vision/echo/None) → NULL.
+    """
+    if intent in ("faq", "task", "auth", "escalation"):
+        return intent
+    return None
 
 
 @router.post("/incoming")
 async def incoming_call(request: Request):
+    form = await request.form()
+    to_field = form.get("To", "")
+    twilio_call_sid = form.get("CallSid", "")
+    caller_raw = form.get("Caller", "") or form.get("From", "")
+    caller_number = _extract_caller_number(caller_raw)
+    # SIP URI / e164 / single digit 모두 처리 — 매칭 실패 시 raw 값 반환됨 (UUID 아님 → echo).
+    tenant_id = await resolve_tenant_id(to_field)
+    print(
+        f"[INCOMING] to={to_field!r} caller={caller_number!r} call_sid={twilio_call_sid!r} tenant_id={tenant_id!r}"
+    )
+
     host = request.headers.get("host", "")
     ws_url = f"wss://{host}/call/ws"
 
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
-    <Stream url="{ws_url}" />
+    <Stream url="{ws_url}">
+      <Parameter name="tenant_id" value="{tenant_id}" />
+      <Parameter name="twilio_call_sid" value="{twilio_call_sid}" />
+      <Parameter name="caller_number" value="{caller_number}" />
+    </Stream>
   </Connect>
 </Response>"""
 
@@ -38,8 +107,27 @@ async def call_ws(websocket: WebSocket):
     await websocket.accept()
     _logger.info("[WS] Twilio 연결됨")
 
-    triple = TripleStreamContext()
+    audio_buffer = bytearray()  # STT용 (mulaw 8kHz 누적)
+    pcm_buffer = bytearray()  # VAD frame 잘라쓰는 용 (linear16 16kHz 임시)
+    utterance_pcm = (
+        bytearray()
+    )  # 화자검증/enrollment 용 (linear16 16kHz, 발화 단위 누적)
+    ratecv_state = None  # audioop.ratecv state — 8k→16k 보간 연속성 유지
+    silence_count = 0
+    had_speech = False
     stream_sid = None
+    is_speaking = False  # TTS 송출 중 플래그 — Mode A (Stage 1b) 자기루프 방지
+    # Stage 4a — graph 컨텍스트 (start 시 로드)
+    tenant_id = ""
+    tenant_name = "고객센터"
+    tenant_industry = "unknown"
+    # Stage 4c-1 — DB hook 컨텍스트
+    db_call_id = ""  # calls.id (UUID, INSERT 후 받음). 빈값 = DB hook 비활성
+    call_started_at = 0.0  # time.perf_counter() — duration 계산용
+    twilio_call_sid = ""
+    caller_number = ""
+    # Stage 4c-2 — transcripts turn 카운터 (customer + agent 한 쌍이 같은 turn_index 공유)
+    turn_index = 0
 
     try:
         while True:
@@ -51,126 +139,422 @@ async def call_ws(websocket: WebSocket):
                 _logger.info("[WS] connected")
 
             elif event == "start":
-                start = msg.get("start") or {}
-                stream_sid = start.get("streamSid") or msg.get("streamSid")
-                call_sid = start.get("callSid")
-                triple.reset()
-                _logger.info("[WS] start streamSid=%s callSid=%s", stream_sid, call_sid)
-                try:
-                    await triple.prepare_deepgram_streaming(
-                        stream_sid if isinstance(stream_sid, str) else "no-stream"
-                    )
-                except Exception as e:
-                    _logger.exception("[WS] Deepgram 스트리밍 준비 실패: %s", e)
+                stream_sid = msg["start"]["streamSid"]
+                custom_params = msg["start"].get("customParameters") or {}
+                received_tenant_id = custom_params.get("tenant_id", "")
+                twilio_call_sid = custom_params.get("twilio_call_sid", "")
+                caller_number = custom_params.get("caller_number", "")
+                print(
+                    f"[WS] start streamSid={stream_sid} tenant_id={received_tenant_id!r} call_sid={twilio_call_sid!r}"
+                )
+                audio_buffer.clear()
+                pcm_buffer.clear()
+                utterance_pcm.clear()
+                ratecv_state = None
+                silence_count = 0
+                had_speech = False
+                is_speaking = False
+                tenant_id = ""  # 매칭 실패/graph 비활성 시 echo 모드 신호
+                db_call_id = ""
+                call_started_at = time.perf_counter()
+                turn_index = 0
+
+                # Stage 4b — Twilio Parameter 로 받은 tenant_id 검증 + 메타 로드
+                if _GRAPH_ENABLED and received_tenant_id:
+                    try:
+                        tenant_name, tenant_industry = await get_tenant_meta(
+                            received_tenant_id
+                        )
+                        if (
+                            tenant_name == DEFAULT_NAME
+                            and tenant_industry == DEFAULT_INDUSTRY
+                        ):
+                            print(
+                                f"[GRAPH] tenant 매칭 실패 (received={received_tenant_id!r}) → echo"
+                            )
+                        else:
+                            tenant_id = received_tenant_id
+                            print(f"[GRAPH] tenant={tenant_name} ({tenant_industry})")
+                            # Stage 4c-1 — calls INSERT (graph 활성 + tenant 매칭 시)
+                            if twilio_call_sid:
+                                inserted = await insert_call(
+                                    tenant_id=tenant_id,
+                                    twilio_call_sid=twilio_call_sid,
+                                    caller_number=caller_number or None,
+                                )
+                                if inserted:
+                                    db_call_id = inserted
+                                    print(f"[DB] calls INSERT db_call_id={db_call_id}")
+
+                            # Stage 4d — greeting 자동 송출 (사용자 첫 발화 기다리지 않음)
+                            try:
+                                greeting = await get_greeting(
+                                    tenant_id, within_hours=True
+                                )
+                                print(f"[GREETING] '{greeting[:60]}'")
+                                tts_audio = await _tts.synthesize(greeting)
+                                is_speaking = True
+                                await _send_audio_to_twilio(
+                                    websocket, stream_sid, tts_audio
+                                )
+                                play_sec = len(tts_audio) / 8000
+                                await asyncio.sleep(play_sec)
+                                is_speaking = False
+                                print(f"[GREETING] 재생 끝 ({play_sec:.2f}s)")
+                                # transcripts INSERT — turn 0 agent (사용자 첫 발화는 turn 1 부터)
+                                if db_call_id:
+                                    await insert_transcript(
+                                        db_call_id,
+                                        turn_index,
+                                        "agent",
+                                        greeting,
+                                        response_path=None,
+                                    )
+                                    turn_index += 1
+                                # buffer reset — greeting 잔향이 enrollment 에 섞이지 않게
+                                audio_buffer.clear()
+                                pcm_buffer.clear()
+                                utterance_pcm.clear()
+                                ratecv_state = None
+                                silence_count = 0
+                                had_speech = False
+                            except Exception as e:
+                                is_speaking = False
+                                print(f"[GREETING] failed: {e} — silent")
+                    except Exception as e:
+                        print(
+                            f"[GRAPH] tenant_meta load failed: {e} → echo fallback this call"
+                        )
 
             elif event == "media":
+                if is_speaking:
+                    continue  # TTS 송출 중엔 사용자 발화 무시 — barge-in 은 Stage 3 에서 도입
+
                 mulaw = base64.b64decode(msg["media"]["payload"])
-                call_id = stream_sid or "no-stream"
-                await triple.feed_media_chunk(mulaw, call_id)
+                audio_buffer.extend(mulaw)
+
+                pcm_8k = audioop.ulaw2lin(mulaw, 2)
+                pcm_16k, ratecv_state = audioop.ratecv(
+                    pcm_8k, 2, 1, 8000, 16000, ratecv_state
+                )
+                pcm_buffer.extend(pcm_16k)
+
+                while len(pcm_buffer) >= _VAD_FRAME_BYTES:
+                    frame = bytes(pcm_buffer[:_VAD_FRAME_BYTES])
+                    del pcm_buffer[:_VAD_FRAME_BYTES]
+
+                    is_speech = await _vad.detect(frame)
+
+                    if is_speech:
+                        if not had_speech:
+                            print("[VAD] 발화 시작")
+                            utterance_pcm.clear()  # 새 발화 — 이전 잔여/silence prefix 폐기
+                        utterance_pcm.extend(
+                            frame
+                        )  # 발화 시작 후만 누적 (verify/enrollment 입력 품질)
+                        silence_count = 0
+                        had_speech = True
+                    else:
+                        if had_speech:
+                            utterance_pcm.extend(frame)  # 발화 중 짧은 pause 도 포함
+                            if silence_count == 0:
+                                print("[VAD] 침묵 카운트 시작")
+                        silence_count += 1
+                        if silence_count >= _SILENCE_THRESHOLD and had_speech:
+                            pcm_for_verify = bytes(utterance_pcm)
+                            print(f"[VERIFY-DBG] utterance_pcm={len(pcm_for_verify)}B")
+
+                            # Stage B: voiceprint 등록 후 — STT 전 화자검증 게이트
+                            # TitaNet 짧은 발화 한계 → 1.5초 미만은 verify 스킵 (본인 reject 방지)
+                            min_verify_bytes = int(
+                                settings.speaker_verify_min_audio_sec * 16000 * 2
+                            )
+                            if stream_sid and _verifier.is_enrolled(stream_sid):
+                                if len(pcm_for_verify) < min_verify_bytes:
+                                    dur_ms = len(pcm_for_verify) * 1000 // 32000
+                                    print(
+                                        f"[VERIFY] short ({dur_ms}ms < {settings.speaker_verify_min_audio_sec}s) — skip verify"
+                                    )
+                                else:
+                                    verified, sim = await _verifier.verify(
+                                        pcm_for_verify, stream_sid
+                                    )
+                                    if not verified:
+                                        print(
+                                            f"[VERIFY] reject sim={sim:.3f} — STT skip"
+                                        )
+                                        audio_buffer.clear()
+                                        utterance_pcm.clear()
+                                        silence_count = 0
+                                        had_speech = False
+                                        continue
+
+                            print(f"[VAD] 침묵 임계 도달 — {len(audio_buffer)}B → STT")
+
+                            t_stt = time.perf_counter()
+                            transcript = await _stt.transcribe(bytes(audio_buffer))
+                            stt_ms = (time.perf_counter() - t_stt) * 1000
+                            print(
+                                f"[STT] '{transcript}' ({stt_ms:.0f}ms, in={len(audio_buffer)}B)"
+                            )
+
+                            audio_buffer.clear()
+                            silence_count = 0
+                            had_speech = False
+
+                            # Stage A: voiceprint 미등록 — STT 후 enrollment 누적 (빈 STT 차단)
+                            if stream_sid and not _verifier.is_enrolled(stream_sid):
+                                await voiceprint_enrollment.accumulate(
+                                    stream_sid, pcm_for_verify, transcript
+                                )
+
+                            utterance_pcm.clear()
+
+                            if transcript and stream_sid:
+                                # Stage 4a — graph 호출 분기 (실패 시 echo 회귀)
+                                response_text = transcript  # 기본 echo
+                                graph_intent: str | None = None
+                                should_hangup = False
+                                if _GRAPH_ENABLED and tenant_id:
+                                    try:
+                                        session_view = await _session.load(stream_sid)
+                                        graph_state = {
+                                            "call_id": stream_sid,
+                                            "tenant_id": tenant_id,
+                                            "tenant_name": tenant_name,
+                                            "tenant_industry": tenant_industry,
+                                            "user_text": transcript,
+                                            "intent": "",
+                                            "response_text": "",
+                                            "session_view": session_view,
+                                            "rewritten_query": "",
+                                            "is_clear": False,
+                                            "missing_info": "",
+                                            "is_goodbye": False,
+                                            "should_hangup": False,
+                                        }
+                                        t_graph = time.perf_counter()
+                                        result = await _graph.ainvoke(graph_state)
+                                        graph_ms = (
+                                            time.perf_counter() - t_graph
+                                        ) * 1000
+                                        graph_resp = result.get("response_text", "")
+                                        graph_intent = result.get("intent") or None
+                                        should_hangup = bool(
+                                            result.get("should_hangup", False)
+                                        )
+                                        print(
+                                            f"[GRAPH] intent={graph_intent} resp='{graph_resp[:60]}' hangup={should_hangup} ({graph_ms:.0f}ms)"
+                                        )
+                                        if graph_resp:
+                                            response_text = graph_resp
+                                            await _session.append_turn(
+                                                stream_sid, transcript, graph_resp
+                                            )
+                                        else:
+                                            print(
+                                                "[GRAPH] empty response — echo fallback"
+                                            )
+                                    except Exception as e:
+                                        print(f"[GRAPH] error: {e} → echo fallback")
+
+                                # Stage 4c-2 — transcripts INSERT 양방향 (TTS 송출 전).
+                                # DB 실패해도 통화 지속 (DB 누락만, traceback 명시).
+                                if db_call_id:
+                                    try:
+                                        await insert_transcript(
+                                            db_call_id,
+                                            turn_index,
+                                            "customer",
+                                            transcript,
+                                        )
+                                        await insert_transcript(
+                                            db_call_id,
+                                            turn_index,
+                                            "agent",
+                                            response_text,
+                                            response_path=_intent_to_response_path(
+                                                graph_intent
+                                            ),
+                                        )
+                                        turn_index += 1
+                                    except Exception as exc:
+                                        print(
+                                            f"[DB] transcripts INSERT 실패 (통화 지속): {type(exc).__name__}: {exc}"
+                                        )
+                                        traceback.print_exc()
+
+                                # TTS synth — 실패 시 polite fallback 멘트로 1회 재시도, 그것도 실패면 silent skip.
+                                tts_audio = b""
+                                try:
+                                    t_tts = time.perf_counter()
+                                    tts_audio = await _tts.synthesize(response_text)
+                                    tts_ms = (time.perf_counter() - t_tts) * 1000
+                                    print(
+                                        f"[TTS] synth {tts_ms:.0f}ms, out={len(tts_audio)}B"
+                                    )
+                                except Exception as exc:
+                                    print(
+                                        f"[TTS] synth 실패: {type(exc).__name__}: {exc}"
+                                    )
+                                    traceback.print_exc()
+                                    try:
+                                        tts_audio = await _tts.synthesize(
+                                            "잠시 문제가 생겼어요. 다시 말씀해주세요."
+                                        )
+                                        print(
+                                            f"[TTS] fallback synth ok out={len(tts_audio)}B"
+                                        )
+                                    except Exception as exc2:
+                                        print(
+                                            f"[TTS] fallback 도 실패 (silent skip): {type(exc2).__name__}: {exc2}"
+                                        )
+                                        tts_audio = b""
+
+                                if not tts_audio:
+                                    # silent skip — 다음 turn 으로
+                                    continue
+
+                                is_speaking = True
+                                # _send_audio_to_twilio 실패 = WebSocket 손상 신호. raise 해서
+                                # outer except Exception 분기가 정리/traceback 처리.
+                                t_send = time.perf_counter()
+                                await _send_audio_to_twilio(
+                                    websocket, stream_sid, tts_audio
+                                )
+                                send_ms = (time.perf_counter() - t_send) * 1000
+                                print(f"[TTS] 송출 {send_ms:.0f}ms")
+
+                                # 실제 재생 시간만큼 대기 — Twilio 큐가 비워질 때까지 is_speaking 유지
+                                # (송출 ≠ 재생. mulaw 8kHz = 8000B/s)
+                                play_sec = len(tts_audio) / 8000
+                                await asyncio.sleep(play_sec)
+                                is_speaking = False
+                                print(f"[TTS] 재생 끝 ({play_sec:.2f}s)")
+
+                                # TTS 후 buffer / VAD state 일괄 리셋 — 잔향/echo 누적 방지
+                                audio_buffer.clear()
+                                pcm_buffer.clear()
+                                utterance_pcm.clear()
+                                ratecv_state = None
+                                silence_count = 0
+                                had_speech = False
+
+                                # Polish — goodbye 분기에서 should_hangup=True → Twilio REST API hangup
+                                if (
+                                    should_hangup
+                                    and twilio_call_sid
+                                    and _twilio_rest is not None
+                                ):
+                                    try:
+                                        await asyncio.to_thread(
+                                            _twilio_rest.calls(twilio_call_sid).update,
+                                            status="completed",
+                                        )
+                                        print(
+                                            f"[HANGUP] Twilio call terminated: {twilio_call_sid}"
+                                        )
+                                    except Exception as e:
+                                        print(f"[HANGUP] failed: {e}")
 
             elif event == "stop":
-                _logger.info("[WS] stop")
+                print("[WS] stop")
+                if stream_sid:
+                    _verifier.cleanup(stream_sid)
+                    voiceprint_enrollment.cleanup(stream_sid)
+                    if _GRAPH_ENABLED:
+                        try:
+                            await _session.clear(stream_sid)
+                        except Exception as e:
+                            print(f"[GRAPH] session clear failed: {e}")
+                # Stage 4c-1 — calls UPDATE finalize (Twilio 정상 종료).
+                # finalize 실패해도 break 는 진행 — outer 가 잡지 않게.
+                if db_call_id:
+                    duration_sec = (
+                        int(time.perf_counter() - call_started_at)
+                        if call_started_at
+                        else None
+                    )
+                    try:
+                        await finalize_call(db_call_id, "completed", duration_sec)
+                        print(
+                            f"[DB] finalize_call db_call_id={db_call_id} status=completed dur={duration_sec}s"
+                        )
+                    except Exception as e:
+                        print(f"[DB] finalize_call failed: {e}")
+                        traceback.print_exc()
+                    # Stage 4c-3 — post_call agent fire-and-forget
+                    if tenant_id:
+                        asyncio.create_task(
+                            run_post_call_agent_safely(
+                                db_call_id, "call_ended", tenant_id
+                            )
+                        )
+                        print(
+                            f"[POST_CALL] triggered db_call_id={db_call_id} tenant_id={tenant_id}"
+                        )
                 break
 
     except WebSocketDisconnect:
-        _logger.info("[WS] 연결 끊김")
-    finally:
-        await triple.shutdown_deepgram_streaming()
+        print("[WS] 연결 끊김 (사용자/Twilio)")
         if stream_sid:
-            log_call_stt_latency_summary(triple.stt_latency, stream_sid=stream_sid)
-            get_finetuned_onnx_service().cleanup(stream_sid)
-            cleanup_compare_for_call(stream_sid)
-            voice_enrollment.cleanup(stream_sid)
-
-
-def _require_call_debug_routes() -> None:
-    if not settings.call_debug_routes_enabled:
-        raise HTTPException(status_code=404, detail="Not Found")
-
-
-def _read_verify_compare_rows(*, tail: int, call_id: str | None) -> tuple[str, list[dict[str, str]]]:
-    path = _resolve_compare_csv_path()
-    if not path.is_file():
-        return str(path), []
-    with path.open(newline="", encoding="utf-8") as f:
-        rows = list(csv.DictReader(f))
-    if call_id:
-        rows = [r for r in rows if r.get("call_id") == call_id]
-    if tail > 0 and len(rows) > tail:
-        rows = rows[-tail:]
-    return str(path), rows
-
-
-@router.get("/debug/twilio-webhook-hint")
-async def debug_twilio_webhook_hint(request: Request) -> JSONResponse:
-    """Twilio 콘솔에 넣을 URL 안내 (CALL_DEBUG_ROUTES_ENABLED=true 일 때만)."""
-    _require_call_debug_routes()
-    base = str(request.base_url).rstrip("/")
-    host = request.headers.get("host", "")
-    ws_hint = f"wss://{host}/call/ws" if host else "(Host 헤더 기준으로 Twilio Media Stream 과 동일 호스트)"
-    return JSONResponse(
-        {
-            "twilio_phone_voice_config": "A call comes in → Webhook / HTTP POST",
-            "incoming_twiml_url": f"{base}/call/incoming",
-            "media_stream_websocket": ws_hint,
-            "speaker_verify_compare_enabled": settings.speaker_verify_compare_enabled,
-            "speaker_verify_compare_csv_path": str(_resolve_compare_csv_path()),
-            "speaker_verify_compare_baseline_onnx_path": (
-                (settings.speaker_verify_compare_baseline_onnx_path or "").strip() or None
-            ),
-            "speaker_verify_nemo_baseline_nemo_path": (
-                (settings.speaker_verify_nemo_baseline_nemo_path or "").strip() or None
-            ),
-            "view_csv_table_in_browser": f"{base}/call/debug/verify-compare?format=html",
-            "view_csv_json": f"{base}/call/debug/verify-compare?format=json&tail=100",
-        }
-    )
-
-
-@router.get("/debug/verify-compare", response_model=None)
-async def debug_verify_compare(
-    tail: int = Query(50, ge=1, le=500),
-    call_id: str | None = Query(None, description="streamSid 등으로 필터 후 tail 적용"),
-    format: str = Query("json", description="json | html"),
-) -> Response:
-    """화자검증 비교 CSV tail 조회 (CALL_DEBUG_ROUTES_ENABLED=true 일 때만)."""
-    _require_call_debug_routes()
-    fmt = (format or "json").strip().lower()
-    if fmt not in ("json", "html"):
-        raise HTTPException(status_code=422, detail="format 은 json 또는 html")
-
-    path_str, rows = _read_verify_compare_rows(tail=tail, call_id=call_id)
-    if fmt == "html":
-        esc = html.escape
-        parts = [
-            "<!DOCTYPE html><html><head><meta charset='utf-8'>",
-            "<title>speaker_verify_compare</title>",
-            "<style>body{font-family:sans-serif;} table{border-collapse:collapse;} th,td{border:1px solid #ccc;padding:4px 8px;font-size:12px;}</style>",
-            "</head><body>",
-            f"<h2>{esc('speaker_verify_compare.csv')}</h2>",
-            f"<p><code>{esc(path_str)}</code> — 표시 행 수: {len(rows)} (tail={tail})</p>",
-        ]
-        if rows:
-            cols = list(rows[0].keys())
-            parts.append("<table><thead><tr>")
-            parts.extend(f"<th>{esc(c)}</th>" for c in cols)
-            parts.append("</tr></thead><tbody>")
-            for r in rows:
-                parts.append("<tr>")
-                parts.extend(f"<td>{esc(str(r.get(c, '')))}</td>" for c in cols)
-                parts.append("</tr>")
-            parts.append("</tbody></table>")
-        else:
-            parts.append("<p>(파일 없음 또는 행 없음)</p>")
-        parts.append("</body></html>")
-        return HTMLResponse("".join(parts))
-
-    return JSONResponse(
-        {
-            "csv_path": path_str,
-            "row_count": len(rows),
-            "tail": tail,
-            "call_id_filter": call_id,
-            "rows": rows,
-        }
-    )
+            _verifier.cleanup(stream_sid)
+            voiceprint_enrollment.cleanup(stream_sid)
+            if _GRAPH_ENABLED:
+                try:
+                    await _session.clear(stream_sid)
+                except Exception as e:
+                    print(f"[GRAPH] session clear failed: {e}")
+        # Stage 4c-1 — calls UPDATE finalize (사용자 먼저 끊음)
+        if db_call_id:
+            duration_sec = (
+                int(time.perf_counter() - call_started_at) if call_started_at else None
+            )
+            try:
+                await finalize_call(db_call_id, "abandoned", duration_sec)
+                print(
+                    f"[DB] finalize_call db_call_id={db_call_id} status=abandoned dur={duration_sec}s"
+                )
+            except Exception as e:
+                print(f"[DB] finalize_call failed: {e}")
+                traceback.print_exc()
+            # Stage 4c-3 — post_call agent fire-and-forget (abandoned 통화도 분석 트리거)
+            if tenant_id:
+                asyncio.create_task(
+                    run_post_call_agent_safely(db_call_id, "call_ended", tenant_id)
+                )
+                print(
+                    f"[POST_CALL] triggered db_call_id={db_call_id} tenant_id={tenant_id}"
+                )
+    except Exception as exc:
+        # WebSocketDisconnect 외 unhandled 예외 — Twilio 입장에선 우리가 close = Error 31921.
+        # traceback 을 stdout 으로 명시 출력해 logs/{date}/stdout_*.log 에 잡히게.
+        print(f"[WS] 비정상 종료: {type(exc).__name__}: {exc}")
+        traceback.print_exc()
+        if stream_sid:
+            try:
+                _verifier.cleanup(stream_sid)
+                voiceprint_enrollment.cleanup(stream_sid)
+                if _GRAPH_ENABLED:
+                    await _session.clear(stream_sid)
+            except Exception as e:
+                print(f"[WS] cleanup failed: {e}")
+        if db_call_id:
+            duration_sec = (
+                int(time.perf_counter() - call_started_at) if call_started_at else None
+            )
+            try:
+                await finalize_call(db_call_id, "abandoned", duration_sec)
+                print(
+                    f"[DB] finalize_call db_call_id={db_call_id} status=abandoned (server error) dur={duration_sec}s"
+                )
+            except Exception as e:
+                print(f"[DB] finalize_call failed: {e}")
+                traceback.print_exc()
+            if tenant_id:
+                asyncio.create_task(
+                    run_post_call_agent_safely(db_call_id, "call_ended", tenant_id)
+                )
+                print(
+                    f"[POST_CALL] triggered (server error) db_call_id={db_call_id} tenant_id={tenant_id}"
+                )

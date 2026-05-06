@@ -18,3 +18,7 @@ class CallState(TypedDict):
     rewritten_query: str   # 맥락 보강된 self-contained 쿼리 (is_clear=False 면 빈 문자열)
     is_clear: bool         # 발화가 명확한가 (재작성 성공 여부)
     missing_info: str      # is_clear=False 일 때 무엇이 부족한지 (예: "어떤 상품")
+    is_goodbye: bool       # 작별/통화 종료 의사 감지 (query_refine 핵심 규칙 6)
+
+    # goodbye_branch 결과 — call.py 가 Twilio REST API 로 hangup
+    should_hangup: bool

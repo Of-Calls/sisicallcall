@@ -26,7 +26,7 @@ from app.services.chunking.pdf_processor import (
     _enrich_chunks_with_llm,
     _polish_chunks_for_embedding,
 )
-from app.services.embedding.local import BGEM3LocalEmbeddingService
+from app.services.embedding import get_embedder
 from app.services.llm.gpt4o_mini import GPT4OMiniService
 from app.services.rag.chroma import ChromaRAGService
 from app.utils.config import settings
@@ -89,7 +89,8 @@ async def main() -> None:
     tenant_id = await _resolve_tenant_id(_TENANT_NAME)
     logger.info("tenant_id=%s name=%s", tenant_id, _TENANT_NAME)
 
-    embedder = BGEM3LocalEmbeddingService()
+    embedder = get_embedder()
+    logger.info("embedder=%s (provider=%s)", type(embedder).__name__, settings.embedding_provider)
     rag = ChromaRAGService()
     llm = GPT4OMiniService()
 
@@ -102,7 +103,7 @@ async def main() -> None:
     metas = await _enrich_chunks_with_llm(chunks, llm)
     logger.info("enrich 완료 cnt=%d", len(metas))
 
-    embeddings = await embedder.embed_batch(polished)
+    embeddings = await embedder.embed_passages(polished)
     logger.info("임베딩 완료 cnt=%d", len(embeddings))
 
     document_id = str(uuid.uuid4())

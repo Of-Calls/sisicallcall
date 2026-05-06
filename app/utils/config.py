@@ -40,6 +40,17 @@ class Settings(BaseSettings):
     chroma_host: str = "localhost"
     chroma_port: int = 8001
 
+    # Embedding provider — "bge-m3" (default, FlagEmbedding) | "qwen3" (sentence-transformers).
+    # swap 시 ChromaDB 의 모든 컬렉션 reseed 필수 (벡터 공간이 모델별로 다름).
+    embedding_provider: str = "qwen3"
+
+    # FAQ RAG distance threshold (ChromaDB default L2). 임베딩 모델에 따라 분포 다름.
+    # - BGE-M3: 0.85 (정답 0.6~0.85, 무관 1.0+)
+    # - Qwen3:  1.15 (정답 0.5~1.20, 무관 1.21+, gap 우월)
+    faq_distance_threshold: float = 1.20
+    # vision 게이트는 일반 humanize 보다 느슨 (model_spec 청크 top_k 진입 자체가 신호).
+    faq_vision_gate_threshold: float = 0.95
+
     # App
     env: str = "development"
     log_level: str = "INFO"
@@ -47,124 +58,18 @@ class Settings(BaseSettings):
     # TTS Output Channel 모드 — "mock" (기본, 테스트/유닛) | "twilio" (프로덕션 WebSocket)
     tts_channel_mode: str = "mock"
 
-    # TitaNet 화자 검증 — onnxruntime + 로컬 ONNX. mel 은 torchaudio 기본, 선택 시 NeMo preprocessor(.nemo).
-    # 코사인 유사도 ≥ threshold 일 때만 검증 통과. 짧은 발화·전화 음질에 따라 본인 거절(FRR)↑ 가능.
-    speaker_verify_threshold: float = Field(
-        default=0.40,
-        validation_alias=AliasChoices(
-            "SPEAKER_VERIFY_THRESHOLD",
-            "TITANET_SIMILARITY_THRESHOLD",
-        ),
-    )
-    speaker_verify_finetuned_threshold: float | None = Field(
-        default=None,
-        validation_alias=AliasChoices("SPEAKER_VERIFY_FINETUNED_THRESHOLD"),
-    )
-    titanet_enrollment_sec: float = 3.0  # 레거시(초 단위 PCM 누적). 등록 로직은 enroll_utt_count 발화 기준.
-    # enrollment: STT 성공 발화마다 finetuned 임베딩 수집 → N개 도달 시 평균·L2 정규화 후 저장.
-    enroll_utt_count: int = Field(
-        default=3,
-        ge=1,
-        validation_alias=AliasChoices("ENROLL_UTT_COUNT"),
-    )
-    # ONNX mel: "torchaudio"(기본) | "nemo" — nemo 시 학습과 동일 preprocessor(.nemo) 사용.
-    titanet_mel_backend: str = Field(
-        default="torchaudio",
-        validation_alias=AliasChoices("TITANET_MEL_BACKEND"),
-    )
-    titanet_speaker_nemo_path: str = Field(
-        default="",
-        validation_alias=AliasChoices("TITANET_SPEAKER_NEMO_PATH"),
-    )
-    # finetuned ONNX만: 긴 발화 PCM 상한(초). mel 계산·메모리 완화. 0 이하면 상한 없음.
-    # STFT center·hop 정렬 때문에 이 한도만으로 mel T 가 ONNX 내부 상한과 일치하지 않을 수 있음 → TITANET_FINETUNED_ONNX_MAX_MEL_FRAMES.
-    titanet_finetuned_infer_max_sec: float = 12.0
-    # finetuned ONNX mel 시간축 T 상한(프레임). 0 이면 런타임 안전 기본 1200 사용(Where 1200×1201 방지).
-    # 더 큰 T 가 필요하면 명시적으로 큰 값(예: 2000)을 두고, 재export 로 그래프를 고치는 것이 근본 해결.
-    titanet_finetuned_onnx_max_mel_frames: int = Field(
-        default=0,
-        validation_alias=AliasChoices("TITANET_FINETUNED_ONNX_MAX_MEL_FRAMES"),
-    )
-    # 병렬 통화 / enrollment — 빈 문자열이면 레포 models/speech_verification/ 기본 ONNX
-    titanet_finetuned_onnx_path: str = Field(
-        default="",
-        validation_alias=AliasChoices("TITANET_FINETUNED_ONNX_PATH"),
-    )
-    # True면 기동 시 파인튜닝 ONNX까지 동시 로드. False면 NeMo mel(설정 시)만 즉시, 파인튜닝은 백그라운드.
-    # (환경 변수명 PRELOAD_FINETUNED_NEMO_AT_STARTUP는 기존 .env 호환용)
-    preload_finetuned_nemo_at_startup: bool = False
-    # TITANET_MEL_BACKEND=nemo 일 때만 해당. False(기본)=NeMo restore 는 첫 mel 사용 시(기동 빠름).
-    # True=기존처럼 기동 시 restore(첫 통화 지연 없음, 대신 startup 이 길어짐). CPU만 쓸 때 특히 false 권장.
-    warmup_nemo_mel_at_startup: bool = Field(
-        default=False,
-        validation_alias=AliasChoices("WARMUP_NEMO_MEL_AT_STARTUP"),
-    )
-    # ONNX mel 전처리 (TitaNet 16kHz 스펙트로그 관례; 학습 yaml과 다르면 덮어쓰기)
-    titanet_onnx_mel_n_fft: int = 512
-    titanet_onnx_mel_n_mels: int = 80
-    titanet_onnx_mel_win_length: int = 400  # 25 ms @ 16 kHz
-    titanet_onnx_mel_hop_length: int = 160  # 10 ms @ 16 kHz
-    titanet_onnx_mel_fmin: float = 0.0
-    titanet_onnx_mel_fmax: float = 8000.0
-    speaker_verify_enabled: bool = True
-    # 통화 발화마다 동일 mel로 NeMo forward_for_export vs 파인튜닝 ONNX 임베딩 코사인 로그 (NeMo+CPU/GPU 부하).
-    speaker_verify_nemo_onnx_compare_on_call: bool = Field(
-        default=False,
-        validation_alias=AliasChoices(
-            "SPEAKER_VERIFY_NEMO_ONNX_COMPARE_ON_CALL",
-        ),
-    )
-    # 순정·파인튜닝 ONNX 동시 추론·CSV. 경로별 STT는 각 모델 임계값(baseline_ok / finetuned_ok)만 사용.
-    speaker_verify_compare_enabled: bool = Field(
-        default=False,
-        validation_alias=AliasChoices("SPEAKER_VERIFY_COMPARE_ENABLED"),
-    )
-    speaker_verify_gate_model: Literal["baseline", "finetuned"] = Field(
-        default="finetuned",
-        description="레거시·.env 호환. 이중 ONNX compare 스냅샷·CSV에서는 미사용.",
-        validation_alias=AliasChoices("SPEAKER_VERIFY_GATE_MODEL"),
-    )
-    speaker_verify_compare_log_path: str = Field(
-        default="logs/speaker_verify_compare.csv",
-        validation_alias=AliasChoices("SPEAKER_VERIFY_COMPARE_LOG_PATH"),
-    )
-    # 비교 baseline: 순정(또는 비파인튜닝) TitaNet ONNX. 비우면 models/speech_verification/titanet-s.onnx
-    speaker_verify_compare_baseline_onnx_path: str = Field(
-        default="",
-        validation_alias=AliasChoices(
-            "SPEAKER_VERIFY_COMPARE_BASELINE_ONNX_PATH",
-        ),
-    )
-    # 비어 있으면 from_pretrained("titanet_small") — 캐시/허브. 로컬 .nemo 절대·상대 경로면 다운로드 없이 복원.
-    speaker_verify_nemo_baseline_nemo_path: str = Field(
-        default="",
-        validation_alias=AliasChoices("SPEAKER_VERIFY_NEMO_BASELINE_NEMO_PATH"),
-    )
-    # True면 원격 체크포인트 캐시 갱신(이름 로드 시). 로컬 .nemo 경로일 때는 보통 불필요.
-    speaker_verify_nemo_baseline_refresh_cache: bool = Field(
-        default=False,
-        validation_alias=AliasChoices("SPEAKER_VERIFY_NEMO_BASELINE_REFRESH_CACHE"),
-    )
-    # True: NeMo 로드 전 CUDA_VISIBLE_DEVICES=-1 (CPU 전용·torch CUDA 미초기화 시에만 효과). GPU 서버에서는 false 유지.
-    speaker_verify_nemo_force_cpu: bool = Field(
-        default=False,
-        validation_alias=AliasChoices("SPEAKER_VERIFY_NEMO_FORCE_CPU"),
-    )
-
-    @field_validator("speaker_verify_gate_model", mode="before")
-    @classmethod
-    def _normalize_speaker_verify_gate_model(cls, v: object) -> object:
-        if isinstance(v, str):
-            return v.strip().lower()
-        return v
-
-    # True면 서버 기동 시 in-memory voiceprint·enrollment 전역을 비움 (오염 임베딩 제거).
-    reset_voiceprint_on_startup: bool = False
-    # Twilio 로컬 테스트 시 화자검증 CSV·웹훅 안내용 디버그 GET (운영에서는 false).
-    call_debug_routes_enabled: bool = Field(
-        default=False,
-        validation_alias=AliasChoices("CALL_DEBUG_ROUTES_ENABLED"),
-    )
+    # Speaker Verification (TitaNet-L ONNX, runtime enrollment)
+    # ONNX 도착 전엔 enabled=False 권장 (회귀 안전망 — verify 자동 bypass).
+    # 모델 도착 시 .env 에서 SPEAKER_VERIFY_ENABLED=true.
+    # threshold/enrollment_sec 는 ONNX 도착 후 실통화로 튜닝 (보통 cosine 0.4~0.6).
+    speaker_verify_enabled: bool = False
+    speaker_verify_model_path: str = "models/speech_verification/titanet_large.onnx"
+    speaker_verify_threshold: float = 0.5
+    speaker_verify_enrollment_sec: float = 3.0
+    # TitaNet 짧은 발화 한계 — 2.0초 미만 발화는 임베딩 신뢰성 낮아 본인 reject 위험.
+    # 미만은 verify 스킵하고 통과 (짧은 응답 보호 + 시연 안정성 우선).
+    # 임베딩 신뢰성 곡선: <1s 매우 불안정, 1~1.5s 불안정, 1.5~2s 경계, 2s+ 안정.
+    speaker_verify_min_audio_sec: float = 2.0
 
     # Silero VAD (v6.2+, 2026-04-30 채택 — 짧은 발화 + 긴 trailing silence reject 해결).
     # logs/2026-04-30/server_100651.log Turn 4/5 사례: "예약은어떻게해요" 0.5s + trailing 1.3s
@@ -225,6 +130,15 @@ class Settings(BaseSettings):
     vision_model_path: str = "models/water_purifier_convnextv2_femto_scripted.pt"
     vision_metadata_path: str = "models/water_purifier_convnextv2_femto_metadata.json"
     vision_device: str = "auto"
+
+    # FAQ 시맨틱 캐시 (faq_branch 전용)
+    # ChromaDB L2 squared distance (BGE-M3 normalized, L2sq = 2(1-cos_sim)).
+    # 0.04 (cos_sim ≥ 0.98) — 진단 결과 (8 paraphrase + 8 unrelated) 에서
+    # false hit 0%, paraphrase 25% hit. 짧은 의문문/도메인 단어 묶임 발화는
+    # BGE-M3 가 표면 매칭으로 unrelated 도 cos 0.97 까지 끌어올려서 위험.
+    # 긴 task/예약 발화 (cos 0.99+) 위주로 캐시 효과. miss 시 RAG fallthrough 정답 보장.
+    cache_distance_threshold: float = 0.04
+    cache_ttl_seconds: int = 86400  # 24h
 
     # extra="ignore" — .env 에 코드에서 제거된 잔여 키(예: 과거 GOOGLE_APPLICATION_CREDENTIALS)
     # 가 있어도 ValidationError 로 죽지 않게. 신규 키는 위 클래스 필드로 명시 정의 필요.

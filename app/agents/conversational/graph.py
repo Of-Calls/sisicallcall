@@ -10,9 +10,12 @@ from app.agents.conversational.nodes.vision_branch_node.vision_branch_node impor
 from app.agents.conversational.nodes.escalation_branch_node.escalation_branch_node import escalation_branch_node
 from app.agents.conversational.nodes.clarify_branch_node.clarify_branch_node import clarify_branch_node
 from app.agents.conversational.nodes.repeat_branch_node.repeat_branch_node import repeat_branch_node
+from app.agents.conversational.nodes.goodbye_branch_node.goodbye_branch_node import goodbye_branch_node
 
 
 def _route_by_clarity(state: CallState) -> str:
+    if state.get("is_goodbye"):
+        return "goodbye"
     return "intent_router" if state.get("is_clear") else "clarify"
 
 
@@ -32,6 +35,7 @@ def build_graph():
     g.add_node("escalation", escalation_branch_node)
     g.add_node("clarify", clarify_branch_node)
     g.add_node("repeat", repeat_branch_node)
+    g.add_node("goodbye", goodbye_branch_node)
 
     g.set_entry_point("query_refine")
 
@@ -41,6 +45,7 @@ def build_graph():
         {
             "intent_router": "intent_router",
             "clarify": "clarify",
+            "goodbye": "goodbye",
         },
     )
 
@@ -64,5 +69,6 @@ def build_graph():
     g.add_edge("escalation", END)
     g.add_edge("clarify", END)
     g.add_edge("repeat", END)
+    g.add_edge("goodbye", END)
 
     return g.compile()
