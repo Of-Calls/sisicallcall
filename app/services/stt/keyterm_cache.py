@@ -12,6 +12,7 @@ from collections import Counter
 
 import redis.asyncio as aioredis
 
+from app.services.rag.chroma import make_chroma_http_client
 from app.utils.config import settings
 from app.utils.logger import get_logger
 
@@ -31,8 +32,7 @@ def _collection_name(tenant_id: str) -> str:
 async def _fetch_all_metadatas(tenant_id: str) -> list[dict]:
     """ChromaDB 컬렉션 전체 chunk metadata 반환 (blocking → executor)."""
     def _query():
-        import chromadb
-        client = chromadb.HttpClient(host=settings.chroma_host, port=settings.chroma_port)
+        client = make_chroma_http_client()
         try:
             col = client.get_collection(_collection_name(tenant_id))
         except Exception:

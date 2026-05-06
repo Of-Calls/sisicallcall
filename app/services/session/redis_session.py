@@ -6,6 +6,7 @@ import redis.asyncio as redis
 from app.utils.config import settings
 
 _TTL_SECONDS = 3600  # 1시간 후 세션 자동 만료
+_RAG_CATEGORIES_TTL = 86400 * 7  # tenant RAG 카테고리 — PDF 재인덱싱 시 갱신
 
 
 class RedisSessionService:
@@ -117,4 +118,16 @@ class RedisSessionService:
             self._key(call_id),
             json.dumps(view, ensure_ascii=False),
             ex=_TTL_SECONDS,
+        )
+
+    async def set_rag_categories(self, tenant_id: str, categories: list[str]) -> None:
+        """PDF 인덱싱 완료 후 음성 안내용 카테고리(5~7개) 저장.
+
+        키: ``rag:categories:{tenant_id 하이픈 제거}`` — 값: JSON 배열 문자열.
+        """
+        key = f"rag:categories:{tenant_id.replace('-', '')}"
+        await self._client.set(
+            key,
+            json.dumps(categories, ensure_ascii=False),
+            ex=_RAG_CATEGORIES_TTL,
         )

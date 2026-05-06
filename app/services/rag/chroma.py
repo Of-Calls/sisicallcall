@@ -13,13 +13,57 @@ logger = get_logger(__name__)
 _CHROMA_QUERY_PATH = "/api/v1/collections/{collection_id}/query"
 
 
+def _install_chroma_posthog_shim() -> None:
+    """Chroma 텔레메트리가 posthog.capture(distinct_id, event, props) 형태로 호출하는데,
+    posthog>=6 는 capture(event, distinct_id=..., properties=...) 만 허용한다.
+    또한 anonymized_telemetry=False 여도 Chroma는 disabled 플래그를 보지 않고 capture 를
+    호출하므로, disabled 일 때는 무조건 no-op 처리한다.
+    """
+    try:
+        import posthog
+    except ImportError:
+        return
+    if getattr(posthog, "_sisicallcall_capture_shim", False):
+        return
+    _orig = posthog.capture
+
+    def capture(*args, **kwargs):  # type: ignore[no-untyped-def]
+        if getattr(posthog, "disabled", False):
+            return None
+        if len(args) == 3 and not kwargs and isinstance(args[2], dict):
+            distinct_id, event_name, properties = args
+            return _orig(
+                str(event_name),
+                distinct_id=str(distinct_id),
+                properties=properties,
+            )
+        return _orig(*args, **kwargs)
+
+    posthog.capture = capture  # type: ignore[assignment]
+    posthog._sisicallcall_capture_shim = True  # type: ignore[attr-defined]
+
+
+_install_chroma_posthog_shim()
+
+
+def make_chroma_http_client():
+    """Chroma HttpClient — 텔레메트리 비활성화(settings) + posthog 셔틀(모듈 로드 시).
+
+    PostHog 6.x 와 chromadb 0.5.x 조합에서 ClientStartEvent 전송 시 시그니처 충돌 방지.
+    """
+    import chromadb
+    from chromadb.config import Settings
+
+    return chromadb.HttpClient(
+        host=settings.chroma_host,
+        port=settings.chroma_port,
+        settings=Settings(anonymized_telemetry=False),
+    )
+
+
 class ChromaRAGService(BaseRAGService):
     def __init__(self):
-        import chromadb
-
-        self._client = chromadb.HttpClient(
-            host=settings.chroma_host, port=settings.chroma_port
-        )
+        self._client = make_chroma_http_client()
 
     def _collection_name(self, tenant_id: str) -> str:
         return f"tenant_{tenant_id.replace('-', '')}_docs"
@@ -87,17 +131,25 @@ class ChromaRAGService(BaseRAGService):
         loop = asyncio.get_event_loop()
 
         def _query():
-            col = self._client.get_or_create_collection(
-                self._collection_name(tenant_id)
-            )
-            kwargs = {
-                "query_embeddings": [query_embedding],
-                "n_results": top_k,
-                "include": ["documents", "metadatas", "distances"],
-            }
+            include = ["documents", "metadatas", "distances"]
             if where:
-                kwargs["where"] = where
-            result = col.query(**kwargs)
+                col = self._client.get_or_create_collection(
+                    self._collection_name(tenant_id)
+                )
+                result = col.query(
+                    query_embeddings=[query_embedding],
+                    n_results=top_k,
+                    where=where,
+                    include=include,
+                )
+            else:
+                # col.query(where 미지정) → 라이브러리가 "where": {} 전송 → 서버 400
+                result = self._query_http_no_where(
+                    tenant_id,
+                    query_embedding,
+                    top_k,
+                    include=include,
+                )
             docs_outer = result.get("documents") or []
             if not docs_outer:
                 return []
