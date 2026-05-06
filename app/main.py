@@ -14,7 +14,9 @@ from app.services.speaker_verify.compare_runtime_bootstrap import (
 bootstrap_speaker_compare_runtime_env_before_imports(log=True)
 
 from app.utils.config import settings
-from app.services.speaker_verify.compare_runtime_env import apply_speaker_compare_runtime_env
+from app.services.speaker_verify.compare_runtime_env import (
+    apply_speaker_compare_runtime_env,
+)
 
 if settings.speaker_verify_compare_enabled:
     apply_speaker_compare_runtime_env(log=True)
@@ -23,7 +25,7 @@ from fastapi import FastAPI
 
 from app.core.config import APP_DESCRIPTION, APP_TITLE, APP_VERSION
 from app.core.middleware import RequestLoggingMiddleware
-from app.api.v1 import auth, call, post_call, summary, tenant, dashboard, voiceprint
+from app.api.v1 import auth, call, post_call, summary, tenant, dashboard, vision
 from app.api.v1.oauth import router as oauth_router
 from app.utils.logger import get_logger
 
@@ -47,7 +49,10 @@ def _preload_nemo_mel_if_configured_sync() -> None:
     """TITANET_MEL_BACKEND=nemo 이고 WARMUP_NEMO_MEL_AT_STARTUP=true 일 때만 NeMo restore."""
     import torch
 
-    from app.services.speaker_verify.titanet_mel_nemo import nemo_mel_backend_enabled, get_shared_nemo_preprocessor
+    from app.services.speaker_verify.titanet_mel_nemo import (
+        nemo_mel_backend_enabled,
+        get_shared_nemo_preprocessor,
+    )
 
     if not settings.warmup_nemo_mel_at_startup:
         return
@@ -143,7 +148,9 @@ async def lifespan(app: FastAPI):
             "(기동 단축). 기동 시 미리 올리려면 WARMUP_NEMO_MEL_AT_STARTUP=true"
         )
 
-    from app.services.speaker_verify.onnx_pipeline import log_onnx_inference_session_check
+    from app.services.speaker_verify.onnx_pipeline import (
+        log_onnx_inference_session_check,
+    )
 
     log_onnx_inference_session_check()
 
@@ -154,9 +161,7 @@ async def lifespan(app: FastAPI):
 
         bl_onnx = (settings.speaker_verify_compare_baseline_onnx_path or "").strip()
         bl_src = (
-            bl_onnx
-            if bl_onnx
-            else "models/speech_verification/titanet-s.onnx (기본)"
+            bl_onnx if bl_onnx else "models/speech_verification/titanet-s.onnx (기본)"
         )
         _logger.info(
             "startup: SPEAKER_VERIFY_COMPARE_ENABLED — baseline ONNX 워커에서 백그라운드 로드 (%s). "
@@ -185,12 +190,16 @@ async def lifespan(app: FastAPI):
                         "(순정 ONNX + finetuned ONNX 비교·게이트 사용 가능)"
                     )
             except Exception:
-                _logger.exception("startup: titanet_compare baseline ONNX 백그라운드 로드 예외")
+                _logger.exception(
+                    "startup: titanet_compare baseline ONNX 백그라운드 로드 예외"
+                )
 
         asyncio.create_task(_load_compare_baseline_background())
 
     if settings.call_debug_routes_enabled:
-        from app.services.speaker_verify.titanet_compare import _resolve_compare_csv_path
+        from app.services.speaker_verify.titanet_compare import (
+            _resolve_compare_csv_path,
+        )
 
         _logger.info(
             "startup: CALL_DEBUG_ROUTES_ENABLED — 통화 후 결과: 브라우저 "
@@ -202,7 +211,9 @@ async def lifespan(app: FastAPI):
     if settings.reset_voiceprint_on_startup:
         from app.services.speaker_verify import enrollment as voice_enrollment_reset
         from app.services.speaker_verify.onnx_pipeline import clear_all_onnx_voiceprints
-        from app.services.speaker_verify.titanet_compare import clear_all_compare_voiceprints
+        from app.services.speaker_verify.titanet_compare import (
+            clear_all_compare_voiceprints,
+        )
 
         clear_all_onnx_voiceprints()
         clear_all_compare_voiceprints()
@@ -219,7 +230,9 @@ async def lifespan(app: FastAPI):
         try:
             ex.shutdown(wait=True)
         except Exception:
-            _logger.exception("startup: compare baseline ONNX 전용 executor shutdown 실패")
+            _logger.exception(
+                "startup: compare baseline ONNX 전용 executor shutdown 실패"
+            )
         _NEMO_COMPARE_BASELINE_EXECUTOR = None
 
 
@@ -239,7 +252,6 @@ app.include_router(tenant.router, prefix="/tenant", tags=["tenant"])
 app.include_router(dashboard.router, prefix="/dashboard", tags=["dashboard"])
 app.include_router(auth.router, prefix="/auth", tags=["auth"])
 app.include_router(oauth_router, prefix="/api/v1/oauth", tags=["oauth"])
-app.include_router(voiceprint.router, prefix="/api/v1/voiceprint", tags=["voiceprint"])
 
 
 @app.get("/health")

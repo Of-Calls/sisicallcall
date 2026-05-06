@@ -219,6 +219,13 @@ class Settings(BaseSettings):
     auth_enable_test_register: bool = False
     auth_web_base_url: str = "http://localhost:3000"
 
+    # Vision (정수기 모델 분류 — TorchScript 단일 파일)
+    # metadata JSON 안에 input_size, normalize_mean/std, classes 정의.
+    # device="auto" 시 cuda 가능하면 cuda, 아니면 cpu 자동 선택.
+    vision_model_path: str = "models/water_purifier_convnextv2_femto_scripted.pt"
+    vision_metadata_path: str = "models/water_purifier_convnextv2_femto_metadata.json"
+    vision_device: str = "auto"
+
     # extra="ignore" — .env 에 코드에서 제거된 잔여 키(예: 과거 GOOGLE_APPLICATION_CREDENTIALS)
     # 가 있어도 ValidationError 로 죽지 않게. 신규 키는 위 클래스 필드로 명시 정의 필요.
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}

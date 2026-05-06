@@ -16,6 +16,7 @@ _CHROMA_QUERY_PATH = "/api/v1/collections/{collection_id}/query"
 class ChromaRAGService(BaseRAGService):
     def __init__(self):
         import chromadb
+
         self._client = chromadb.HttpClient(
             host=settings.chroma_host, port=settings.chroma_port
         )
@@ -70,20 +71,33 @@ class ChromaRAGService(BaseRAGService):
         return await loop.run_in_executor(None, _query)
 
     async def search_with_meta(
-        self, query_embedding: list[float], tenant_id: str, top_k: int = 3
+        self,
+        query_embedding: list[float],
+        tenant_id: str,
+        top_k: int = 3,
+        where: dict | None = None,
     ) -> list[dict]:
-        """벡터 검색 + id/distance/metadata 동봉 반환 — 진단/로깅용."""
+        """벡터 검색 + id/distance/metadata 동봉 반환 — 진단/로깅용.
+
+        where: ChromaDB metadata 필터. 예) {"doc_type": "model_spec", "model_id": "B1"}.
+        None 이면 필터 없이 컬렉션 전체에서 top_k 검색.
+        """
         import asyncio
 
         loop = asyncio.get_event_loop()
 
         def _query():
-            result = self._query_http_no_where(
-                tenant_id,
-                query_embedding,
-                top_k,
-                include=["documents", "metadatas", "distances"],
+            col = self._client.get_or_create_collection(
+                self._collection_name(tenant_id)
             )
+            kwargs = {
+                "query_embeddings": [query_embedding],
+                "n_results": top_k,
+                "include": ["documents", "metadatas", "distances"],
+            }
+            if where:
+                kwargs["where"] = where
+            result = col.query(**kwargs)
             docs_outer = result.get("documents") or []
             if not docs_outer:
                 return []
@@ -93,12 +107,14 @@ class ChromaRAGService(BaseRAGService):
             dists = (result.get("distances") or [[]])[0]
             out: list[dict] = []
             for i, doc in enumerate(docs):
-                out.append({
-                    "id": ids[i] if i < len(ids) else "",
-                    "document": doc,
-                    "distance": dists[i] if i < len(dists) else None,
-                    "metadata": metas[i] if i < len(metas) else {},
-                })
+                out.append(
+                    {
+                        "id": ids[i] if i < len(ids) else "",
+                        "document": doc,
+                        "distance": dists[i] if i < len(dists) else None,
+                        "metadata": metas[i] if i < len(metas) else {},
+                    }
+                )
             return out
 
         return await loop.run_in_executor(None, _query)
@@ -117,7 +133,9 @@ class ChromaRAGService(BaseRAGService):
         loop = asyncio.get_event_loop()
 
         def _upsert():
-            col = self._client.get_or_create_collection(self._collection_name(tenant_id))
+            col = self._client.get_or_create_collection(
+                self._collection_name(tenant_id)
+            )
             col.upsert(
                 ids=[doc_id],
                 embeddings=[embedding],
@@ -135,7 +153,9 @@ class ChromaRAGService(BaseRAGService):
         loop = asyncio.get_event_loop()
 
         def _delete():
-            col = self._client.get_or_create_collection(self._collection_name(tenant_id))
+            col = self._client.get_or_create_collection(
+                self._collection_name(tenant_id)
+            )
             col.delete(ids=[doc_id])
 
         await loop.run_in_executor(None, _delete)
@@ -148,8 +168,12 @@ class ChromaRAGService(BaseRAGService):
         loop = asyncio.get_event_loop()
 
         def _delete():
-            col = self._client.get_or_create_collection(self._collection_name(tenant_id))
+            col = self._client.get_or_create_collection(
+                self._collection_name(tenant_id)
+            )
             col.delete(where={"document_id": {"$eq": document_id}})
 
         await loop.run_in_executor(None, _delete)
-        logger.info("chroma delete_by_document document_id=%s tenant=%s", document_id, tenant_id)
+        logger.info(
+            "chroma delete_by_document document_id=%s tenant=%s", document_id, tenant_id
+        )

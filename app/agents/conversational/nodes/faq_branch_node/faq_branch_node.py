@@ -11,10 +11,14 @@ _TOP_K = 3
 # 분포: 매우 관련 0.6~0.8, 약 관련 0.8~1.0, 무관 1.0+ (max √2 ≈ 1.41).
 # 0.85 — 한밭식당 검증 결과 정확히 매칭되는 청크는 0.6~0.85 범위에 분포.
 _DIST_THRESHOLD = 0.85
+# vision 게이트는 모델 식별 필요 신호만 잡으면 됨 — 일반 humanize 보다 느슨한 기준.
+# 0.95 — model_spec 청크가 top_k 안에 들어왔다는 사실 자체가 강한 신호.
+_VISION_GATE_THRESHOLD = 0.95
 
 _POLITE_AUTH = "본인 인증이 필요한 정보예요. 인증 진행해드릴까요?"
 _POLITE_VISION = "확인하시려는 게 어떤 건지 사진으로 봐야 정확히 안내드릴 수 있어요. 사진 보내주실 수 있을까요?"
 _POLITE_NO_RESULT = "제가 잘 모르는 부분이에요. 상담원 연결해드릴까요?"
+_POLITE_DECLINE_FALLBACK = "알겠습니다. 그러면 다른 무엇을 도와드릴까요?"
 
 _FAQ_SYSTEM_PROMPT = """당신은 매장 전화 상담 AI 입니다. 사용자의 질문에 RAG 검색 결과를 바탕으로 친절하게 답변하세요.
 
@@ -28,7 +32,14 @@ _FAQ_SYSTEM_PROMPT = """당신은 매장 전화 상담 AI 입니다. 사용자�
 
 async def faq_branch_node(state: CallState) -> dict:
     query = state.get("rewritten_query") or state["user_text"]
+    user_text = state.get("user_text") or ""  # is_vision 게이트의 model_id substring 매칭용
     tenant_id = state["tenant_id"]
+
+    # 거절 패턴 — RAG 없이 generic 안내. query_refine 이 일관되게
+    # "사용자가 ... 거절함" 으로 재작성하므로 string 매칭으로 충분.
+    if "거절함" in query:
+        print("[faq_branch] 거절 패턴 감지 → polite decline")
+        return {"response_text": _POLITE_DECLINE_FALLBACK}
 
     # 1. 임베딩
     embedder = get_embedder()
@@ -58,13 +69,46 @@ async def faq_branch_node(state: CallState) -> dict:
         print("[faq_branch] is_auth=True 청크 발견 (threshold 이내) → polite auth")
         return {"response_text": _POLITE_AUTH}
 
-    if any((r.get("metadata") or {}).get("is_vision", False) for r in related):
-        print("[faq_branch] is_vision=True 청크 발견 (threshold 이내) → polite vision")
-        return {"response_text": _POLITE_VISION}
+    # is_vision 게이트 — 별도 threshold (0.95) 로 results 전체 검사.
+    # 모델 식별 필요 query 는 일반 humanize 보다 느슨하게 잡아야 함 (모델 사양 청크가
+    # top_k 안에 들어왔다는 것 자체가 강한 신호).
+    # 매칭 검사는 user_text (raw) + rewritten_query (history 기반 추론) 둘 다.
+    rewritten = state.get("rewritten_query") or ""
+    vision_chunks = [
+        r for r in results
+        if r.get("distance") is not None
+        and r["distance"] <= _VISION_GATE_THRESHOLD
+        and (r.get("metadata") or {}).get("is_vision", False)
+    ]
+    if vision_chunks:
+        candidate_ids = {
+            (r.get("metadata") or {}).get("model_id", "")
+            for r in vision_chunks
+        }
+        candidate_ids = {mid for mid in candidate_ids if mid}
+        search_text = f"{user_text} {rewritten}".upper()
+        matched = any(
+            mid and mid.upper() in search_text for mid in candidate_ids
+        )
+        if not matched:
+            print(
+                f"[faq_branch] is_vision 청크 발견 (threshold {_VISION_GATE_THRESHOLD}) "
+                f"candidates={candidate_ids} 매칭 X → polite vision"
+            )
+            return {"response_text": _POLITE_VISION}
+        print(
+            f"[faq_branch] is_vision 청크 발견 candidates={candidate_ids} "
+            f"발화/재작성에 모델 명시 → 게이트 우회"
+        )
 
-    # 4. 게이트 통과 → LLM 응답 (컨텍스트는 results 전체)
+    # threshold 통과 청크가 없으면 LLM 환각 차단 — 즉시 NO_RESULT.
+    if not related:
+        print("[faq_branch] threshold 통과 청크 없음 → polite no_result")
+        return {"response_text": _POLITE_NO_RESULT}
+
+    # 4. 게이트 통과 → LLM 응답 (컨텍스트는 threshold 통과 청크만)
     context = "\n\n".join(
-        f"[청크 {i+1}]\n{r.get('document', '')}" for i, r in enumerate(results)
+        f"[청크 {i+1}]\n{r.get('document', '')}" for i, r in enumerate(related)
     )
     user_message = f"[검색 결과]\n{context}\n\n[사용자 질문]\n{query}"
 

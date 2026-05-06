@@ -50,3 +50,71 @@ class RedisSessionService:
     async def clear(self, call_id: str) -> None:
         """통화 종료 시 세션 삭제."""
         await self._client.delete(self._key(call_id))
+
+    async def set_auth_id(self, call_id: str, auth_id: str) -> None:
+        """auth_branch 가 SMS 발송 후 통화 세션에 auth_id 기록 — 재진입 시 폴링용."""
+        view = await self.load(call_id)
+        view["auth_id"] = auth_id
+        await self._client.set(
+            self._key(call_id),
+            json.dumps(view, ensure_ascii=False),
+            ex=_TTL_SECONDS,
+        )
+
+    async def get_auth_id(self, call_id: str) -> str | None:
+        view = await self.load(call_id)
+        return view.get("auth_id")
+
+    async def set_pending_task(self, call_id: str, task: dict) -> None:
+        """task_branch 가 polite_auth 응답 직전 호출 — auth verified 후 자동 재실행용.
+
+        task 구조: {"tool": str, "action_type": str, "arguments": dict, "user_text": str}.
+        """
+        view = await self.load(call_id)
+        view["pending_task"] = task
+        await self._client.set(
+            self._key(call_id),
+            json.dumps(view, ensure_ascii=False),
+            ex=_TTL_SECONDS,
+        )
+
+    async def get_pending_task(self, call_id: str) -> dict | None:
+        view = await self.load(call_id)
+        return view.get("pending_task")
+
+    async def clear_pending_task(self, call_id: str) -> None:
+        view = await self.load(call_id)
+        if "pending_task" not in view:
+            return
+        del view["pending_task"]
+        await self._client.set(
+            self._key(call_id),
+            json.dumps(view, ensure_ascii=False),
+            ex=_TTL_SECONDS,
+        )
+
+    async def set_vision_id(self, call_id: str, vision_id: str) -> None:
+        """vision_branch 가 SMS 발송 후 통화 세션에 vision_id 기록 — 재진입 시 폴링용."""
+        view = await self.load(call_id)
+        view["vision_id"] = vision_id
+        await self._client.set(
+            self._key(call_id),
+            json.dumps(view, ensure_ascii=False),
+            ex=_TTL_SECONDS,
+        )
+
+    async def get_vision_id(self, call_id: str) -> str | None:
+        view = await self.load(call_id)
+        return view.get("vision_id")
+
+    async def clear_vision_id(self, call_id: str) -> None:
+        """vision 결과 처리 후 정리 — 새 vision 사이클을 위해 호출."""
+        view = await self.load(call_id)
+        if "vision_id" not in view:
+            return
+        del view["vision_id"]
+        await self._client.set(
+            self._key(call_id),
+            json.dumps(view, ensure_ascii=False),
+            ex=_TTL_SECONDS,
+        )

@@ -4,6 +4,8 @@ from typing import TypedDict
 class CallState(TypedDict):
     call_id: str
     tenant_id: str
+    tenant_name: str       # tenants.name (예: "한밭식당") / 미등록 시 "고객센터"
+    tenant_industry: str   # tenants.industry (예: "restaurant") / 미등록 시 "unknown"
     user_text: str
     intent: str          # "faq" | "task" | "auth" | "vision" | "escalation"
     response_text: str
