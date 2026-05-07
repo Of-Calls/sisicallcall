@@ -43,6 +43,7 @@ class AuthStatusResponse(BaseModel):
     auth_id: str
     status: str
     liveness_passed: bool
+    ocr_passed: bool
     face_verified: bool
     created_at: Optional[str] = None
 

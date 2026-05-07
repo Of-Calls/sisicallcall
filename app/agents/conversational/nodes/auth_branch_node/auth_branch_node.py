@@ -23,6 +23,13 @@ _POLITE_SMS_SENT = (
     "링크를 열어 인증을 완료해주세요."
 )
 _POLITE_IN_PROGRESS = "본인 인증을 진행 중이에요. 휴대폰에서 인증을 완료해주세요."
+_POLITE_OCR_PENDING = (
+    "문자로 받은 링크에서 신분증 촬영·인식을 먼저 완료해주세요. "
+    "완료 후 얼굴 인증 단계로 넘어갑니다."
+)
+_POLITE_FACE_PENDING = (
+    "신분증 인식이 완료됐어요. 같은 화면에서 정면 얼굴 촬영으로 본인 인증을 마쳐주세요."
+)
 _POLITE_VERIFIED = "인증이 완료됐어요. 어떤 도움이 필요하신가요?"
 _POLITE_BLOCKED = "인증이 여러 번 실패해 차단됐어요. 상담원으로 연결해드릴게요."
 _POLITE_TOOL_FAILED = "처리 중 문제가 생겼어요. 잠시 후 다시 시도해주시거나 매장으로 문의해주세요."
@@ -119,7 +126,13 @@ async def auth_branch_node(state: CallState) -> dict:
             return await _create_new_auth(call_id, tenant_id, customer_phone)
 
         status = auth_session.get("status", "")
-        print(f"[auth_branch] 기존 auth_id={existing_auth_id} status={status}")
+        liveness_ok = auth_session.get("liveness_passed") == "true"
+        ocr_ok = auth_session.get("ocr_passed") == "true"
+        face_ok = auth_session.get("face_verified") == "true"
+        print(
+            f"[auth_branch] 기존 auth_id={existing_auth_id} status={status} "
+            f"liveness={liveness_ok} ocr={ocr_ok} face={face_ok}"
+        )
 
         if status == "verified":
             pending = await _call_session_svc.get_pending_task(call_id)
@@ -129,7 +142,10 @@ async def auth_branch_node(state: CallState) -> dict:
             return {"response_text": _POLITE_VERIFIED}
         if status == "blocked":
             return {"response_text": _POLITE_BLOCKED}
-        # pending / liveness_pending / liveness_passed / 그 외 → 진행 중 안내
+        if liveness_ok and not ocr_ok:
+            return {"response_text": _POLITE_OCR_PENDING}
+        if liveness_ok and ocr_ok and not face_ok:
+            return {"response_text": _POLITE_FACE_PENDING}
         return {"response_text": _POLITE_IN_PROGRESS}
 
     # ② 신규 진입 — D-A 와 동일

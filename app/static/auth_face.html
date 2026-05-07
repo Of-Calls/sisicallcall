@@ -137,12 +137,9 @@ async function completeLiveness() {
       document.getElementById('step1').className = 'step done';
       document.getElementById('b1').textContent = '완료';
       document.getElementById('b1').className = 'badge ok';
-      document.getElementById('step2').style.display = 'block';
-      document.getElementById('step2').className = 'step active';
-      document.getElementById('b2').textContent = '진행 중';
-      await startCamera();
+      document.getElementById('step2').style.display = 'none';
       await startOcrCamera();
-      setStatus('카메라가 열렸습니다. 정면을 바라보세요.');
+      setStatus('후면 카메라로 신분증을 촬영해주세요. 완료 후 얼굴 인증 단계로 넘어갑니다.');
     } else {
       setStatus('Liveness 실패. 다시 시도하세요.');
       document.getElementById('btn-done-liveness').disabled = false;
@@ -183,6 +180,16 @@ async function startOcrCamera() {
 
 function setOcrMsg(msg) {
   document.getElementById('ocr-quality-msg').textContent = msg;
+}
+
+function stopOcrCamera() {
+  if (_ocrTimer) clearInterval(_ocrTimer);
+  _ocrTimer = null;
+  _ocrChecking = false;
+  if (_ocrStream) {
+    _ocrStream.getTracks().forEach(function (t) { t.stop(); });
+    _ocrStream = null;
+  }
 }
 
 function calcBlurMetric(gray, w, h) {
@@ -272,6 +279,10 @@ function runOcrQualityCheck() {
 
 async function captureOcrAndSend() {
   if (_ocrCaptured) return;
+  if (!authId) {
+    setOcrMsg('세션 ID가 없습니다. 문자 링크로 다시 열어주세요.');
+    return;
+  }
   const video = document.getElementById('ocr-video');
   if (!video.videoWidth || !video.videoHeight) {
     setOcrMsg('카메라 준비가 아직 안 됐어요');
@@ -292,7 +303,7 @@ async function captureOcrAndSend() {
     const form = new FormData();
     form.append('file', blob, 'id_card.jpg');
     try {
-      const r = await fetch('/ocr', { method: 'POST', body: form });
+      const r = await fetch('/auth/' + authId + '/ocr', { method: 'POST', body: form });
       const data = await r.json();
       document.getElementById('ocr-result').textContent = JSON.stringify(data, null, 2);
       if (data.status === 'success') {
@@ -300,6 +311,12 @@ async function captureOcrAndSend() {
         document.getElementById('step-ocr').className = 'step done';
         document.getElementById('b-ocr').textContent = '완료';
         document.getElementById('b-ocr').className = 'badge ok';
+        stopOcrCamera();
+        document.getElementById('step2').style.display = 'block';
+        document.getElementById('step2').className = 'step active';
+        document.getElementById('b2').textContent = '진행 중';
+        await startCamera();
+        setStatus('정면 카메라가 열렸습니다. 얼굴 인증을 진행해주세요.');
       } else {
         setOcrMsg(data.reason ? ('재시도 필요: ' + data.reason) : '재시도 필요');
         _ocrCaptured = false;

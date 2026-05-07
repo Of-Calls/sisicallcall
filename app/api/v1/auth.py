@@ -17,6 +17,7 @@ from app.schemas.auth import (
 from app.services.auth.arcface import ArcFaceAuthService
 from app.services.auth.liveness import LivenessService
 from app.services.auth.session import AuthSessionService
+from app.services.ocr.id_card_ocr_service import get_id_card_ocr_service
 from app.services.sms import get_sms_service
 from app.utils.config import settings
 from app.utils.logger import get_logger
@@ -33,6 +34,7 @@ _session_svc = AuthSessionService()
 _liveness_svc = LivenessService()
 _auth_svc = ArcFaceAuthService()
 _sms_svc = get_sms_service()
+_id_card_ocr = get_id_card_ocr_service()
 
 
 @router.post("/verify", response_model=AuthInitiateResponse)
@@ -91,6 +93,24 @@ async def complete_liveness(auth_id: str, body: LivenessCompleteRequest):
     return LivenessCompleteResponse(auth_id=auth_id, liveness_passed=True)
 
 
+@router.post("/{auth_id}/ocr")
+async def ocr_id_card(auth_id: str, file: UploadFile = File(...)):
+    """Liveness 완료 후 신분증 이미지 OCR — 성공 시 세션에 ocr_passed 반영."""
+    session = await _session_svc.get_session(auth_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="인증 세션이 없거나 만료됨")
+    if session.get("liveness_passed") != "true":
+        raise HTTPException(status_code=409, detail="Liveness 인증을 먼저 완료해주세요")
+    if session.get("ocr_passed") == "true":
+        raise HTTPException(status_code=409, detail="이미 신분증 OCR이 완료되었습니다")
+
+    image_bytes = await file.read()
+    result = await _id_card_ocr.process_image(image_bytes)
+    if result.get("status") == "success":
+        await _session_svc.set_ocr_passed(auth_id)
+    return result
+
+
 @router.post("/{auth_id}/face", response_model=FaceVerifyResponse)
 async def verify_face(auth_id: str, file: UploadFile = File(...)):
     """얼굴 이미지 인증 — ArcFace cosine similarity.
@@ -103,6 +123,8 @@ async def verify_face(auth_id: str, file: UploadFile = File(...)):
         raise HTTPException(status_code=404, detail="인증 세션이 없거나 만료됨")
     if session.get("liveness_passed") != "true":
         raise HTTPException(status_code=409, detail="Liveness 미완료 — 먼저 Liveness 인증을 완료하세요")
+    if session.get("ocr_passed") != "true":
+        raise HTTPException(status_code=409, detail="신분증 OCR을 먼저 완료해주세요")
     if session.get("status") == "blocked":
         raise HTTPException(status_code=403, detail="인증 차단됨 — 상담원 연결로 전환됩니다")
     if session.get("face_verified") == "true":
@@ -151,6 +173,7 @@ async def get_auth_status(auth_id: str):
         auth_id=auth_id,
         status=session.get("status", "unknown"),
         liveness_passed=session.get("liveness_passed") == "true",
+        ocr_passed=session.get("ocr_passed") == "true",
         face_verified=session.get("face_verified") == "true",
         created_at=session.get("created_at"),
     )

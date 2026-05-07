@@ -37,6 +37,7 @@ class AuthSessionService:
             "call_id": call_id,
             "status": "pending",
             "liveness_passed": "false",
+            "ocr_passed": "false",
             "face_verified": "false",
             "face_attempts": "0",
             "created_at": now,
@@ -56,6 +57,12 @@ class AuthSessionService:
         await self._redis.hset(_key(auth_id), mapping={
             "liveness_passed": "true",
             "status": "liveness_passed",
+        })
+
+    async def set_ocr_passed(self, auth_id: str) -> None:
+        await self._redis.hset(_key(auth_id), mapping={
+            "ocr_passed": "true",
+            "status": "ocr_passed",
         })
 
     async def increment_face_attempts(self, auth_id: str) -> int:
