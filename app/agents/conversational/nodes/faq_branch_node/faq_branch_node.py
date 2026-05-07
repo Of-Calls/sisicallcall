@@ -3,15 +3,15 @@ from app.services.cache import get_cache
 from app.services.embedding import get_embedder
 from app.services.llm.gpt4o_mini import GPT4OMiniService
 from app.services.rag.chroma import ChromaRAGService
-from app.services.retrieval import HybridRetriever
+from app.services.retrieval import get_hybrid_retriever
 from app.utils.config import settings
 
 _llm = GPT4OMiniService()
 _rag = ChromaRAGService()
 _cache = get_cache()
-# HybridRetriever lazy singleton — 첫 검색에서 BM25 인덱스 build 후 재사용.
+# module-level singleton — main.py 의 prewarm 결과 (BM25 캐시) 와 동일 인스턴스 공유.
 # embedder 는 외부 (faq_branch) 에서 주입 — 여기서는 search_with_embedding 만 사용.
-_hybrid = HybridRetriever(rag=_rag)
+_hybrid = get_hybrid_retriever(rag=_rag)
 
 _TOP_K = 5  # Hybrid: dense+bm25 결합이라 single mode 보다 약간 넓게 후보 받음
 # Dense distance pass — ChromaDB default L2 (정규화 벡터, 작을수록 유사).
@@ -27,15 +27,15 @@ _POLITE_DECLINE_FALLBACK = "알겠습니다. 그러면 다른 무엇을 도와�
 
 _FAQ_SYSTEM_PROMPT = """당신은 매장 전화 상담 AI 입니다. 사용자의 질문에 RAG 검색 결과를 바탕으로 친절하게 답변하세요.
 
-[지침]
-- 검색 결과 컨텍스트에 있는 사실만 사용. 없는 정보는 추측하지 마세요.
-- 한국어 한두 문장으로 자연스럽게 답변. 너무 길면 안 됨 (음성 안내).
+[지침 — 음성 안내라 짧고 핵심만이 핵심]
+- 두 문장 이내, 150자 이내로 답변. 사용자 발화 시간 + 답변 시간을 고려해 짧을수록 좋아요.
+- 사용자가 명시적으로 묻지 않은 항목은 생략. (예: "단품 메뉴 뭐 있어요" → 카테고리 1~2개와 가격대만 — 모든 메뉴 나열 금지)
+- 항목 나열은 핵심 3개 이내. 더 자세한 정보는 "자세한 건 매장 메뉴판으로 안내드려요" 처럼 짧게 마무리.
+- 검색 결과 컨텍스트에 있는 사실만 사용. 없는 정보는 추측 금지.
 - "검색 결과", "문서에 따르면" 같은 메타 표현 금지. 매장 직원처럼 답하세요.
 - 컨텍스트에 답이 없으면: 정확히 "NO_RESULT" 만 출력 (다른 텍스트/구두점 추가 금지). 코드가 감지해 폴백 메시지로 대체함.
 - 출력은 답변 텍스트만. 따옴표/머릿말 금지.
-- 시간은 "11시 30분" 형식으로. ":" 콜론, "~" 물결 등 기호 사용 금지.
-- 시간 범위는 "11시 30분부터 22시까지" 형식. "~", "-" 사용 금지.
-- 영업시간 같은 다항목 정보는 사용자가 명시적으로 묻지 않은 항목 (예: 휴무일) 은 생략."""
+- 시간은 "11시 30분" 형식. 시간 범위는 "11시 30분부터 22시까지". ":" / "~" / "-" 사용 금지."""
 
 
 def _preview(text: str, limit: int = 120) -> str:
@@ -150,7 +150,7 @@ async def faq_branch_node(state: CallState) -> dict:
             system_prompt=_FAQ_SYSTEM_PROMPT,
             user_message=user_message,
             temperature=0.2,
-            max_tokens=200,
+            max_tokens=150,  # prompt 의 "150자 이내" 와 일치 (한국어 ~1.5자/token, 약간 여유)
         )
         text = text.strip().strip('"').strip("'")
         # NO_RESULT 신호 (또는 빈값) → cache 저장 안 함 + 폴백 메시지로 대체.

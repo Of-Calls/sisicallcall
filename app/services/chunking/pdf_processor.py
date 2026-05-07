@@ -3,7 +3,7 @@
 청킹 전략:
     1. opendataloader-pdf JSON 변환 (heading level / table row-cell / list item 구조 보존)
     2. heading 단위 section 분할 + table 단독 청크 (가운데 split 절대 X)
-    3. section 본문 polish (BGE-M3 임베딩 친화 자연어화, 숫자 보존)
+    3. section 본문 polish (한국어 자연어화 → 임베딩 친화, 숫자 보존)
     4. table 본문 LLM 자연어화 (모든 셀 정보 보존, 친근체)
     5. chunk 별 LLM 메타 (title/summary/keywords/topic)
     6. tenant 가용 카테고리 5~7개 정제 → Redis
@@ -359,7 +359,7 @@ _CHUNK_POLISH_SYSTEM_PROMPT = """당신은 RAG 임베딩용 청크 정제기입�
 입력: PDF 추출 텍스트 청크 N 개 (헤더/리스트/줄바꿈 raw 포함).
 출력: JSON 배열, 원소 N 개 — 각 원소는 정제된 자연어 본문 (string, plain Korean).
 
-목적: BGE-M3 임베딩이 짧은 음성 질문 (예: "메뉴가 뭐가 있어요", "주차 가능?") 와 매칭
+목적: 임베딩이 짧은 음성 질문 (예: "메뉴가 뭐가 있어요", "주차 가능?") 와 매칭
 정확도를 높이도록 chunk 본문을 자연어 형태로 다듬는 것.
 
 정제 규칙:
@@ -383,7 +383,7 @@ _CHUNK_POLISH_SYSTEM_PROMPT = """당신은 RAG 임베딩용 청크 정제기입�
 async def _polish_chunks_for_embedding(
     chunks: list[str], llm: BaseLLMService
 ) -> list[str]:
-    """chunks 를 BGE-M3 임베딩 친화 자연어로 정제. 실패 batch 는 원본 fallback."""
+    """chunks 를 임베딩 친화 자연어로 정제. 실패 batch 는 원본 fallback."""
     POLISH_BATCH = 5
     results: list[str] = []
     for start in range(0, len(chunks), POLISH_BATCH):

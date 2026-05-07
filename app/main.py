@@ -27,6 +27,8 @@ from app.core.config import APP_DESCRIPTION, APP_TITLE, APP_VERSION
 from app.core.middleware import RequestLoggingMiddleware
 from app.api.v1 import auth, call, post_call, summary, tenant, dashboard, vision
 from app.api.v1.oauth import router as oauth_router
+from app.services.embedding import get_embedder
+from app.utils.config import settings
 from app.utils.logger import get_logger
 
 _logger = get_logger(__name__)
@@ -102,15 +104,30 @@ async def _background_warm_finetuned_onnx() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    _logger.info("startup: loading BGE-M3 embedding model...")
+    _logger.info(
+        "startup: loading embedding model (provider=%s)...", settings.embedding_provider
+    )
     get_embedder()
     _logger.info("startup: embedding model ready")
 
-    _logger.info("startup: warming up speaker verify (ONNX)...")
+    _logger.info("startup: warming up speaker verify (TitaNet-L ONNX)...")
     from app.services.speaker_verify import get_speaker_verify_service
 
     await get_speaker_verify_service().warmup()
     _logger.info("startup: speaker verify ready")
+
+    _logger.info("startup: warming up BM25 indices for active tenants...")
+    from app.services.retrieval import prewarm_all_tenants
+
+    await prewarm_all_tenants()
+    _logger.info("startup: BM25 ready")
+
+    _logger.info("startup: prewarming TTS filler audios...")
+    from app.services.tts.azure import AzureTTSService
+    from app.services.tts.filler import prewarm_fillers
+
+    await prewarm_fillers(AzureTTSService())
+    _logger.info("startup: filler ready")
 
     yield
 

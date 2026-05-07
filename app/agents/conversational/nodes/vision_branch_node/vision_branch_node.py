@@ -16,7 +16,7 @@ _call_session_svc = RedisSessionService()
 _sms_svc = get_sms_service()
 
 _TOP_K = 3
-# faq_branch 와 동일 — BGE-M3 normalized L2 distance.
+# faq_branch 와 동일 — ChromaDB default L2 distance (정규화 임베딩, 작을수록 유사).
 _DIST_THRESHOLD = 0.85
 
 _POLITE_NO_PHONE = "사진 안내를 위한 정보가 부족해요. 매장으로 직접 문의해주세요."
