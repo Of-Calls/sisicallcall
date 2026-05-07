@@ -19,6 +19,7 @@ from app.services.speaker_verify import get_speaker_verify_service
 from app.services.stt.deepgram import DeepgramSTTService
 from app.services.tenant import DEFAULT_INDUSTRY, DEFAULT_NAME, get_greeting, get_tenant_meta, resolve_tenant_id
 from app.services.tts.azure import AzureTTSService
+from app.services.tts.filler import pick_filler
 from app.services.vad.silero_vad import SileroVADService
 from app.utils.config import settings
 
@@ -98,6 +99,45 @@ async def _send_audio_to_twilio(websocket: WebSocket, stream_sid: str, audio: by
             "media": {"payload": base64.b64encode(chunk).decode()},
         }
         await websocket.send_text(json.dumps(msg))
+
+
+async def _run_conversational_graph(
+    transcript: str,
+    tenant_id: str,
+    tenant_name: str,
+    tenant_industry: str,
+    call_id: str,
+) -> tuple[str, str | None, bool]:
+    """graph 호출 + session 저장. (response_text, intent, should_hangup) 반환.
+
+    barge-in (Stage 3) 도입 시 호출 측에서 task.cancel() 가능하도록 별도 함수로 분리.
+    """
+    session_view = await _session.load(call_id)
+    graph_state = {
+        "call_id": call_id,
+        "tenant_id": tenant_id,
+        "tenant_name": tenant_name,
+        "tenant_industry": tenant_industry,
+        "user_text": transcript,
+        "intent": "",
+        "response_text": "",
+        "session_view": session_view,
+        "rewritten_query": "",
+        "is_clear": False,
+        "missing_info": "",
+        "is_goodbye": False,
+        "should_hangup": False,
+    }
+    t_graph = time.perf_counter()
+    result = await _graph.ainvoke(graph_state)
+    graph_ms = (time.perf_counter() - t_graph) * 1000
+    graph_resp = result.get("response_text", "")
+    graph_intent = result.get("intent") or None
+    should_hangup = bool(result.get("should_hangup", False))
+    print(f"[GRAPH] intent={graph_intent} resp='{graph_resp[:60]}' hangup={should_hangup} ({graph_ms:.0f}ms)")
+    if graph_resp:
+        await _session.append_turn(call_id, transcript, graph_resp)
+    return graph_resp, graph_intent, should_hangup
 
 
 @router.websocket("/ws")
@@ -275,38 +315,38 @@ async def call_ws(websocket: WebSocket):
                             utterance_pcm.clear()
 
                             if transcript and stream_sid:
-                                # Stage 4a — graph 호출 분기 (실패 시 echo 회귀)
-                                response_text = transcript  # 기본 echo
+                                # Latency 옵션 A — graph background + filler 즉시 송출 병렬.
+                                # barge-in (Stage 3) 도입 시 graph_task.cancel() 한 줄 추가하면 됨.
+                                graph_task: asyncio.Task | None = None
+                                if _GRAPH_ENABLED and tenant_id:
+                                    graph_task = asyncio.create_task(
+                                        _run_conversational_graph(
+                                            transcript, tenant_id, tenant_name, tenant_industry, stream_sid,
+                                        )
+                                    )
+
+                                # filler 즉시 송출 — graph 진행 중 사용자 무음 갭 채움.
+                                # cache 비어있으면 (startup 합성 실패) skip — 기존 흐름 그대로.
+                                filler = pick_filler()
+                                if filler:
+                                    is_speaking = True
+                                    try:
+                                        await _send_audio_to_twilio(websocket, stream_sid, filler)
+                                        filler_play = len(filler) / 8000
+                                        await asyncio.sleep(filler_play)
+                                        print(f"[FILLER] 재생 끝 ({filler_play:.2f}s)")
+                                    except Exception as exc:
+                                        print(f"[FILLER] 송출 실패 (continue): {exc}")
+
+                                # graph 결과 await — 실패/empty 시 echo fallback
+                                response_text = transcript
                                 graph_intent: str | None = None
                                 should_hangup = False
-                                if _GRAPH_ENABLED and tenant_id:
+                                if graph_task is not None:
                                     try:
-                                        session_view = await _session.load(stream_sid)
-                                        graph_state = {
-                                            "call_id": stream_sid,
-                                            "tenant_id": tenant_id,
-                                            "tenant_name": tenant_name,
-                                            "tenant_industry": tenant_industry,
-                                            "user_text": transcript,
-                                            "intent": "",
-                                            "response_text": "",
-                                            "session_view": session_view,
-                                            "rewritten_query": "",
-                                            "is_clear": False,
-                                            "missing_info": "",
-                                            "is_goodbye": False,
-                                            "should_hangup": False,
-                                        }
-                                        t_graph = time.perf_counter()
-                                        result = await _graph.ainvoke(graph_state)
-                                        graph_ms = (time.perf_counter() - t_graph) * 1000
-                                        graph_resp = result.get("response_text", "")
-                                        graph_intent = result.get("intent") or None
-                                        should_hangup = bool(result.get("should_hangup", False))
-                                        print(f"[GRAPH] intent={graph_intent} resp='{graph_resp[:60]}' hangup={should_hangup} ({graph_ms:.0f}ms)")
+                                        graph_resp, graph_intent, should_hangup = await graph_task
                                         if graph_resp:
                                             response_text = graph_resp
-                                            await _session.append_turn(stream_sid, transcript, graph_resp)
                                         else:
                                             print("[GRAPH] empty response — echo fallback")
                                     except Exception as e:
@@ -348,7 +388,9 @@ async def call_ws(websocket: WebSocket):
                                         tts_audio = b""
 
                                 if not tts_audio:
-                                    # silent skip — 다음 turn 으로
+                                    # silent skip — filler 가 송출됐다면 is_speaking 풀어줘야
+                                    # 다음 사용자 발화가 차단되지 않음.
+                                    is_speaking = False
                                     continue
 
                                 is_speaking = True

@@ -1,3 +1,5 @@
+import time
+
 from langgraph.graph import StateGraph, END
 
 from app.agents.conversational.state import CallState
@@ -23,19 +25,30 @@ def _route_by_intent(state: CallState) -> str:
     return state["intent"]
 
 
+def _timed(name: str, node):
+    """노드 wrapper — D 단계 (병렬화 진단) 용 노드별 latency 측정."""
+    async def wrapper(state):
+        t = time.perf_counter()
+        result = await node(state)
+        ms = (time.perf_counter() - t) * 1000
+        print(f"[NODE] {name} {ms:.0f}ms")
+        return result
+    return wrapper
+
+
 def build_graph():
     g = StateGraph(CallState)
 
-    g.add_node("query_refine", query_refine_node)
-    g.add_node("intent_router", intent_router_llm_node)
-    g.add_node("faq", faq_branch_node)
-    g.add_node("task", task_branch_node)
-    g.add_node("auth", auth_branch_node)
-    g.add_node("vision", vision_branch_node)
-    g.add_node("escalation", escalation_branch_node)
-    g.add_node("clarify", clarify_branch_node)
-    g.add_node("repeat", repeat_branch_node)
-    g.add_node("goodbye", goodbye_branch_node)
+    g.add_node("query_refine", _timed("query_refine", query_refine_node))
+    g.add_node("intent_router", _timed("intent_router", intent_router_llm_node))
+    g.add_node("faq", _timed("faq", faq_branch_node))
+    g.add_node("task", _timed("task", task_branch_node))
+    g.add_node("auth", _timed("auth", auth_branch_node))
+    g.add_node("vision", _timed("vision", vision_branch_node))
+    g.add_node("escalation", _timed("escalation", escalation_branch_node))
+    g.add_node("clarify", _timed("clarify", clarify_branch_node))
+    g.add_node("repeat", _timed("repeat", repeat_branch_node))
+    g.add_node("goodbye", _timed("goodbye", goodbye_branch_node))
 
     g.set_entry_point("query_refine")
 

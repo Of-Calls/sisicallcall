@@ -55,7 +55,7 @@ class Settings(BaseSettings):
     # threshold/enrollment_sec 는 ONNX 도착 후 실통화로 튜닝 (보통 cosine 0.4~0.6).
     speaker_verify_enabled: bool = False
     speaker_verify_model_path: str = "models/speech_verification/titanet_large.onnx"
-    speaker_verify_threshold: float = 0.5
+    speaker_verify_threshold: float = 0.4
     speaker_verify_enrollment_sec: float = 3.0
     # TitaNet 짧은 발화 한계 — 2.0초 미만 발화는 임베딩 신뢰성 낮아 본인 reject 위험.
     # 미만은 verify 스킵하고 통과 (짧은 응답 보호 + 시연 안정성 우선).
