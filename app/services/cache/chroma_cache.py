@@ -10,11 +10,13 @@ from app.utils.logger import get_logger
 # RAG 컬렉션 (_docs) 와 분리 — 테넌트 격리 + 검색 영역 분리.
 
 logger = get_logger(__name__)
+_CHROMA_QUERY_PATH = "/api/v1/collections/{collection_id}/query"
 
 
 class ChromaCacheService(BaseCacheService):
     def __init__(self):
         import chromadb
+
         self._client = chromadb.HttpClient(
             host=settings.chroma_host, port=settings.chroma_port
         )
@@ -22,17 +24,46 @@ class ChromaCacheService(BaseCacheService):
     def _collection_name(self, tenant_id: str) -> str:
         return f"tenant_{tenant_id.replace('-', '')}_cache"
 
+    def _query_http_no_where_document(
+        self,
+        tenant_id: str,
+        query_embedding: list[float],
+        n_results: int,
+        where: dict | None = None,
+    ) -> dict:
+        """col.query 대신 where_document 키를 생략한 REST 호출."""
+        import httpx
+
+        col = self._client.get_or_create_collection(self._collection_name(tenant_id))
+        collection_id = str(col.id)
+        url = (
+            f"http://{settings.chroma_host}:{settings.chroma_port}"
+            f"{_CHROMA_QUERY_PATH.format(collection_id=collection_id)}"
+        )
+        body: dict = {
+            "query_embeddings": [query_embedding],
+            "n_results": n_results,
+            "include": ["metadatas", "distances"],
+        }
+        if where is not None:
+            body["where"] = where
+        with httpx.Client(timeout=120.0) as http:
+            resp = http.post(url, json=body)
+            resp.raise_for_status()
+            return resp.json()
+
     async def lookup(
         self, tenant_id: str, query_embedding: list[float]
     ) -> CacheHit | None:
         loop = asyncio.get_event_loop()
 
         def _query():
-            col = self._client.get_or_create_collection(self._collection_name(tenant_id))
-            result = col.query(
-                query_embeddings=[query_embedding],
+            now = time.time()
+            result = self._query_http_no_where_document(
+                tenant_id=tenant_id,
+                query_embedding=query_embedding,
                 n_results=1,
-                include=["metadatas", "distances"],
+                where={"expires_at": {"$gt": now}},
             )
             dists = (result.get("distances") or [[]])[0]
             metas = (result.get("metadatas") or [[]])[0]
@@ -42,7 +73,6 @@ class ChromaCacheService(BaseCacheService):
             if distance > settings.cache_distance_threshold:
                 return None
             meta = metas[0] or {}
-            now = time.time()
             if meta.get("expires_at", 0) <= now:
                 return None
             return CacheHit(
@@ -66,17 +96,21 @@ class ChromaCacheService(BaseCacheService):
         entry_id = str(uuid.uuid4())
 
         def _save():
-            col = self._client.get_or_create_collection(self._collection_name(tenant_id))
+            col = self._client.get_or_create_collection(
+                self._collection_name(tenant_id)
+            )
             col.add(
                 ids=[entry_id],
                 embeddings=[query_embedding],
                 documents=[query_text],
-                metadatas=[{
-                    "query_text": query_text,
-                    "response_text": response_text,
-                    "created_at": now,
-                    "expires_at": expires_at,
-                }],
+                metadatas=[
+                    {
+                        "query_text": query_text,
+                        "response_text": response_text,
+                        "created_at": now,
+                        "expires_at": expires_at,
+                    }
+                ],
             )
 
         await loop.run_in_executor(None, _save)

@@ -8,6 +8,7 @@
     5. chunk 별 LLM 메타 (title/summary/keywords/topic)
     6. tenant 가용 카테고리 5~7개 정제 → Redis
 """
+
 import asyncio
 import json
 import re
@@ -33,8 +34,8 @@ logger = get_logger(__name__)
 MIN_CHUNK_CHARS = 200
 MAX_CHUNK_CHARS = 800
 
-_JSON_ARRAY_RE = re.compile(r'\[.*\]', re.DOTALL)
-_NUMBER_RE = re.compile(r'\d+')
+_JSON_ARRAY_RE = re.compile(r"\[.*\]", re.DOTALL)
+_NUMBER_RE = re.compile(r"\d+")
 
 # polish 결과 silent 압축/숫자 누락 방어 — 위반 시 원본 chunk fallback.
 _MIN_POLISH_RATIO = 0.7
@@ -42,9 +43,11 @@ _MIN_POLISH_RATIO = 0.7
 
 # ── PDF → JSON 변환 ──────────────────────────────────────────────
 
+
 def _extract_json(pdf_path: str) -> dict:
     """opendataloader-pdf 로 PDF → JSON tree."""
     from opendataloader_pdf import convert
+
     with tempfile.TemporaryDirectory(prefix="odl_") as tmp:
         convert(
             input_path=pdf_path,
@@ -61,12 +64,14 @@ def _extract_json(pdf_path: str) -> dict:
     data = json.loads(raw)
     logger.info(
         "pdf parsed by opendataloader pages=%d path=%s",
-        data.get("number of pages", 0), pdf_path,
+        data.get("number of pages", 0),
+        pdf_path,
     )
     return data
 
 
 # ── JSON tree → flat element ──────────────────────────────────────
+
 
 @dataclass
 class FlatElement:
@@ -113,20 +118,30 @@ def _flatten_json(data: dict) -> list[FlatElement]:
             text = (kid.get("content") or "").strip()
             if not text:
                 continue
-            out.append(FlatElement(
-                type="heading",
-                heading_level=kid.get("heading level"),
-                page=page, bbox=bbox, text=text, raw=kid,
-            ))
+            out.append(
+                FlatElement(
+                    type="heading",
+                    heading_level=kid.get("heading level"),
+                    page=page,
+                    bbox=bbox,
+                    text=text,
+                    raw=kid,
+                )
+            )
         elif kt == "paragraph":
             text = (kid.get("content") or "").strip()
             if not text:
                 continue
-            out.append(FlatElement(
-                type="paragraph",
-                heading_level=None,
-                page=page, bbox=bbox, text=text, raw=kid,
-            ))
+            out.append(
+                FlatElement(
+                    type="paragraph",
+                    heading_level=None,
+                    page=page,
+                    bbox=bbox,
+                    text=text,
+                    raw=kid,
+                )
+            )
         elif kt == "list":
             items = kid.get("list items") or []
             item_texts: list[str] = []
@@ -138,36 +153,47 @@ def _flatten_json(data: dict) -> list[FlatElement]:
                     item_texts.append("- " + content)
             if not item_texts:
                 continue
-            out.append(FlatElement(
-                type="list",
-                heading_level=None,
-                page=page, bbox=bbox,
-                text="\n".join(item_texts), raw=kid,
-            ))
+            out.append(
+                FlatElement(
+                    type="list",
+                    heading_level=None,
+                    page=page,
+                    bbox=bbox,
+                    text="\n".join(item_texts),
+                    raw=kid,
+                )
+            )
         elif kt == "table":
             text_dump = _table_text_dump(kid)
             if not text_dump.strip():
                 continue
-            out.append(FlatElement(
-                type="table",
-                heading_level=None,
-                page=page, bbox=bbox,
-                text=text_dump, raw=kid,
-            ))
+            out.append(
+                FlatElement(
+                    type="table",
+                    heading_level=None,
+                    page=page,
+                    bbox=bbox,
+                    text=text_dump,
+                    raw=kid,
+                )
+            )
     return out
 
 
 # ── flat list → Chunk 그룹화 ──────────────────────────────────────
 
+
 @dataclass
 class Chunk:
-    heading: str            # 직전 가까운 heading content (없으면 빈)
-    chunk_type: str         # section / table
-    text: str               # 청크 본문 (그룹화 시점은 raw, polish 후 자연어로 교체)
-    page: int               # 시작 페이지
+    heading: str  # 직전 가까운 heading content (없으면 빈)
+    chunk_type: str  # section / table
+    text: str  # 청크 본문 (그룹화 시점은 raw, polish 후 자연어로 교체)
+    page: int  # 시작 페이지
     bbox: Optional[list[float]]
     raw_table: Optional[dict] = None  # table 청크만 — 자연어화 LLM 입력용
-    heading_path: list[str] = field(default_factory=list)  # L2 이상 hierarchy (L1 은 거의 모든 청크 공통이라 제외)
+    heading_path: list[str] = field(
+        default_factory=list
+    )  # L2 이상 hierarchy (L1 은 거의 모든 청크 공통이라 제외)
 
 
 def _group_into_chunks(elements: list[FlatElement]) -> list[Chunk]:
@@ -180,7 +206,9 @@ def _group_into_chunks(elements: list[FlatElement]) -> list[Chunk]:
       - chunk 마다 현재 heading hierarchy snapshot — L1 제외 L2 이상만 path 로
     """
     chunks: list[Chunk] = []
-    heading_stack: list[tuple[int, str]] = []  # (level, text), L1 부터 가장 깊은 level 까지
+    heading_stack: list[tuple[int, str]] = (
+        []
+    )  # (level, text), L1 부터 가장 깊은 level 까지
     current_section: list[FlatElement] = []
 
     def current_heading() -> str:
@@ -197,15 +225,17 @@ def _group_into_chunks(elements: list[FlatElement]) -> list[Chunk]:
         if not text:
             current_section = []
             return
-        chunks.append(Chunk(
-            heading=current_heading(),
-            heading_path=current_path(),
-            chunk_type="section",
-            text=text,
-            page=current_section[0].page,
-            bbox=current_section[0].bbox,
-            raw_table=None,
-        ))
+        chunks.append(
+            Chunk(
+                heading=current_heading(),
+                heading_path=current_path(),
+                chunk_type="section",
+                text=text,
+                page=current_section[0].page,
+                bbox=current_section[0].bbox,
+                raw_table=None,
+            )
+        )
         current_section = []
 
     for elem in elements:
@@ -217,15 +247,17 @@ def _group_into_chunks(elements: list[FlatElement]) -> list[Chunk]:
             heading_stack.append((level, elem.text))
         elif elem.type == "table":
             flush_section()
-            chunks.append(Chunk(
-                heading=current_heading(),
-                heading_path=current_path(),
-                chunk_type="table",
-                text=elem.text,
-                page=elem.page,
-                bbox=elem.bbox,
-                raw_table=elem.raw,
-            ))
+            chunks.append(
+                Chunk(
+                    heading=current_heading(),
+                    heading_path=current_path(),
+                    chunk_type="table",
+                    text=elem.text,
+                    page=elem.page,
+                    bbox=elem.bbox,
+                    raw_table=elem.raw,
+                )
+            )
         elif elem.type in ("paragraph", "list"):
             current_section.append(elem)
             running = sum(len(e.text) for e in current_section)
@@ -310,6 +342,7 @@ async def _naturalize_table(heading: str, raw_dump: str, llm: BaseLLMService) ->
 
 # ── section polish (samsong 시드도 import 해 사용) ───────────────────
 
+
 def _validate_polish(orig: str, polished: str) -> tuple[bool, str]:
     """polish 결과가 원본 정보를 보존했는지 검증. (ok, reason)."""
     if len(polished) < len(orig) * _MIN_POLISH_RATIO:
@@ -366,7 +399,8 @@ async def _polish_chunks_for_embedding(
         except Exception as e:
             logger.error(
                 "chunk polish LLM call failed batch=%d: %s",
-                start // POLISH_BATCH, e,
+                start // POLISH_BATCH,
+                e,
             )
             results.extend(batch)
             continue
@@ -375,7 +409,8 @@ async def _polish_chunks_for_embedding(
         if not match:
             logger.warning(
                 "chunk polish JSON not found batch=%d raw=%r",
-                start // POLISH_BATCH, (raw or "")[:200],
+                start // POLISH_BATCH,
+                (raw or "")[:200],
             )
             results.extend(batch)
             continue
@@ -384,7 +419,8 @@ async def _polish_chunks_for_embedding(
         except Exception as e:
             logger.error(
                 "chunk polish JSON parse failed batch=%d: %s",
-                start // POLISH_BATCH, e,
+                start // POLISH_BATCH,
+                e,
             )
             results.extend(batch)
             continue
@@ -400,7 +436,9 @@ async def _polish_chunks_for_embedding(
                 if not ok:
                     logger.warning(
                         "polish suspicious batch=%d j=%d %s — fallback",
-                        start // POLISH_BATCH, j, reason,
+                        start // POLISH_BATCH,
+                        j,
+                        reason,
                     )
                     polished = ""
             normalized.append(polished or batch[j])
@@ -459,9 +497,7 @@ _CHUNK_ENRICH_SYSTEM_PROMPT = """당신은 PDF 청크의 메타데이터 추출�
 - 출력은 JSON 배열만, 다른 설명 절대 금지."""
 
 
-async def _enrich_chunks_with_llm(
-    chunks: list[str], llm: BaseLLMService
-) -> list[dict]:
+async def _enrich_chunks_with_llm(chunks: list[str], llm: BaseLLMService) -> list[dict]:
     """chunks → metadata list. 실패 batch 는 default 메타로 채움."""
     results: list[dict] = []
     for start in range(0, len(chunks), _CHUNK_ENRICH_BATCH):
@@ -477,7 +513,8 @@ async def _enrich_chunks_with_llm(
         except Exception as e:
             logger.error(
                 "chunk enrich LLM call failed batch=%d: %s",
-                start // _CHUNK_ENRICH_BATCH, e,
+                start // _CHUNK_ENRICH_BATCH,
+                e,
             )
             results.extend([_default_chunk_meta()] * len(batch))
             continue
@@ -498,12 +535,16 @@ async def _enrich_chunks_with_llm(
         normalized: list[dict] = []
         for item in parsed[: len(batch)]:
             if isinstance(item, dict):
-                normalized.append({
-                    "title": str(item.get("title", ""))[:100],
-                    "summary": str(item.get("summary", ""))[:300],
-                    "keywords": [str(k) for k in (item.get("keywords") or []) if k][:5],
-                    "topic": str(item.get("topic", "기타"))[:50],
-                })
+                normalized.append(
+                    {
+                        "title": str(item.get("title", ""))[:100],
+                        "summary": str(item.get("summary", ""))[:300],
+                        "keywords": [str(k) for k in (item.get("keywords") or []) if k][
+                            :5
+                        ],
+                        "topic": str(item.get("topic", "기타"))[:50],
+                    }
+                )
             else:
                 normalized.append(_default_chunk_meta())
         while len(normalized) < len(batch):
@@ -555,6 +596,7 @@ async def _refine_categories(topics: list[str], llm: BaseLLMService) -> list[str
 
 # ── PDFProcessor ─────────────────────────────────────────────────
 
+
 class PDFProcessor:
     def __init__(
         self,
@@ -585,7 +627,8 @@ class PDFProcessor:
         if existing:
             logger.info(
                 "duplicate detected, replacing doc_id=%s file=%s",
-                existing["id"], file_name,
+                existing["id"],
+                file_name,
             )
             await self._rag.delete_by_document(str(existing["id"]), tenant_id)
             await self._delete_rag_document(existing["id"])
@@ -622,7 +665,9 @@ class PDFProcessor:
             ]
             if table_indices:
                 tasks = [
-                    _naturalize_table(chunks_obj[i].heading, chunks_obj[i].text, self._llm)
+                    _naturalize_table(
+                        chunks_obj[i].heading, chunks_obj[i].text, self._llm
+                    )
                     for i in table_indices
                 ]
                 naturalized = await asyncio.gather(*tasks)
@@ -647,7 +692,11 @@ class PDFProcessor:
             # 3. 임베딩 (passage 측 — heading_path prepend 으로 큰 청크의 sub-topic 매칭 보강)
             #    chunk.text 자체는 보존 (humanize 단계에 원본 전달). 임베딩에만 path 포함.
             embed_texts = [
-                f"[{' > '.join(c.heading_path)}]\n\n{c.text}" if c.heading_path else c.text
+                (
+                    f"[{' > '.join(c.heading_path)}]\n\n{c.text}"
+                    if c.heading_path
+                    else c.text
+                )
                 for c in chunks_obj
             ]
             embeddings = await self._embedder.embed_passages(embed_texts)
@@ -656,7 +705,8 @@ class PDFProcessor:
             llm_metas = await _enrich_chunks_with_llm(final_texts, self._llm)
             logger.info(
                 "llm enrich done doc_id=%s metas=%d",
-                document_id, len(llm_metas),
+                document_id,
+                len(llm_metas),
             )
 
             # 5. ChromaDB upsert
@@ -701,20 +751,27 @@ class PDFProcessor:
             refined_categories = await _refine_categories(topics, self._llm)
             if refined_categories:
                 try:
-                    await self._session.set_rag_categories(tenant_id, refined_categories)
+                    await self._session.set_rag_categories(
+                        tenant_id, refined_categories
+                    )
                     logger.info(
                         "rag_categories refined tenant=%s categories=%s",
-                        tenant_id, refined_categories,
+                        tenant_id,
+                        refined_categories,
                     )
                 except Exception as e:
                     logger.warning(
-                        "rag_categories save failed (인덱싱은 성공): %s", e,
+                        "rag_categories save failed (인덱싱은 성공): %s",
+                        e,
                     )
 
-            await self._update_rag_document(document_id, len(chunks_obj), collection_name)
+            await self._update_rag_document(
+                document_id, len(chunks_obj), collection_name
+            )
             logger.info(
                 "pdf_processor done doc_id=%s chunks=%d",
-                document_id, len(chunks_obj),
+                document_id,
+                len(chunks_obj),
             )
 
         except Exception as e:
@@ -739,7 +796,8 @@ class PDFProcessor:
                 VALUES ($1::uuid, $2, 'pdf', 'processing')
                 RETURNING id
                 """,
-                tenant_id, file_name,
+                tenant_id,
+                file_name,
             )
             return row["id"]
         finally:
@@ -759,7 +817,9 @@ class PDFProcessor:
                     indexed_at = now()
                 WHERE id = $1
                 """,
-                document_id, chunk_count, collection_name,
+                document_id,
+                chunk_count,
+                collection_name,
             )
         finally:
             await conn.close()
@@ -785,7 +845,8 @@ class PDFProcessor:
                 WHERE tenant_id = $1::uuid AND file_name = $2 AND status != 'failed'
                 ORDER BY uploaded_at DESC LIMIT 1
                 """,
-                tenant_id, file_name,
+                tenant_id,
+                file_name,
             )
             return dict(row) if row else None
         finally:
@@ -795,7 +856,8 @@ class PDFProcessor:
         conn = await asyncpg.connect(settings.database_url)
         try:
             await conn.execute(
-                "DELETE FROM rag_documents WHERE id = $1", document_id,
+                "DELETE FROM rag_documents WHERE id = $1",
+                document_id,
             )
         finally:
             await conn.close()

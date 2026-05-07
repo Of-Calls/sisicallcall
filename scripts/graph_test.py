@@ -33,7 +33,8 @@ async def main():
     call_id = str(uuid.uuid4())
     # b4961018-e1dc-49d1-a851-800908bd4b6b: 서울중앙병원
     # 1484849a-549b-4b21-9cdb-77040afc2c2f: 한밭식당
-    tenant_id = "b4961018-e1dc-49d1-a851-800908bd4b6b"
+    # 8699eb2a-e1cb-477a-a1e2-108c830e0c43: 금융기관
+    tenant_id = "8699eb2a-e1cb-477a-a1e2-108c830e0c43"
     tenant_name, tenant_industry = await get_tenant_meta(tenant_id)
 
     print(

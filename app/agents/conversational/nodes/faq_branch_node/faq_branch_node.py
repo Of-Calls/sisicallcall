@@ -38,6 +38,13 @@ _FAQ_SYSTEM_PROMPT = """당신은 매장 전화 상담 AI 입니다. 사용자�
 - 영업시간 같은 다항목 정보는 사용자가 명시적으로 묻지 않은 항목 (예: 휴무일) 은 생략."""
 
 
+def _preview(text: str, limit: int = 120) -> str:
+    compact = " ".join((text or "").split())
+    if len(compact) <= limit:
+        return compact
+    return compact[:limit] + "..."
+
+
 async def faq_branch_node(state: CallState) -> dict:
     query = state.get("rewritten_query") or state["user_text"]
     user_text = state.get("user_text") or ""  # is_vision 게이트의 model_id substring 매칭용
@@ -70,11 +77,13 @@ async def faq_branch_node(state: CallState) -> dict:
         dist = r.get("distance")
         bm25 = r.get("bm25_score") or 0
         dist_str = f"{dist:.3f}" if dist is not None else "-"
+        text_preview = _preview(r.get("document", ""))
         print(
-            f"  [{i+1}] dense={dist_str} bm25={bm25:.2f} "
+            f"  K={i+1}: dense={dist_str} bm25={bm25:.2f} "
             f"title='{meta.get('llm_title', '')}' "
             f"is_auth={meta.get('is_auth', False)} is_vision={meta.get('is_vision', False)}"
         )
+        print(f"      text='{text_preview}'")
 
     if not results:
         return {"response_text": _POLITE_NO_RESULT}

@@ -53,6 +53,8 @@ async def query_refine_node(state: CallState) -> dict:
         rewritten = user_text
 
     print(f"[query_refine] is_clear={is_clear} rewritten='{rewritten}' missing='{missing}' goodbye={is_goodbye}")
+    if not is_clear and not is_goodbye:
+        print("[query_refine] route=clarify (FAQ 검색 스킵)")
     return {
         "rewritten_query": rewritten,
         "is_clear": is_clear,
