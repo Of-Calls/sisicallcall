@@ -35,11 +35,34 @@ from __future__ import annotations
 
 import os
 from abc import ABC, abstractmethod
-from datetime import datetime
+from datetime import datetime, timezone
 
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+
+def _as_utc_aware(dt: datetime | None) -> datetime | None:
+    """datetime 을 UTC aware 로 정규화한다.
+
+    - None → None
+    - naive (tzinfo 없음) → UTC 로 간주하여 ``replace(tzinfo=UTC)``
+    - aware → ``astimezone(UTC)``
+
+    asyncpg 가 TIMESTAMPTZ 를 aware 로 돌려주는 반면 (구버전) ``datetime.utcnow()``
+    나 file mode 직렬화는 naive 라서, 두 형태를 그대로 비교하면
+    ``can't compare offset-naive and offset-aware datetimes`` 가 난다.
+    """
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _utc_now() -> datetime:
+    """현재 시각의 UTC aware datetime."""
+    return datetime.now(timezone.utc)
 
 
 # Connector 의 ``_oauth_provider_name`` 과 tenant_integrations.provider 가
@@ -96,6 +119,19 @@ class BaseMCPConnector(ABC):
 
     # ── tenant OAuth 헬퍼 ─────────────────────────────────────────────────────
 
+    @staticmethod
+    def _is_token_expired(integration) -> bool:
+        """integration.expires_at < now (UTC) 를 timezone-safe 하게 판정.
+
+        DB(asyncpg)는 TIMESTAMPTZ 를 aware datetime 으로 돌려주고, file/legacy
+        경로는 naive 일 수 있다. 어떤 형태든 UTC aware 로 정규화 후 비교한다.
+        ``expires_at`` 이 None 이면 만료되지 않은 것으로 본다 (정책 보존).
+        """
+        expires_at = _as_utc_aware(getattr(integration, "expires_at", None))
+        if expires_at is None:
+            return False
+        return expires_at < _utc_now()
+
     def _resolve_tenant_integration(self, tenant_id: str):
         """
         ``_oauth_provider_name`` + alias 후보를 순서대로 DB / file / memory 에서
@@ -149,8 +185,8 @@ class BaseMCPConnector(ABC):
         if integration is None or integration.status == IntegrationStatus.disconnected:
             return self._skipped("tenant_integration_not_connected")
 
-        # 만료 체크
-        if integration.expires_at and integration.expires_at < datetime.utcnow():
+        # 만료 체크 (timezone-safe)
+        if self._is_token_expired(integration):
             if integration.refresh_token_encrypted:
                 refreshed = await self._refresh_tenant_token(integration)
                 if refreshed:
@@ -201,7 +237,7 @@ class BaseMCPConnector(ABC):
             from datetime import timedelta
             expires_at = None
             if token_result.expires_in:
-                expires_at = datetime.utcnow() + timedelta(seconds=token_result.expires_in)
+                expires_at = _utc_now() + timedelta(seconds=token_result.expires_in)
 
             update_tokens(
                 integration.tenant_id, provider,

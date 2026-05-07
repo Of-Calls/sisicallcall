@@ -29,7 +29,6 @@ from __future__ import annotations
 import base64
 import email.message
 import os
-from datetime import datetime
 
 from app.services.mcp.connectors.base import BaseMCPConnector
 from app.utils.logger import get_logger
@@ -89,8 +88,8 @@ class GmailConnector(BaseMCPConnector):
         if integration is None or integration.status == IntegrationStatus.disconnected:
             return self._skipped("tenant_integration_not_connected")
 
-        # 만료 체크
-        if integration.expires_at and integration.expires_at < datetime.utcnow():
+        # 만료 체크 (timezone-safe — DB asyncpg 는 aware, file legacy 는 naive)
+        if self._is_token_expired(integration):
             if integration.refresh_token_encrypted:
                 refreshed = await self._refresh_tenant_token(integration)
                 if refreshed:
