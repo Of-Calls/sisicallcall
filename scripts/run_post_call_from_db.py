@@ -16,12 +16,16 @@ import asyncio
 import copy
 import os
 import sys
+from pathlib import Path
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(_PROJECT_ROOT))
 
 from dotenv import load_dotenv  # noqa: E402
 
-load_dotenv(override=False)
+# 프로젝트 루트의 .env 명시적 로드. override=False — OS env / secret manager 우선.
+# .env 가 없어도 죽지 않는다.
+load_dotenv(_PROJECT_ROOT / ".env", override=False)
 
 from app.agents.post_call import completed_call_runner as runner_mod  # noqa: E402
 from app.agents.post_call.llm_caller import (  # noqa: E402

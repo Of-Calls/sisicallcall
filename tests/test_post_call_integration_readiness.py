@@ -30,8 +30,15 @@ class TestNormalizeProviderStatus:
         assert result["status"] == "internal"
         assert result["ready"] is True
 
-    def test_env_configured_provider(self):
+    def test_env_configured_provider(self, monkeypatch):
         from scripts.check_post_call_integrations import normalize_provider_status
+
+        # SMS provider 단계 readiness 는 Solapi 서버 공통 env 의 함수다.
+        # 테스트는 .env 오염을 받지 않게 명시적으로 env 를 채운다.
+        monkeypatch.setenv("SOLAPI_API_KEY", "key-x")
+        monkeypatch.setenv("SOLAPI_API_SECRET", "secret-x")
+        monkeypatch.setenv("SOLAPI_FROM", "01000000000")
+        monkeypatch.delenv("SMS_TEST_TO", raising=False)
 
         result = normalize_provider_status("sms", None)
         assert result["status"] == "configured"
@@ -161,12 +168,71 @@ class TestBuildActionReadiness:
     def test_sms_action_marked_with_customer_phone_caveat(self):
         from scripts.check_post_call_integrations import build_action_readiness
 
+        # Solapi env OK 이지만 SMS_TEST_TO 미설정 → customer_phone 이 들어와야
+        # 진짜 ready. action 단계에서는 caveat 라벨로 surface 한다.
         actions = build_action_readiness(
-            {"sms": {"status": "configured", "ready": True}},
+            {"sms": {
+                "status": "configured", "ready": True,
+                "sms_env": {"test_to_present": False},
+            }},
         )
         sms_action = actions["send_callback_sms"]
         assert sms_action["provider"] == "sms"
         assert sms_action["ready_label"] == "needs_customer_phone_or_sms_config"
+
+    def test_sms_action_ready_test_fallback_when_test_to_set(self):
+        """SMS_TEST_TO 가 있으면 로컬/시연용 ready_test_fallback 라벨로 ready."""
+        from scripts.check_post_call_integrations import build_action_readiness
+
+        actions = build_action_readiness(
+            {"sms": {
+                "status": "configured", "ready": True,
+                "sms_env": {"test_to_present": True},
+            }},
+        )
+        sms_action = actions["send_callback_sms"]
+        assert sms_action["ready"] is True
+        assert sms_action["ready_label"] == "ready_test_fallback"
+
+    def test_sms_action_surfaces_env_missing_reason(self):
+        """SMS env 부족 시 needs_customer_phone... 가 아니라 구체적인
+        not_ready reason 을 그대로 노출해야 한다."""
+        from scripts.check_post_call_integrations import build_action_readiness
+
+        actions = build_action_readiness({
+            "sms": {
+                "status": "missing", "ready": False,
+                "reason": "solapi_credentials_missing",
+            },
+        })
+        sms_action = actions["send_callback_sms"]
+        assert sms_action["ready"] is False
+        assert sms_action["ready_label"] == "not_ready"
+        assert sms_action["reason"] == "solapi_credentials_missing"
+
+    def test_jira_action_surfaces_provider_reason(self):
+        """Jira 의 workspace/project 부족 reason 이 action 라벨에 그대로 전달된다."""
+        from scripts.check_post_call_integrations import build_action_readiness
+
+        actions = build_action_readiness({
+            "jira": {
+                "status": "incomplete", "ready": False,
+                "reason": "jira_workspace_not_selected",
+            },
+        })
+        jira_action = actions["create_jira_issue"]
+        assert jira_action["ready"] is False
+        assert jira_action["ready_label"] == "not_ready"
+        assert jira_action["reason"] == "jira_workspace_not_selected"
+
+    def test_jira_action_ready_when_db_complete(self):
+        from scripts.check_post_call_integrations import build_action_readiness
+
+        actions = build_action_readiness({
+            "jira": {"status": "connected", "ready": True, "reason": None},
+        })
+        assert actions["create_jira_issue"]["ready"] is True
+        assert actions["create_jira_issue"]["ready_label"] == "ready"
 
 
 # ── check_tenant_readiness with in-memory repo ────────────────────────────────
@@ -506,3 +572,208 @@ class TestRealActionsGuardMessage:
         source = inspect.getsource(runner_mod)
         assert "Real actions enabled" in source
         assert "check_post_call_integrations.py" in source
+
+
+# ── SMS provider-level readiness ─────────────────────────────────────────────
+
+class TestSmsProviderStatus:
+    def _clear_sms_env(self, monkeypatch):
+        for key in (
+            "SOLAPI_API_KEY", "SOLAPI_API_SECRET",
+            "SOLAPI_FROM", "SOLAPI_SENDER_NUMBER", "SMS_TEST_TO",
+        ):
+            monkeypatch.delenv(key, raising=False)
+
+    def test_credentials_missing_reports_specific_reason(self, monkeypatch):
+        from scripts.check_post_call_integrations import _sms_provider_status
+
+        self._clear_sms_env(monkeypatch)
+        result = _sms_provider_status()
+
+        # solapi 패키지가 깔려 있다는 가정 하에 다음 단계 reason
+        # (테스트 환경에 solapi 가 설치돼 있어야 함 — requirements.txt 에 있음)
+        assert result["ready"] is False
+        assert result["reason"] in {
+            "solapi_credentials_missing",
+            "solapi_not_installed",
+        }
+
+    def test_sender_missing_reports_specific_reason(self, monkeypatch):
+        from scripts.check_post_call_integrations import _sms_provider_status
+
+        self._clear_sms_env(monkeypatch)
+        monkeypatch.setenv("SOLAPI_API_KEY", "k")
+        monkeypatch.setenv("SOLAPI_API_SECRET", "s")
+
+        result = _sms_provider_status()
+        # solapi 미설치 환경이면 미설치 reason 이 먼저 나오므로 둘 다 허용
+        assert result["ready"] is False
+        assert result["reason"] in {
+            "solapi_sender_missing",
+            "solapi_not_installed",
+        }
+
+    def test_full_env_yields_configured(self, monkeypatch):
+        from scripts.check_post_call_integrations import _sms_provider_status
+
+        self._clear_sms_env(monkeypatch)
+        monkeypatch.setenv("SOLAPI_API_KEY", "k")
+        monkeypatch.setenv("SOLAPI_API_SECRET", "s")
+        monkeypatch.setenv("SOLAPI_FROM", "01000000000")
+
+        try:
+            import solapi  # noqa: F401
+        except Exception:
+            pytest.skip("solapi package missing in test env")
+
+        result = _sms_provider_status()
+        assert result["ready"] is True
+        assert result["status"] == "configured"
+        assert result["details"]["test_to_present"] is False
+
+    def test_test_to_surfaced_in_details(self, monkeypatch):
+        from scripts.check_post_call_integrations import _sms_provider_status
+
+        self._clear_sms_env(monkeypatch)
+        monkeypatch.setenv("SOLAPI_API_KEY", "k")
+        monkeypatch.setenv("SOLAPI_API_SECRET", "s")
+        monkeypatch.setenv("SOLAPI_FROM", "01000000000")
+        monkeypatch.setenv("SMS_TEST_TO", "01099999999")
+
+        try:
+            import solapi  # noqa: F401
+        except Exception:
+            pytest.skip("solapi package missing in test env")
+
+        result = _sms_provider_status()
+        assert result["details"]["test_to_present"] is True
+
+
+# ── Jira readiness branches ──────────────────────────────────────────────────
+
+class TestJiraReadiness:
+    def _clear_jira_env(self, monkeypatch):
+        for k in (
+            "MCP_ALLOW_ENV_FALLBACK",
+            "JIRA_BASE_URL", "JIRA_EMAIL", "JIRA_API_TOKEN", "JIRA_PROJECT_KEY",
+        ):
+            monkeypatch.delenv(k, raising=False)
+
+    def test_no_db_no_env_fallback_reports_tenant_not_connected(self, monkeypatch):
+        from scripts.check_post_call_integrations import _jira_readiness
+
+        self._clear_jira_env(monkeypatch)
+        r = _jira_readiness(None)
+        assert r["ready"] is False
+        assert r["status"] == "missing"
+        assert r["reason"] == "tenant_integration_not_connected"
+
+    def test_env_fallback_with_full_env_yields_configured_env(self, monkeypatch):
+        from scripts.check_post_call_integrations import _jira_readiness
+
+        self._clear_jira_env(monkeypatch)
+        monkeypatch.setenv("MCP_ALLOW_ENV_FALLBACK", "true")
+        monkeypatch.setenv("JIRA_BASE_URL", "https://x.atlassian.net")
+        monkeypatch.setenv("JIRA_EMAIL", "u@co.com")
+        monkeypatch.setenv("JIRA_API_TOKEN", "tok")
+        monkeypatch.setenv("JIRA_PROJECT_KEY", "VOC")
+
+        r = _jira_readiness(None)
+        assert r["ready"] is True
+        assert r["status"] == "configured_env"
+        assert r["reason"] == "env_fallback"
+
+    def test_env_fallback_with_partial_env_reports_missing(self, monkeypatch):
+        from scripts.check_post_call_integrations import _jira_readiness
+
+        self._clear_jira_env(monkeypatch)
+        monkeypatch.setenv("MCP_ALLOW_ENV_FALLBACK", "true")
+        monkeypatch.setenv("JIRA_BASE_URL", "https://x.atlassian.net")
+        # 나머지 누락
+
+        r = _jira_readiness(None)
+        assert r["ready"] is False
+        assert r["reason"].startswith("jira_env_config_missing")
+        assert "JIRA_API_TOKEN" in r["reason"]
+        assert "JIRA_PROJECT_KEY" in r["reason"]
+
+    def test_db_connected_without_workspace_reports_workspace_not_selected(self, monkeypatch):
+        from scripts.check_post_call_integrations import _jira_readiness
+
+        self._clear_jira_env(monkeypatch)
+        integration = TenantIntegration(
+            tenant_id="t-jira-1", provider="jira",
+            status=IntegrationStatus.connected,
+            external_workspace_id=None,
+            metadata={"workspace_selection_required": True},
+        )
+        r = _jira_readiness(integration)
+        assert r["ready"] is False
+        assert r["status"] == "incomplete"
+        assert r["reason"] == "jira_workspace_not_selected"
+
+    def test_db_connected_without_project_key_reports_project_not_configured(self, monkeypatch):
+        from scripts.check_post_call_integrations import _jira_readiness
+
+        self._clear_jira_env(monkeypatch)  # JIRA_PROJECT_KEY env 도 비움
+        integration = TenantIntegration(
+            tenant_id="t-jira-2", provider="jira",
+            status=IntegrationStatus.connected,
+            external_workspace_id="cloud-uuid-1",
+            metadata={"cloud_id": "cloud-uuid-1"},
+        )
+        r = _jira_readiness(integration)
+        assert r["ready"] is False
+        assert r["status"] == "incomplete"
+        assert r["reason"] == "jira_project_not_configured"
+
+    def test_db_connected_with_workspace_and_project_is_ready(self, monkeypatch):
+        from scripts.check_post_call_integrations import _jira_readiness
+
+        self._clear_jira_env(monkeypatch)
+        integration = TenantIntegration(
+            tenant_id="t-jira-3", provider="jira",
+            status=IntegrationStatus.connected,
+            external_workspace_id="cloud-uuid-1",
+            metadata={"cloud_id": "cloud-uuid-1", "project_key": "VOC"},
+        )
+        r = _jira_readiness(integration)
+        assert r["ready"] is True
+        assert r["status"] == "connected"
+        assert r["reason"] is None
+
+    def test_db_connected_project_key_from_env_when_metadata_missing(self, monkeypatch):
+        """metadata.project_key 가 없어도 env JIRA_PROJECT_KEY 가 있으면 ready."""
+        from scripts.check_post_call_integrations import _jira_readiness
+
+        self._clear_jira_env(monkeypatch)
+        monkeypatch.setenv("JIRA_PROJECT_KEY", "VOC")
+        integration = TenantIntegration(
+            tenant_id="t-jira-4", provider="jira",
+            status=IntegrationStatus.connected,
+            external_workspace_id="cloud-uuid-1",
+            metadata={"cloud_id": "cloud-uuid-1"},
+        )
+        r = _jira_readiness(integration)
+        assert r["ready"] is True
+
+
+# ── Script .env loading: explicit project-root path ──────────────────────────
+
+class TestScriptEnvLoading:
+    def test_check_script_loads_root_env(self):
+        """check script 가 명시적 프로젝트 루트 .env 경로를 사용하는지 — 회귀 가드."""
+        import scripts.check_post_call_integrations as mod
+        import inspect
+
+        source = inspect.getsource(mod)
+        assert "_PROJECT_ROOT" in source
+        assert 'load_dotenv(_PROJECT_ROOT / ".env"' in source
+
+    def test_run_post_call_loads_root_env(self):
+        import scripts.run_post_call_from_db as mod
+        import inspect
+
+        source = inspect.getsource(mod)
+        assert "_PROJECT_ROOT" in source
+        assert 'load_dotenv(_PROJECT_ROOT / ".env"' in source
