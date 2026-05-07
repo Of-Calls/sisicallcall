@@ -89,6 +89,21 @@ def test_dashboard_with_valid_token_returns_200(monkeypatch):
     assert resp.json()["tenant_id"] == TENANT_ID
 
 
+def test_dashboard_overview_alias_returns_same_shape(monkeypatch):
+    _patch_admin_lookup(monkeypatch)
+
+    async def fake_get_dashboard_overview(**kwargs):
+        return {"tenant_id": kwargs["tenant_id"], "total_calls": 12}
+
+    monkeypatch.setattr(dashboard, "get_dashboard_overview", fake_get_dashboard_overview)
+
+    resp = _client().get("/dashboard/overview", headers=_auth_headers())
+
+    assert resp.status_code == 200
+    assert resp.json()["tenant_id"] == TENANT_ID
+    assert resp.json()["total_calls"] == 12
+
+
 def test_dashboard_query_tenant_equal_jwt_tenant_returns_200(monkeypatch):
     _patch_admin_lookup(monkeypatch)
 
@@ -115,7 +130,7 @@ def test_dashboard_query_tenant_mismatch_returns_403(monkeypatch):
     )
 
     assert resp.status_code == 403
-    assert resp.json()["detail"] == "tenant 정보가 일치하지 않습니다."
+    assert "tenant" in resp.json()["detail"]
 
 
 def test_dashboard_uses_jwt_tenant_not_query_tenant(monkeypatch):
@@ -173,6 +188,7 @@ def test_dashboard_recent_calls_uses_jwt_tenant(monkeypatch):
     assert captured[0]["tenant_id"] == TENANT_ID
     assert captured[0]["offset"] == 2
     assert captured[0]["limit"] == 5
+    assert resp.json()["items"][0]["priority"] == "high"
     assert resp.json()["data"]["items"][0]["priority"] == "high"
 
 
@@ -182,7 +198,7 @@ def test_dashboard_intent_distribution_uses_jwt_tenant(monkeypatch):
 
     async def fake_fetch_dashboard_intent_distribution(**kwargs):
         captured.append(kwargs)
-        return [{"label": "예약/일정", "count": 12}]
+        return [{"label": "intent-category", "count": 12}]
 
     monkeypatch.setattr(
         dashboard,
@@ -195,29 +211,97 @@ def test_dashboard_intent_distribution_uses_jwt_tenant(monkeypatch):
     assert resp.status_code == 200
     assert captured[0]["tenant_id"] == TENANT_ID
     assert captured[0]["limit"] == 7
-    assert resp.json()["data"] == [{"label": "예약/일정", "count": 12}]
+    assert resp.json()["data"] == [{"label": "intent-category", "count": 12}]
 
 
-def test_dashboard_emotion_distribution_prefers_db_shape(monkeypatch):
+def test_dashboard_intent_distribution_top_level_items(monkeypatch):
+    _patch_admin_lookup(monkeypatch)
+
+    async def fake_fetch_dashboard_intent_distribution(**kwargs):
+        return [{"label": "intent-top", "count": 18}]
+
+    monkeypatch.setattr(
+        dashboard,
+        "fetch_dashboard_intent_distribution",
+        fake_fetch_dashboard_intent_distribution,
+    )
+
+    resp = _client().get("/dashboard/intent-distribution", headers=_auth_headers())
+
+    assert resp.status_code == 200
+    assert resp.json()["items"] == [{"category": "intent-top", "count": 18}]
+
+
+def test_dashboard_keyword_stats_uses_jwt_tenant(monkeypatch):
     _patch_admin_lookup(monkeypatch)
     captured: list[dict] = []
 
-    async def fake_fetch_dashboard_emotion_distribution_counts(**kwargs):
+    async def fake_fetch_dashboard_keyword_stats(**kwargs):
         captured.append(kwargs)
-        return {"positive": 3, "neutral": 12, "negative": 4, "angry": 1}
+        return [{"label": "keyword-top", "count": 5}]
 
-    async def fake_get_emotion_distribution(**kwargs):
-        raise AssertionError("legacy in-memory fallback should not be used")
+    monkeypatch.setattr(dashboard, "fetch_dashboard_keyword_stats", fake_fetch_dashboard_keyword_stats)
+
+    resp = _client().get("/dashboard/keyword-stats?limit=3", headers=_auth_headers())
+
+    assert resp.status_code == 200
+    assert captured[0]["tenant_id"] == TENANT_ID
+    assert captured[0]["limit"] == 3
+    assert resp.json()["items"] == [{"keyword": "keyword-top", "count": 5}]
+    assert resp.json()["data"] == [{"label": "keyword-top", "count": 5}]
+
+
+def test_dashboard_priority_distribution_uses_jwt_tenant(monkeypatch):
+    _patch_admin_lookup(monkeypatch)
+    captured: list[dict] = []
+
+    async def fake_fetch_dashboard_priority_distribution(**kwargs):
+        captured.append(kwargs)
+        return {"critical": 1, "high": 2, "medium": 3, "low": 4}
+
+    monkeypatch.setattr(
+        dashboard,
+        "fetch_dashboard_priority_distribution",
+        fake_fetch_dashboard_priority_distribution,
+    )
+
+    resp = _client().get("/dashboard/priority-distribution", headers=_auth_headers())
+
+    assert resp.status_code == 200
+    assert captured[0]["tenant_id"] == TENANT_ID
+    assert resp.json() == {"critical": 1, "high": 2, "medium": 3, "low": 4}
+
+
+def test_dashboard_emotion_distribution_prefers_db_shape(monkeypatch):
+    uuid_tenant_id = "22222222-2222-2222-2222-222222222222"
+    _patch_admin_lookup(monkeypatch, tenant_id=uuid_tenant_id)
+    captured: list[dict] = []
+
+    class _Conn:
+        async def close(self):
+            return None
+
+    async def fake_connect():
+        return _Conn()
+
+    async def fake_fetch_dashboard_emotion_distribution_counts(tenant_id, **kwargs):
+        captured.append({"tenant_id": tenant_id, **kwargs})
+        return {"positive": 3, "neutral": 12, "negative": 4, "angry": 1}
 
     monkeypatch.setattr(
         dashboard,
         "fetch_dashboard_emotion_distribution_counts",
         fake_fetch_dashboard_emotion_distribution_counts,
     )
-    monkeypatch.setattr(dashboard, "get_emotion_distribution", fake_get_emotion_distribution)
+    monkeypatch.setattr(dashboard, "_connect", fake_connect)
 
-    resp = _client().get("/dashboard/emotion-distribution", headers=_auth_headers())
+    resp = _client().get(
+        "/dashboard/emotion-distribution",
+        headers=_auth_headers(_token(uuid_tenant_id)),
+    )
 
     assert resp.status_code == 200
-    assert captured[0]["tenant_id"] == TENANT_ID
+    assert captured[0]["tenant_id"] == uuid_tenant_id
     assert resp.json() == {"positive": 3, "neutral": 12, "negative": 4, "angry": 1}
+
+

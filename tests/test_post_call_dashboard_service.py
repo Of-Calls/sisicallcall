@@ -406,6 +406,101 @@ class TestDateRangePropagation:
 # ── Recent rows shape ────────────────────────────────────────────────────────
 
 
+class _BranchingRowConn(_FakeConn):
+    def __init__(self, fetchrow_handler, *, fetch_rows: list[dict] | None = None):
+        super().__init__(fetch_rows=fetch_rows or [], fetchrow_value={})
+        self._fetchrow_handler = fetchrow_handler
+
+    async def fetchrow(self, sql: str, *params):
+        self.fetchrow_calls.append((sql, params))
+        return _FakeRow(self._fetchrow_handler(sql, params))
+
+
+class TestRepositoryAggregates:
+    @pytest.mark.asyncio
+    async def test_dashboard_stats_counts_total_calls_from_calls_table(self):
+        from app.repositories import post_call_dashboard_repo as repo
+
+        def handler(sql: str, _params):
+            if "AS total_calls" in sql:
+                return {"total_calls": 50}
+            if "AS resolved_count" in sql:
+                return {"resolved_count": 20}
+            if "AS escalated_count" in sql:
+                return {"escalated_count": 5}
+            if "AS action_required_count" in sql:
+                return {"action_required_count": 7}
+            if "AS mcp_success_count" in sql:
+                return {"mcp_success_count": 11}
+            if "AS mcp_failed_count" in sql:
+                return {"mcp_failed_count": 2}
+            if "AS partial_success_count" in sql:
+                return {"partial_success_count": 3}
+            raise AssertionError(f"unexpected SQL: {sql}")
+
+        conn = _BranchingRowConn(handler)
+        result = await repo.fetch_dashboard_stats(conn, TENANT_ID)
+
+        assert result["total_calls"] == 50
+        assert result["resolved_count"] == 20
+        assert result["escalated_count"] == 5
+        assert result["agent_connected_count"] == 5
+        assert result["resolution_rate"] == 40.0
+        assert result["action_required_count"] == 7
+        assert result["mcp_success_count"] == 11
+        assert result["mcp_failed_count"] == 2
+        assert result["partial_success_count"] == 3
+
+        sqls = [sql for sql, _ in conn.fetchrow_calls]
+        assert any("FROM calls c" in sql and "AS total_calls" in sql for sql in sqls)
+        assert any("call_summaries" in sql and "resolved_count" in sql for sql in sqls)
+        assert any("voc_analyses" in sql and "action_required_count" in sql for sql in sqls)
+        assert any("mcp_action_logs" in sql and "mcp_success_count" in sql for sql in sqls)
+
+    @pytest.mark.asyncio
+    async def test_dashboard_intent_distribution_falls_back_to_summary(self):
+        from app.repositories import post_call_dashboard_repo as repo
+
+        conn = _FakeConn(fetch_rows=[{"label": "예약문의", "count": 3}])
+        result = await repo.fetch_dashboard_intent_distribution(TENANT_ID, limit=7, conn=conn)
+
+        sql, params = conn.fetch_calls[0]
+        assert "COALESCE(" in sql
+        assert "va.intent_result->>'primary_category'" in sql
+        assert "cs.customer_intent" in sql
+        assert params == (TENANT_ID, 7)
+        assert result == [{"label": "예약문의", "count": 3}]
+
+    @pytest.mark.asyncio
+    async def test_dashboard_keyword_stats_uses_jsonb_array_and_limit(self):
+        from app.repositories import post_call_dashboard_repo as repo
+
+        conn = _FakeConn(fetch_rows=[{"keyword": "예약", "count": 12}])
+        result = await repo.fetch_dashboard_keyword_stats(TENANT_ID, limit=99, conn=conn)
+
+        sql, params = conn.fetch_calls[0]
+        assert "jsonb_array_elements_text" in sql
+        assert "cs.keywords" in sql
+        assert params == (TENANT_ID, 50)
+        assert result == [{"keyword": "예약", "count": 12}]
+
+    @pytest.mark.asyncio
+    async def test_dashboard_priority_distribution_returns_all_buckets(self):
+        from app.repositories import post_call_dashboard_repo as repo
+
+        conn = _FakeConn(
+            fetch_rows=[
+                {"priority": "critical", "count": 1},
+                {"priority": "high", "count": 2},
+                {"priority": "medium", "count": 3},
+                {"priority": "low", "count": 4},
+            ]
+        )
+        result = await repo.fetch_dashboard_priority_distribution(TENANT_ID, conn=conn)
+
+        assert result == {"critical": 1, "high": 2, "medium": 3, "low": 4}
+
+
 class TestRecentRowsShape:
     @pytest.mark.asyncio
     async def test_recent_calls_row_shape(self):

@@ -172,7 +172,53 @@ def test_list_calls_with_valid_token_returns_200_and_uses_jwt_tenant(monkeypatch
     assert captured[0]["status"] == "completed"
     assert captured[0]["offset"] == 5
     assert captured[0]["limit"] == 100
+    assert resp.json()["total"] == 1
+    assert resp.json()["items"][0]["id"] == CALL_ID
     assert resp.json()["data"]["limit"] == 100
+
+
+def test_list_calls_returns_top_level_pagination_shape(monkeypatch):
+    _patch_admin_lookup(monkeypatch)
+
+    async def fake_list_calls_for_tenant(**kwargs):
+        assert kwargs["offset"] == 0
+        assert kwargs["limit"] == 10
+        return {"items": [_call_payload()], "total": 50, "offset": 0, "limit": 10}
+
+    monkeypatch.setattr(call_history, "list_calls_for_tenant", fake_list_calls_for_tenant)
+
+    resp = _client().get("/call?limit=10&offset=0", headers=_auth_headers())
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["total"] == 50
+    assert body["offset"] == 0
+    assert body["limit"] == 10
+    assert len(body["items"]) == 1
+
+
+def test_list_calls_second_page_passes_offset(monkeypatch):
+    _patch_admin_lookup(monkeypatch)
+
+    async def fake_list_calls_for_tenant(**kwargs):
+        assert kwargs["offset"] == 10
+        assert kwargs["limit"] == 10
+        return {
+            "items": [_call_payload(call_id="page-2-call")],
+            "total": 50,
+            "offset": 10,
+            "limit": 10,
+        }
+
+    monkeypatch.setattr(call_history, "list_calls_for_tenant", fake_list_calls_for_tenant)
+
+    resp = _client().get("/call?limit=10&offset=10", headers=_auth_headers())
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["offset"] == 10
+    assert body["limit"] == 10
+    assert body["items"][0]["id"] == "page-2-call"
 
 
 def test_list_calls_status_all_omits_status_filter(monkeypatch):

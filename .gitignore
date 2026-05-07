@@ -52,6 +52,7 @@ GEMINI.md
 
 # docs
 docs/
+/data
 
 # 테스트 데이터 파일
 tests/*.pdf
@@ -74,3 +75,5 @@ tmp/
 
 # models
 models/
+
+/scripts/import_sisicallcall_csv_dump.py
