@@ -13,7 +13,11 @@ class GPT4OService(BaseLLMService):
 
     def __init__(self):
         from openai import AsyncOpenAI
-        self._client = AsyncOpenAI(api_key=settings.openai_api_key)
+        from app.services.llm._http import get_openai_http_client
+        self._client = AsyncOpenAI(
+            api_key=settings.openai_api_key,
+            http_client=get_openai_http_client(),
+        )
 
     async def generate(
         self,
