@@ -45,13 +45,6 @@ async def initiate_auth(body: AuthInitiateRequest):
         customer_phone=body.customer_phone,
         call_id=body.call_id,
     )
-    face_link = face_auth_url(auth_id)
-    if settings.auth_skip_sms:
-        return AuthInitiateResponse(
-            auth_id=auth_id,
-            status="pending",
-            message=f"SMS 스킵 모드 — 얼굴 인증 링크: {face_link}",
-        )
 
     face_sent = await _sms_svc.send_sms(
         to=body.customer_phone, body=build_face_auth_sms(auth_id)

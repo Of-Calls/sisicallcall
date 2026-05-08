@@ -11,6 +11,8 @@ from typing import Any
 import cv2
 import numpy as np
 
+from app.services.ocr.base import BaseOCRService
+
 _RRN_RE = re.compile(r"\d{6}-?\d{7}")
 _NAME_RE = re.compile(r"[가-힣]{2,4}")
 _ROI_PROFILE_PATH = (
@@ -211,7 +213,11 @@ def _crop_to_text_region(preprocessed_roi: np.ndarray) -> tuple[np.ndarray, tupl
     return cropped, (x1, y1, x2, y2)
 
 
-class IdCardOCRService:
+class IdCardOCRService(BaseOCRService):
+    async def extract_text(self, image_bytes: bytes) -> str:
+        result = await self.process_image(image_bytes)
+        return str(result.get("raw_text", ""))
+
     def process_image_sync(
         self, image_bytes: bytes, roi_override: dict[str, float] | None = None
     ) -> dict[str, Any]:
@@ -232,12 +238,6 @@ class IdCardOCRService:
         _, merged_roi_raw = _preprocess(roi_img)
         merged_roi, text_bbox = _crop_to_text_region(merged_roi_raw)
         name_roi, rrn_roi = _split_name_rrn_roi(merged_roi)
-        if roi_override:
-            print(f"[OCR] roi_override={roi_override}")
-        if text_bbox:
-            print(f"[OCR] dynamic_text_bbox={text_bbox}")
-        else:
-            print("[OCR] dynamic_text_bbox=None (원본 ROI 사용)")
 
         full_text = pytesseract.image_to_string(
             merged_roi, lang="kor+eng", config="--psm 6"
@@ -279,26 +279,13 @@ class IdCardOCRService:
             output_type=pytesseract.Output.DICT,
         )
         tokens = [str(t).strip() for t in ocr_data.get("text", []) if str(t).strip()]
-        kor_tokens = [t for t in tokens if re.search(r"[가-힣]", t)]
-        num_tokens = [t for t in tokens if re.search(r"\d", t)]
-        rrn_like_tokens = [t for t in tokens if re.search(r"\d{6}-?\d{1,7}", t)]
         name = _parse_korean_name_from_tokens(tokens) or _parse_korean_name(
             name_split_text, roi_text, full_text
         )
 
-        print("[OCR] full_text:\n" + full_text)
-        print("[OCR] merged_roi_text:\n" + roi_text)
-        print("[OCR] merged_roi_rrn_text:\n" + rrn_text)
-        print("[OCR] split_name_text:\n" + name_split_text)
-        print("[OCR] split_rrn_text:\n" + rrn_split_text)
-        print(f"[OCR] tokens_all({len(tokens)}): {tokens}")
-        print(f"[OCR] tokens_kor({len(kor_tokens)}): {kor_tokens}")
-        print(f"[OCR] tokens_num({len(num_tokens)}): {num_tokens}")
-        print(f"[OCR] tokens_rrn_like({len(rrn_like_tokens)}): {rrn_like_tokens}")
         print(f"[OCR] parsed_name={name!r} parsed_rrn={rrn!r}")
 
         conf = _ocr_confidence(merged_roi)
-        print(f"[OCR] confidence={conf:.2f}")
         if not rrn:
             return {
                 "status": "retry",
@@ -314,7 +301,6 @@ class IdCardOCRService:
                 "raw_text": full_text,
             }
 
-        print(f"[OCR] CONFIRMED name={name!r} rrn={rrn!r}")
         return {
             "status": "success",
             "data": {"name": name, "rrn": rrn},
@@ -325,6 +311,8 @@ class IdCardOCRService:
         self, image_bytes: bytes, roi_override: dict[str, float] | None = None
     ) -> dict[str, Any]:
         loop = asyncio.get_running_loop()
+        if roi_override is None:
+            return await loop.run_in_executor(None, self.process_image_sync, image_bytes)
         return await loop.run_in_executor(
             None, self.process_image_sync, image_bytes, roi_override
         )

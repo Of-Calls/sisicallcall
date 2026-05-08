@@ -8,14 +8,16 @@ from app.agents.conversational.prompts.fallback_phrases import get_inquiry_phras
 from app.agents.conversational.state import CallState
 from app.agents.conversational.tool_catalog import get_available_actions
 from app.services.auth.session import AuthSessionService
+from app.services.ocr.auth_link_service import OCRAuthLinkService
 from app.services.mcp.client import mcp_client
 from app.services.session.redis_session import RedisSessionService
 from app.services.sms import get_sms_service
-from app.utils.auth_sms import build_face_auth_sms, build_ocr_auth_sms
+from app.utils.auth_sms import build_face_auth_sms
 
 _auth_session_svc = AuthSessionService()
 _call_session_svc = RedisSessionService()
 _sms_svc = get_sms_service()
+_ocr_link_svc = OCRAuthLinkService(session_service=_auth_session_svc, sms_service=_sms_svc)
 
 _POLITE_SMS_FAILED = "인증 링크 발송에 문제가 생겼어요. 잠시 후 다시 시도해주세요."
 _POLITE_SMS_SENT = (
@@ -52,7 +54,7 @@ async def _create_new_auth(call_id: str, tenant_id: str, customer_phone: str) ->
     print(f"[auth_branch] 세션 생성 auth_id={auth_id}")
 
     sent_face = await _sms_svc.send_sms(to=customer_phone, body=build_face_auth_sms(auth_id))
-    sent_ocr = await _sms_svc.send_sms(to=customer_phone, body=build_ocr_auth_sms(auth_id))
+    sent_ocr = await _ocr_link_svc.send_link(auth_id, customer_phone)
     print(f"[auth_branch] SMS 발송 face={sent_face} ocr={sent_ocr} to={customer_phone}")
 
     if not (sent_face and sent_ocr):

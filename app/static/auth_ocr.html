@@ -103,8 +103,11 @@ let _ocrStream = null;
 let _lastGuideAlignment = null;
 
 // TOLERANCE는 클수록 통과가 쉬워지고, EDGE_MIN_HIT는 작을수록 외곽선 검출이 쉬워진다.
-const GUIDE_ALIGNMENT_TOLERANCE_RATIO = 0.03; // 외곽선과 가이드 박스 간 허용 비율
-const GUIDE_EDGE_MIN_HIT_RATIO = 0.04; // 강한 엣지가 최소 몇 % 이상 있어야 하는지
+// const GUIDE_ALIGNMENT_TOLERANCE_RATIO = 0.04; // 외곽선과 가이드 박스 간 허용 비율
+// const GUIDE_EDGE_MIN_HIT_RATIO = 0.05; // 강한 엣지가 최소 몇 % 이상 있어야 하는지
+const GUIDE_ALIGNMENT_TOLERANCE_RATIO = 0.12;
+const GUIDE_EDGE_MIN_HIT_RATIO = 0.02;
+
 
 function setStatus(msg) { document.getElementById('status').textContent = msg; }
 
@@ -320,8 +323,7 @@ function runOcrQualityCheck() {
   _lastGuideAlignment = alignment;
   if (!alignment.pass) {
     _ocrReadyFrames = 0;
-    const diff = Math.round(alignment.maxDelta * 100);
-    setOcrMsg(`신분증을 네모칸에 맞춰주세요 (외곽 ${alignment.found}/4, 차이 ${diff}%)`);
+    setOcrMsg('신분증을 네모칸에 맞춰주세요');
     return;
   }
 

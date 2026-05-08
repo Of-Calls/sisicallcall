@@ -8,10 +8,8 @@ from fastapi.responses import HTMLResponse
 
 from app.schemas.auth import AuthInitiateRequest, AuthInitiateResponse, AuthStatusResponse
 from app.services.auth.session import AuthSessionService
+from app.services.ocr.auth_link_service import OCRAuthLinkService
 from app.services.ocr.id_card_ocr_service import get_id_card_ocr_service
-from app.services.sms import get_sms_service
-from app.utils.auth_sms import build_ocr_auth_sms, ocr_auth_url
-from app.utils.config import settings
 from app.utils.logger import get_logger
 
 _OCR_PAGE_HTML = (
@@ -24,34 +22,23 @@ router = APIRouter()
 
 _session_svc = AuthSessionService()
 _ocr = get_id_card_ocr_service()
-_sms_svc = get_sms_service()
+_ocr_link_svc = OCRAuthLinkService(session_service=_session_svc)
 _ROI_PROFILE_PATH = Path(__file__).resolve().parents[3] / "scripts" / "ocr_roi_profile.json"
 
 
 @router.post("/verify", response_model=AuthInitiateResponse)
 async def initiate_ocr_auth(body: AuthInitiateRequest):
     """인증 세션 생성 + 신분증 OCR 링크 SMS 발송."""
-    auth_id = await _session_svc.create_session(
+    result = await _ocr_link_svc.create_session_and_send_link(
         tenant_id=body.tenant_id,
         customer_ref=body.customer_ref,
         customer_phone=body.customer_phone,
         call_id=body.call_id,
     )
-    ocr_link = ocr_auth_url(auth_id)
-    if settings.auth_skip_sms:
-        return AuthInitiateResponse(
-            auth_id=auth_id,
-            status="pending",
-            message=f"SMS 스킵 모드 — OCR 인증 링크: {ocr_link}",
-        )
-
-    sent = await _sms_svc.send_sms(to=body.customer_phone, body=build_ocr_auth_sms(auth_id))
-    if not sent:
-        logger.error("OCR 인증 SMS 발송 실패 auth_id=%s phone=%s", auth_id, body.customer_phone)
     return AuthInitiateResponse(
-        auth_id=auth_id,
-        status="pending",
-        message="OCR 인증 SMS 발송 완료" if sent else "OCR 인증 SMS 발송 실패 — 인증 세션은 유효",
+        auth_id=result.auth_id,
+        status=result.status,
+        message=result.message,
     )
 
 
