@@ -100,6 +100,11 @@ let _ocrChecking = false;
 let _ocrCaptured = false;
 let _ocrTimer = null;
 let _ocrStream = null;
+let _lastGuideAlignment = null;
+
+// TOLERANCE는 클수록 통과가 쉬워지고, EDGE_MIN_HIT는 작을수록 외곽선 검출이 쉬워진다.
+const GUIDE_ALIGNMENT_TOLERANCE_RATIO = 0.03; // 외곽선과 가이드 박스 간 허용 비율
+const GUIDE_EDGE_MIN_HIT_RATIO = 0.04; // 강한 엣지가 최소 몇 % 이상 있어야 하는지
 
 function setStatus(msg) { document.getElementById('status').textContent = msg; }
 
@@ -161,7 +166,6 @@ function calcBlurMetric(gray, w, h) {
   for (let y = 1; y < h - 1; y += 2) {
     for (let x = 1; x < w - 1; x += 2) {
       const i = y * w + x;
-      
       const lap = Math.abs(4 * gray[i] - gray[i - 1] - gray[i + 1] - gray[i - w] - gray[i + w]);
       sum += lap; sum2 += lap * lap; n++;
     }
@@ -169,6 +173,90 @@ function calcBlurMetric(gray, w, h) {
   if (!n) return 0;
   const mean = sum / n;
   return (sum2 / n) - (mean * mean);
+}
+
+function findBestVerticalEdgeX(gray, w, h, xStart, xEnd, yStart, yEnd) {
+  const sx = Math.max(1, Math.min(w - 2, xStart));
+  const ex = Math.max(1, Math.min(w - 2, xEnd));
+  const sy = Math.max(1, Math.min(h - 2, yStart));
+  const ey = Math.max(1, Math.min(h - 2, yEnd));
+  let bestX = null, bestHits = 0, samplesPerColumn = 0;
+  for (let x = sx; x <= ex; x += 2) {
+    let hits = 0, samples = 0;
+    for (let y = sy; y <= ey; y += 2) {
+      const i = y * w + x;
+      const gx = Math.abs(gray[i] - gray[i + 1]);
+      const gy = Math.abs(gray[i] - gray[i + w]);
+      if (gx > 36 && gx + gy > 60) hits++;
+      samples++;
+    }
+    if (hits > bestHits) {
+      bestHits = hits;
+      bestX = x;
+      samplesPerColumn = samples;
+    }
+  }
+  return samplesPerColumn > 0 && bestHits / samplesPerColumn > GUIDE_EDGE_MIN_HIT_RATIO
+    ? bestX
+    : null;
+}
+
+function findBestHorizontalEdgeY(gray, w, h, xStart, xEnd, yStart, yEnd) {
+  const sx = Math.max(1, Math.min(w - 2, xStart));
+  const ex = Math.max(1, Math.min(w - 2, xEnd));
+  const sy = Math.max(1, Math.min(h - 2, yStart));
+  const ey = Math.max(1, Math.min(h - 2, yEnd));
+  let bestY = null, bestHits = 0, samplesPerRow = 0;
+  for (let y = sy; y <= ey; y += 2) {
+    let hits = 0, samples = 0;
+    for (let x = sx; x <= ex; x += 2) {
+      const i = y * w + x;
+      const gx = Math.abs(gray[i] - gray[i + 1]);
+      const gy = Math.abs(gray[i] - gray[i + w]);
+      if (gy > 36 && gx + gy > 60) hits++;
+      samples++;
+    }
+    if (hits > bestHits) {
+      bestHits = hits;
+      bestY = y;
+      samplesPerRow = samples;
+    }
+  }
+  return samplesPerRow > 0 && bestHits / samplesPerRow > GUIDE_EDGE_MIN_HIT_RATIO
+    ? bestY
+    : null;
+}
+
+function checkGuideBoxAlignment(gray, w, h, x1, y1, x2, y2) {
+  const guideW = x2 - x1;
+  const guideH = y2 - y1;
+  const tolX = Math.max(12, Math.floor(guideW * GUIDE_ALIGNMENT_TOLERANCE_RATIO));
+  const tolY = Math.max(10, Math.floor(guideH * GUIDE_ALIGNMENT_TOLERANCE_RATIO));
+  const innerX1 = x1 + Math.floor(guideW * 0.08);
+  const innerX2 = x2 - Math.floor(guideW * 0.08);
+  const innerY1 = y1 + Math.floor(guideH * 0.08);
+  const innerY2 = y2 - Math.floor(guideH * 0.08);
+  const left = findBestVerticalEdgeX(gray, w, h, x1 - tolX, x1 + tolX, innerY1, innerY2);
+  const right = findBestVerticalEdgeX(gray, w, h, x2 - tolX, x2 + tolX, innerY1, innerY2);
+  const top = findBestHorizontalEdgeY(gray, w, h, innerX1, innerX2, y1 - tolY, y1 + tolY);
+  const bottom = findBestHorizontalEdgeY(gray, w, h, innerX1, innerX2, y2 - tolY, y2 + tolY);
+  const found = [left, right, top, bottom].filter((v) => v !== null).length;
+  if (found < 4) {
+    return { pass: false, found, maxDelta: 1 };
+  }
+
+  const deltas = [
+    Math.abs(left - x1) / guideW,
+    Math.abs(right - x2) / guideW,
+    Math.abs(top - y1) / guideH,
+    Math.abs(bottom - y2) / guideH,
+  ];
+  const maxDelta = Math.max(...deltas);
+  return {
+    pass: maxDelta <= GUIDE_ALIGNMENT_TOLERANCE_RATIO,
+    found,
+    maxDelta,
+  };
 }
 
 function runOcrQualityCheck() {
@@ -227,6 +315,16 @@ function runOcrQualityCheck() {
     setOcrMsg('가이드 박스를 다시 확인해주세요');
     return;
   }
+
+  const alignment = checkGuideBoxAlignment(gray, w, h, x1, y1, x2, y2);
+  _lastGuideAlignment = alignment;
+  if (!alignment.pass) {
+    _ocrReadyFrames = 0;
+    const diff = Math.round(alignment.maxDelta * 100);
+    setOcrMsg(`신분증을 네모칸에 맞춰주세요 (외곽 ${alignment.found}/4, 차이 ${diff}%)`);
+    return;
+  }
+
   let edge = 0, total = 0;
   for (let y = y1; y < y2 - 1; y += 2) {
     for (let x = x1; x < x2 - 1; x += 2) {
@@ -258,6 +356,11 @@ async function captureOcrAndSend() {
     setOcrMsg('세션 ID가 없습니다. 문자 링크로 다시 열어주세요.');
     return;
   }
+  if (!_ocrStream) {
+    await startOcrCamera();
+    setOcrMsg('카메라가 다시 켜졌어요. 신분증을 네모 안에 맞춘 뒤 다시 눌러주세요.');
+    return;
+  }
   const video = document.getElementById('ocr-video');
   if (!video.videoWidth || !video.videoHeight) {
     setOcrMsg('카메라 준비가 아직 안 됐어요');
@@ -266,44 +369,60 @@ async function captureOcrAndSend() {
   _ocrCaptured = true;
   _ocrChecking = false;
   if (_ocrTimer) clearInterval(_ocrTimer);
-  setOcrMsg('OCR 전송 중...');
+  setOcrMsg('인증 중입니다..');
+  setStatus('인증 중입니다.. 잠시만 기다려주세요.');
 
   const canvas = document.getElementById('ocr-canvas');
   const ctx = canvas.getContext('2d');
   canvas.width = video.videoWidth;
   canvas.height = video.videoHeight;
   ctx.drawImage(video, 0, 0);
+  stopOcrCamera();
 
   canvas.toBlob(async (blob) => {
+    if (!blob) {
+      setOcrMsg('촬영 이미지 생성 실패');
+      setStatus('재시도하려면 수동 촬영 버튼을 눌러주세요.');
+      _ocrCaptured = false;
+      return;
+    }
     const form = new FormData();
     form.append('file', blob, 'id_card.jpg');
+    if (_lastGuideAlignment) {
+      form.append('guide_max_delta', String(_lastGuideAlignment.maxDelta));
+      form.append('guide_found_edges', String(_lastGuideAlignment.found));
+    }
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 15000);
     try {
-      const r = await fetch(base + '/ocr-auth/' + authId + '/capture', { method: 'POST', body: form });
+      const r = await fetch(base + '/ocr-auth/' + authId + '/capture', {
+        method: 'POST',
+        body: form,
+        signal: controller.signal,
+      });
       const data = await r.json();
+      if (!r.ok) throw new Error(data.detail || r.status);
       document.getElementById('ocr-result').textContent = JSON.stringify(data, null, 2);
       if (data.status === 'success') {
-        setOcrMsg('OCR 인식됨 — 계속 인식 중...');
-        document.getElementById('step-ocr').className = 'step active';
-        document.getElementById('b-ocr').textContent = '진행 중';
-        document.getElementById('b-ocr').className = 'badge';
+        setOcrMsg('신분증 인증이 완료되었습니다.');
+        document.getElementById('step-ocr').className = 'step done';
+        document.getElementById('b-ocr').textContent = '완료';
+        document.getElementById('b-ocr').className = 'badge ok';
         document.getElementById('next-hint').style.display = 'block';
-        setStatus('인식 결과를 로그로 계속 출력 중입니다.');
-        _ocrCaptured = false;
-        _ocrChecking = true;
-        _ocrReadyFrames = 0;
-        _ocrTimer = setInterval(runOcrQualityCheck, 700);
+        setStatus('인증 완료');
       } else {
         setOcrMsg(data.reason ? ('재시도 필요: ' + data.reason) : '재시도 필요');
+        setStatus('재시도하려면 수동 촬영 버튼을 눌러주세요.');
         _ocrCaptured = false;
-        _ocrChecking = true;
         _ocrReadyFrames = 0;
-        _ocrTimer = setInterval(runOcrQualityCheck, 700);
       }
     } catch (e) {
-      setOcrMsg('OCR 요청 실패: ' + e.message);
+      const msg = e.name === 'AbortError' ? 'OCR 요청 시간이 초과되었습니다' : ('OCR 요청 실패: ' + e.message);
+      setOcrMsg(msg);
+      setStatus('재시도하려면 수동 촬영 버튼을 눌러주세요.');
       _ocrCaptured = false;
-      _ocrChecking = true;
-      _ocrTimer = setInterval(runOcrQualityCheck, 700);
+    } finally {
+      clearTimeout(timeoutId);
     }
   }, 'image/jpeg', 0.92);
 }

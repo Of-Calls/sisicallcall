@@ -58,7 +58,7 @@ async def _create_new_vision(call_id: str, tenant_id: str, customer_phone: str) 
     )
     print(f"[vision_branch] 세션 생성 vision_id={vision_id}")
 
-    upload_url = f"{settings.auth_web_base_url}/vision/{vision_id}"
+    upload_url = f"{settings.base_url.rstrip('/')}/vision/{vision_id}"
     sms_body = f"[시시콜콜] 정수기 사진 업로드 링크입니다.\n{upload_url}"
     sent = await _sms_svc.send_sms(to=customer_phone, body=sms_body)
     print(f"[vision_branch] SMS 발송 sent={sent} to={customer_phone}")

@@ -103,6 +103,8 @@ async def capture_id_card(
     roi_x2: float | None = Form(default=None),
     roi_y1: float | None = Form(default=None),
     roi_y2: float | None = Form(default=None),
+    guide_max_delta: float | None = Form(default=None),
+    guide_found_edges: int | None = Form(default=None),
 ):
     """신분증 이미지 OCR — 성공 시 ocr_passed 반영."""
     session = await _session_svc.get_session(auth_id)
@@ -110,6 +112,11 @@ async def capture_id_card(
         raise HTTPException(status_code=404, detail="인증 세션이 없거나 만료됨")
 
     image_bytes = await file.read()
+    if guide_max_delta is not None or guide_found_edges is not None:
+        print(
+            "[OCR] guide_alignment "
+            f"max_delta={guide_max_delta} found_edges={guide_found_edges}"
+        )
     roi_override = None
     if None not in (roi_x1, roi_x2, roi_y1, roi_y2):
         roi_override = {

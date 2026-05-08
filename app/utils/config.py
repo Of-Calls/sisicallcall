@@ -1,4 +1,14 @@
+import logging
+import os
+
 from pydantic_settings import BaseSettings
+
+
+# ChromaDB 0.5.x telemetry can emit noisy PostHog errors on startup in local dev.
+os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
+os.environ.setdefault("CHROMA_ANONYMIZED_TELEMETRY", "False")
+logging.getLogger("chromadb.telemetry.product").disabled = True
+logging.getLogger("chromadb.telemetry.product.posthog").disabled = True
 
 
 class Settings(BaseSettings):
@@ -117,7 +127,6 @@ class Settings(BaseSettings):
     auth_session_ttl_sec: int = 172800  # 2 days
     auth_enable_test_register: bool = False
     auth_skip_sms: bool = False
-    auth_web_base_url: str = "http://localhost:3000"
 
     # Vision (정수기 모델 분류 — TorchScript 단일 파일)
     # metadata JSON 안에 input_size, normalize_mean/std, classes 정의.

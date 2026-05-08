@@ -15,6 +15,7 @@ from app.api.v1 import (
     call,
     call_history,
     dashboard,
+    ocr_auth,
     post_call,
     summary,
     tenant,
@@ -85,6 +86,7 @@ app.include_router(summary.router, prefix="/summary", tags=["summary"])
 app.include_router(tenant.router, prefix="/tenant", tags=["tenant"])
 app.include_router(dashboard.router, prefix="/dashboard", tags=["dashboard"])
 app.include_router(auth.router, prefix="/auth", tags=["auth"])
+app.include_router(ocr_auth.router, prefix="/ocr-auth", tags=["ocr-auth"])
 app.include_router(vision.router, prefix="/vision", tags=["vision"])
 app.include_router(oauth_router, prefix="/api/v1/oauth", tags=["oauth"])
 

@@ -29,6 +29,24 @@ def _parse_korean_name(*texts: str) -> str:
     return ""
 
 
+def _parse_korean_name_from_tokens(tokens: list[str]) -> str:
+    chars: list[str] = []
+    for token in tokens:
+        if _RRN_RE.search(token) or re.search(r"\d", token):
+            break
+        if re.fullmatch(r"[가-힣]", token):
+            chars.append(token)
+            if len(chars) == 4:
+                break
+            continue
+        if chars:
+            break
+
+    if 2 <= len(chars) <= 4:
+        return "".join(chars)
+    return ""
+
+
 def _filter_small_strokes(binary_img: np.ndarray) -> np.ndarray:
     """작은 점 노이즈를 제거하고 일정 크기 이상의 획만 남긴다."""
     # THRESH_BINARY 기준: 글자(검정)=0, 배경(흰색)=255 -> 연결요소 분석을 위해 반전
@@ -254,8 +272,6 @@ class IdCardOCRService:
         if rrn and "-" not in rrn and len(rrn) >= 13:
             rrn = f"{rrn[:6]}-{rrn[6:]}"
 
-        name = _parse_korean_name(name_split_text, roi_text, full_text)
-
         ocr_data = pytesseract.image_to_data(
             merged_roi,
             lang="kor",
@@ -266,6 +282,9 @@ class IdCardOCRService:
         kor_tokens = [t for t in tokens if re.search(r"[가-힣]", t)]
         num_tokens = [t for t in tokens if re.search(r"\d", t)]
         rrn_like_tokens = [t for t in tokens if re.search(r"\d{6}-?\d{1,7}", t)]
+        name = _parse_korean_name_from_tokens(tokens) or _parse_korean_name(
+            name_split_text, roi_text, full_text
+        )
 
         print("[OCR] full_text:\n" + full_text)
         print("[OCR] merged_roi_text:\n" + roi_text)

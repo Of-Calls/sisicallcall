@@ -4,8 +4,8 @@ from app.utils.config import settings
 
 
 def auth_public_base() -> str:
-    """AUTH_WEB_BASE_URL 정규화 (스킴 없으면 https 붙임)."""
-    b = (settings.auth_web_base_url or "").strip().rstrip("/")
+    """BASE_URL 정규화 (스킴 없으면 https 붙임)."""
+    b = (settings.base_url or "").strip().rstrip("/")
     if not b:
         return ""
     if not b.lower().startswith(("http://", "https://")):
