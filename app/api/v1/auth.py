@@ -17,8 +17,8 @@ from app.schemas.auth import (
 from app.services.auth.arcface import ArcFaceAuthService
 from app.services.auth.liveness import LivenessService
 from app.services.auth.session import AuthSessionService
-from app.services.ocr.id_card_ocr_service import get_id_card_ocr_service
 from app.services.sms import get_sms_service
+from app.utils.auth_sms import build_face_auth_sms, face_auth_url
 from app.utils.config import settings
 from app.utils.logger import get_logger
 
@@ -34,27 +34,36 @@ _session_svc = AuthSessionService()
 _liveness_svc = LivenessService()
 _auth_svc = ArcFaceAuthService()
 _sms_svc = get_sms_service()
-_id_card_ocr = get_id_card_ocr_service()
 
 
 @router.post("/verify", response_model=AuthInitiateResponse)
 async def initiate_auth(body: AuthInitiateRequest):
-    """인증 세션 생성 + 고객에게 얼굴 인증 링크 SMS 발송."""
+    """인증 세션 생성 + 얼굴 인증 링크 SMS 발송."""
     auth_id = await _session_svc.create_session(
         tenant_id=body.tenant_id,
         customer_ref=body.customer_ref,
         customer_phone=body.customer_phone,
         call_id=body.call_id,
     )
-    auth_url = f"{settings.auth_web_base_url}/auth/{auth_id}"
-    sms_body = f"[시시콜콜] 본인인증을 위해 아래 링크를 열어주세요.\n{auth_url}"
-    sent = await _sms_svc.send_sms(to=body.customer_phone, body=sms_body)
-    if not sent:
-        logger.error("SMS 발송 실패 auth_id=%s phone=%s", auth_id, body.customer_phone)
+    face_link = face_auth_url(auth_id)
+    if settings.auth_skip_sms:
+        return AuthInitiateResponse(
+            auth_id=auth_id,
+            status="pending",
+            message=f"SMS 스킵 모드 — 얼굴 인증 링크: {face_link}",
+        )
+
+    face_sent = await _sms_svc.send_sms(to=body.customer_phone, body=build_face_auth_sms(auth_id))
+    if not face_sent:
+        logger.error(
+            "얼굴 인증 SMS 발송 실패 auth_id=%s phone=%s",
+            auth_id,
+            body.customer_phone,
+        )
     return AuthInitiateResponse(
         auth_id=auth_id,
         status="pending",
-        message="SMS 발송 완료" if sent else "SMS 발송 실패 — 인증 세션은 유효",
+        message="얼굴 인증 SMS 발송 완료" if face_sent else "얼굴 인증 SMS 발송 실패 — 인증 세션은 유효",
     )
 
 
@@ -91,24 +100,6 @@ async def complete_liveness(auth_id: str, body: LivenessCompleteRequest):
 
     await _session_svc.set_liveness_passed(auth_id)
     return LivenessCompleteResponse(auth_id=auth_id, liveness_passed=True)
-
-
-@router.post("/{auth_id}/ocr")
-async def ocr_id_card(auth_id: str, file: UploadFile = File(...)):
-    """Liveness 완료 후 신분증 이미지 OCR — 성공 시 세션에 ocr_passed 반영."""
-    session = await _session_svc.get_session(auth_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="인증 세션이 없거나 만료됨")
-    if session.get("liveness_passed") != "true":
-        raise HTTPException(status_code=409, detail="Liveness 인증을 먼저 완료해주세요")
-    if session.get("ocr_passed") == "true":
-        raise HTTPException(status_code=409, detail="이미 신분증 OCR이 완료되었습니다")
-
-    image_bytes = await file.read()
-    result = await _id_card_ocr.process_image(image_bytes)
-    if result.get("status") == "success":
-        await _session_svc.set_ocr_passed(auth_id)
-    return result
 
 
 @router.post("/{auth_id}/face", response_model=FaceVerifyResponse)
@@ -207,8 +198,9 @@ async def register_face(
 
 @router.get("/{auth_id}", response_class=HTMLResponse)
 async def auth_page(auth_id: str) -> HTMLResponse:
-    """SMS 링크에서 진입하는 얼굴 인증 페이지.
+    """SMS 링크에서 진입하는 얼굴 인증 페이지 (Liveness + 정면 촬영).
 
+    신분증 OCR은 /ocr-auth/{auth_id} 전용 페이지·API 사용.
     HTML 안 JS 가 /auth/{auth_id}/liveness, /face, /status 를 직접 호출.
     더 구체적인 라우트들(/liveness, /face, /status, /register, /verify)이
     위에 먼저 선언돼 있으므로 catch-all 처럼 동작해도 충돌 없음.

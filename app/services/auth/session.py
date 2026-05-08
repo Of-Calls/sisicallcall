@@ -8,7 +8,7 @@ from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-_AUTH_SESSION_TTL = 600  # 10분
+_AUTH_SESSION_TTL = settings.auth_session_ttl_sec
 
 
 def _key(auth_id: str) -> str:

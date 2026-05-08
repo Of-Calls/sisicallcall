@@ -32,7 +32,13 @@ async def _fetch_all_metadatas(tenant_id: str) -> list[dict]:
     """ChromaDB 컬렉션 전체 chunk metadata 반환 (blocking → executor)."""
     def _query():
         import chromadb
-        client = chromadb.HttpClient(host=settings.chroma_host, port=settings.chroma_port)
+        from chromadb.config import Settings
+
+        client = chromadb.HttpClient(
+            host=settings.chroma_host,
+            port=settings.chroma_port,
+            settings=Settings(anonymized_telemetry=False),
+        )
         try:
             col = client.get_collection(_collection_name(tenant_id))
         except Exception:

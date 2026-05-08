@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
-  <title>시시콜콜 본인인증</title>
+  <title>시시콜콜 얼굴 인증</title>
   <style>
     *{box-sizing:border-box;margin:0;padding:0}
     body{font-family:-apple-system,sans-serif;background:#f5f5f5;min-height:100vh;display:flex;align-items:center;justify-content:center}
@@ -22,29 +22,19 @@
     .btn-primary:disabled{background:#a5d6a7;cursor:not-allowed}
     .btn-blue{background:#1976D2;color:#fff}
     video,canvas{width:100%;border-radius:8px;background:#000;margin:8px 0}
-    video{transform:scaleX(-1)}
-    .video-wrap{position:relative}
-    .guide-box{
-      position:absolute;
-      left:12%;
-      top:20%;
-      width:76%;
-      height:56%;
-      border:3px solid rgba(76,175,80,.95);
-      border-radius:10px;
-      box-shadow:0 0 0 9999px rgba(0,0,0,.28);
-      pointer-events:none;
-    }
-    .ocr-msg{font-size:13px;color:#444;margin-top:4px;min-height:20px}
+    #video{transform:scaleX(-1)}
     #status{text-align:center;font-size:13px;color:#666;padding:8px 0;min-height:20px}
     .instructions{font-size:14px;color:#333;margin:8px 0;padding:10px;background:#fff8e1;border-radius:6px}
     .score{font-size:28px;font-weight:700;text-align:center;margin:8px 0}
+    .hint{font-size:12px;color:#666;margin-top:12px;line-height:1.5}
+    a.ocr-link{color:#1976D2;font-weight:600}
   </style>
 </head>
 <body>
 <div class="card">
-  <h2>시시콜콜 본인인증</h2>
+  <h2>얼굴 본인인증</h2>
   <p class="subtitle" id="auth-id-label"></p>
+  <p class="hint">신분증 OCR은 <a class="ocr-link" id="ocr-link" href="#">별도 페이지</a>에서 진행합니다. (Liveness 완료 후 신분증 촬영 → 이 페이지로 돌아와 정면 촬영)</p>
 
   <div class="step active" id="step1">
     <div class="step-title">1단계 <span class="badge" id="b1">대기</span></div>
@@ -56,7 +46,7 @@
 
   <div class="step" id="step2" style="display:none">
     <div class="step-title">2단계 <span class="badge" id="b2">대기</span></div>
-    <p style="font-size:13px;color:#555;margin-bottom:4px">정면을 바라보고 📷 버튼을 누르세요.</p>
+    <p style="font-size:13px;color:#555;margin-bottom:4px">정면을 바라보고 📷 버튼을 누르세요. (신분증 OCR을 먼저 완료했는지 확인하세요)</p>
     <video id="video" autoplay playsinline muted></video>
     <canvas id="canvas" style="display:none"></canvas>
     <button class="btn-blue" onclick="captureAndVerify()">📷 촬영 후 인증</button>
@@ -70,19 +60,6 @@
     <pre id="status-json" style="font-size:11px;color:#777;margin-top:8px;white-space:pre-wrap"></pre>
   </div>
 
-  <div class="step" id="step-ocr" style="display:none">
-    <div class="step-title">신분증 OCR <span class="badge" id="b-ocr">대기</span></div>
-    <p style="font-size:13px;color:#555;margin-bottom:4px">신분증을 네모 박스에 맞춰주세요. 조건 충족 시 자동 촬영됩니다.</p>
-    <div class="video-wrap">
-      <video id="ocr-video" autoplay playsinline muted></video>
-      <div class="guide-box"></div>
-    </div>
-    <canvas id="ocr-canvas" style="display:none"></canvas>
-    <div class="ocr-msg" id="ocr-quality-msg">카메라 준비 중...</div>
-    <button class="btn-blue" id="btn-ocr-manual" onclick="captureOcrAndSend()">수동 촬영 (Fallback)</button>
-    <pre id="ocr-result" style="font-size:11px;color:#777;margin-top:8px;white-space:pre-wrap"></pre>
-  </div>
-
   <p id="status">준비 중...</p>
 </div>
 
@@ -92,14 +69,14 @@ const authId = (() => {
   return m ? m[1] : null;
 })();
 document.getElementById('auth-id-label').textContent = 'session: ' + authId;
-let _token = null;
-let _ocrReadyFrames = 0;
-let _ocrChecking = false;
-let _ocrCaptured = false;
-let _ocrTimer = null;
-let _ocrStream = null;
+const ocrLink = document.getElementById('ocr-link');
+if (ocrLink && authId) {
+  ocrLink.href = '/ocr-auth/' + authId;
+}
 
 function setStatus(msg) { document.getElementById('status').textContent = msg; }
+
+let _token = null;
 
 async function startLiveness() {
   document.getElementById('btn-start').disabled = true;
@@ -137,9 +114,11 @@ async function completeLiveness() {
       document.getElementById('step1').className = 'step done';
       document.getElementById('b1').textContent = '완료';
       document.getElementById('b1').className = 'badge ok';
-      document.getElementById('step2').style.display = 'none';
-      await startOcrCamera();
-      setStatus('후면 카메라로 신분증을 촬영해주세요. 완료 후 얼굴 인증 단계로 넘어갑니다.');
+      document.getElementById('step2').style.display = 'block';
+      document.getElementById('step2').className = 'step active';
+      document.getElementById('b2').textContent = '진행 중';
+      await startCamera();
+      setStatus('신분증 OCR을 완료한 뒤 정면 촬영을 진행하세요.');
     } else {
       setStatus('Liveness 실패. 다시 시도하세요.');
       document.getElementById('btn-done-liveness').disabled = false;
@@ -157,180 +136,6 @@ async function startCamera() {
   } catch(e) {
     setStatus('카메라 접근 실패: ' + e.message + ' (HTTPS 필요)');
   }
-}
-
-async function startOcrCamera() {
-  const video = document.getElementById('ocr-video');
-  const step = document.getElementById('step-ocr');
-  step.style.display = 'block';
-  step.className = 'step active';
-  document.getElementById('b-ocr').textContent = '진행 중';
-  try {
-    _ocrStream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } },
-    });
-    video.srcObject = _ocrStream;
-    setOcrMsg('카드를 네모 안에 맞춰주세요');
-    _ocrChecking = true;
-    _ocrTimer = setInterval(runOcrQualityCheck, 700);
-  } catch (e) {
-    setOcrMsg('후면 카메라 접근 실패: ' + e.message);
-  }
-}
-
-function setOcrMsg(msg) {
-  document.getElementById('ocr-quality-msg').textContent = msg;
-}
-
-function stopOcrCamera() {
-  if (_ocrTimer) clearInterval(_ocrTimer);
-  _ocrTimer = null;
-  _ocrChecking = false;
-  if (_ocrStream) {
-    _ocrStream.getTracks().forEach(function (t) { t.stop(); });
-    _ocrStream = null;
-  }
-}
-
-function calcBlurMetric(gray, w, h) {
-  // 간단한 Laplacian 근사 (브라우저 JS에서 빠른 선형 계산)
-  let sum = 0, sum2 = 0, n = 0;
-  for (let y = 1; y < h - 1; y += 2) {
-    for (let x = 1; x < w - 1; x += 2) {
-      const i = y * w + x;
-      const lap = Math.abs(4 * gray[i] - gray[i - 1] - gray[i + 1] - gray[i - w] - gray[i + w]);
-      sum += lap; sum2 += lap * lap; n++;
-    }
-  }
-  if (!n) return 0;
-  const mean = sum / n;
-  return (sum2 / n) - (mean * mean);
-}
-
-function runOcrQualityCheck() {
-  if (!_ocrChecking || _ocrCaptured) return;
-  const video = document.getElementById('ocr-video');
-  if (!video.videoWidth || !video.videoHeight) return;
-
-  const canvas = document.getElementById('ocr-canvas');
-  const ctx = canvas.getContext('2d', { willReadFrequently: true });
-  canvas.width = video.videoWidth;
-  canvas.height = video.videoHeight;
-  ctx.drawImage(video, 0, 0);
-
-  const w = canvas.width, h = canvas.height;
-  const frame = ctx.getImageData(0, 0, w, h).data;
-  const gray = new Uint8Array(w * h);
-  let sumL = 0, brightCount = 0;
-  for (let i = 0, p = 0; i < frame.length; i += 4, p++) {
-    const g = (frame[i] * 0.299 + frame[i + 1] * 0.587 + frame[i + 2] * 0.114) | 0;
-    gray[p] = g;
-    sumL += g;
-    if (frame[i] > 245 && frame[i + 1] > 245 && frame[i + 2] > 245) brightCount++;
-  }
-
-  const brightness = sumL / (w * h);
-  if (brightness < 70) {
-    _ocrReadyFrames = 0;
-    setOcrMsg('너무 어두워요');
-    return;
-  }
-
-  const reflectionRatio = brightCount / (w * h);
-  if (reflectionRatio > 0.12) {
-    _ocrReadyFrames = 0;
-    setOcrMsg('빛 반사가 있어요');
-    return;
-  }
-
-  const blurVar = calcBlurMetric(gray, w, h);
-  if (blurVar < 55) {
-    _ocrReadyFrames = 0;
-    setOcrMsg('이미지가 흐려요');
-    return;
-  }
-
-  // 가이드 박스 내부 edge 비율로 카드 정렬 여부 추정
-  const x1 = Math.floor(w * 0.12), x2 = Math.floor(w * 0.88);
-  const y1 = Math.floor(h * 0.20), y2 = Math.floor(h * 0.76);
-  let edge = 0, total = 0;
-  for (let y = y1; y < y2 - 1; y += 2) {
-    for (let x = x1; x < x2 - 1; x += 2) {
-      const i = y * w + x;
-      const gx = Math.abs(gray[i] - gray[i + 1]);
-      const gy = Math.abs(gray[i] - gray[i + w]);
-      if (gx + gy > 40) edge++;
-      total++;
-    }
-  }
-  const edgeRatio = total ? (edge / total) : 0;
-  if (edgeRatio < 0.06) {
-    _ocrReadyFrames = 0;
-    setOcrMsg('카드를 네모 안에 맞춰주세요');
-    return;
-  }
-
-  _ocrReadyFrames += 1;
-  setOcrMsg('품질 양호 — 자동 촬영 준비 중...');
-  if (_ocrReadyFrames >= 3) {
-    captureOcrAndSend();
-  }
-}
-
-async function captureOcrAndSend() {
-  if (_ocrCaptured) return;
-  if (!authId) {
-    setOcrMsg('세션 ID가 없습니다. 문자 링크로 다시 열어주세요.');
-    return;
-  }
-  const video = document.getElementById('ocr-video');
-  if (!video.videoWidth || !video.videoHeight) {
-    setOcrMsg('카메라 준비가 아직 안 됐어요');
-    return;
-  }
-  _ocrCaptured = true;
-  _ocrChecking = false;
-  if (_ocrTimer) clearInterval(_ocrTimer);
-  setOcrMsg('OCR 전송 중...');
-
-  const canvas = document.getElementById('ocr-canvas');
-  const ctx = canvas.getContext('2d');
-  canvas.width = video.videoWidth;
-  canvas.height = video.videoHeight;
-  ctx.drawImage(video, 0, 0);
-
-  canvas.toBlob(async (blob) => {
-    const form = new FormData();
-    form.append('file', blob, 'id_card.jpg');
-    try {
-      const r = await fetch('/auth/' + authId + '/ocr', { method: 'POST', body: form });
-      const data = await r.json();
-      document.getElementById('ocr-result').textContent = JSON.stringify(data, null, 2);
-      if (data.status === 'success') {
-        setOcrMsg('OCR 성공');
-        document.getElementById('step-ocr').className = 'step done';
-        document.getElementById('b-ocr').textContent = '완료';
-        document.getElementById('b-ocr').className = 'badge ok';
-        stopOcrCamera();
-        document.getElementById('step2').style.display = 'block';
-        document.getElementById('step2').className = 'step active';
-        document.getElementById('b2').textContent = '진행 중';
-        await startCamera();
-        setStatus('정면 카메라가 열렸습니다. 얼굴 인증을 진행해주세요.');
-      } else {
-        setOcrMsg(data.reason ? ('재시도 필요: ' + data.reason) : '재시도 필요');
-        _ocrCaptured = false;
-        _ocrChecking = true;
-        _ocrReadyFrames = 0;
-        _ocrTimer = setInterval(runOcrQualityCheck, 700);
-      }
-    } catch (e) {
-      setOcrMsg('OCR 요청 실패: ' + e.message);
-      _ocrCaptured = false;
-      _ocrChecking = true;
-      _ocrTimer = setInterval(runOcrQualityCheck, 700);
-    }
-  }, 'image/jpeg', 0.92);
 }
 
 async function captureAndVerify() {
@@ -383,6 +188,7 @@ async function checkStatus() {
     document.getElementById('status-json').textContent = '오류: ' + e.message;
   }
 }
+
 </script>
 </body>
 </html>

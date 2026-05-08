@@ -10,7 +10,7 @@ from app.services.auth.session import AuthSessionService
 from app.services.mcp.client import mcp_client
 from app.services.session.redis_session import RedisSessionService
 from app.services.sms import get_sms_service
-from app.utils.config import settings
+from app.utils.auth_sms import build_face_auth_sms, build_ocr_auth_sms
 
 _auth_session_svc = AuthSessionService()
 _call_session_svc = RedisSessionService()
@@ -19,16 +19,15 @@ _sms_svc = get_sms_service()
 _POLITE_NO_PHONE = "본인 인증 진행을 위한 정보가 부족해요. 매장으로 직접 문의해주세요."
 _POLITE_SMS_FAILED = "인증 링크 발송에 문제가 생겼어요. 잠시 후 다시 시도해주세요."
 _POLITE_SMS_SENT = (
-    "본인 인증을 위해 휴대폰으로 인증 링크를 보내드렸어요. "
-    "링크를 열어 인증을 완료해주세요."
+    "본인 인증 링크를 두 건(얼굴/신분증)으로 나눠 보내드렸어요. "
+    "각 링크에서 인증을 완료해주세요."
 )
 _POLITE_IN_PROGRESS = "본인 인증을 진행 중이에요. 휴대폰에서 인증을 완료해주세요."
 _POLITE_OCR_PENDING = (
-    "문자로 받은 링크에서 신분증 촬영·인식을 먼저 완료해주세요. "
-    "완료 후 얼굴 인증 단계로 넘어갑니다."
+    "문자에 있는 신분증 OCR 전용 링크(/ocr-auth)에서 촬영·인식을 먼저 완료해주세요."
 )
 _POLITE_FACE_PENDING = (
-    "신분증 인식이 완료됐어요. 같은 화면에서 정면 얼굴 촬영으로 본인 인증을 마쳐주세요."
+    "신분증 인식이 완료됐어요. 얼굴 인증 페이지(/auth 링크)로 돌아가 정면 촬영을 마쳐주세요."
 )
 _POLITE_VERIFIED = "인증이 완료됐어요. 어떤 도움이 필요하신가요?"
 _POLITE_BLOCKED = "인증이 여러 번 실패해 차단됐어요. 상담원으로 연결해드릴게요."
@@ -45,12 +44,11 @@ async def _create_new_auth(call_id: str, tenant_id: str, customer_phone: str) ->
     )
     print(f"[auth_branch] 세션 생성 auth_id={auth_id}")
 
-    auth_url = f"{settings.auth_web_base_url}/auth/{auth_id}"
-    sms_body = f"[시시콜콜] 본인인증을 위해 아래 링크를 열어주세요.\n{auth_url}"
-    sent = await _sms_svc.send_sms(to=customer_phone, body=sms_body)
-    print(f"[auth_branch] SMS 발송 sent={sent} to={customer_phone}")
+    sent_face = await _sms_svc.send_sms(to=customer_phone, body=build_face_auth_sms(auth_id))
+    sent_ocr = await _sms_svc.send_sms(to=customer_phone, body=build_ocr_auth_sms(auth_id))
+    print(f"[auth_branch] SMS 발송 face={sent_face} ocr={sent_ocr} to={customer_phone}")
 
-    if not sent:
+    if not (sent_face and sent_ocr):
         return {"response_text": _POLITE_SMS_FAILED}
 
     # SMS 발송 성공 시에만 auth_id 저장 — 실패 시 다음 진입 때 재시도하도록.

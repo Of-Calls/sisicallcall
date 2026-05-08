@@ -20,13 +20,26 @@ from app.services.stt.deepgram import DeepgramSTTService
 from app.services.tenant import DEFAULT_INDUSTRY, DEFAULT_NAME, get_greeting, get_tenant_meta, resolve_tenant_id
 from app.services.tts.azure import AzureTTSService
 from app.services.tts.filler import pick_filler
-from app.services.vad.silero_vad import SileroVADService
+# from app.services.vad.silero_vad import SileroVADService  # 임시 비활성: 모델 로드 방지
 from app.utils.config import settings
 
 router = APIRouter()
+
+
+class _RmsVADService:
+    """Silero 모델 로드 없이 임시로 쓰는 간단한 에너지 기반 VAD."""
+
+    def __init__(self, threshold: int = 350):
+        self._threshold = threshold
+
+    async def detect(self, audio_chunk: bytes) -> bool:
+        return audioop.rms(audio_chunk, 2) > self._threshold
+
+
 _stt = DeepgramSTTService()
 _tts = AzureTTSService()
-_vad = SileroVADService()
+# _vad = SileroVADService()
+_vad = _RmsVADService()
 _verifier = get_speaker_verify_service()
 _graph = build_graph()
 _session = RedisSessionService()

@@ -15,8 +15,12 @@ logger = get_logger(__name__)
 class ChromaCacheService(BaseCacheService):
     def __init__(self):
         import chromadb
+        from chromadb.config import Settings
+
         self._client = chromadb.HttpClient(
-            host=settings.chroma_host, port=settings.chroma_port
+            host=settings.chroma_host,
+            port=settings.chroma_port,
+            settings=Settings(anonymized_telemetry=False),
         )
 
     def _collection_name(self, tenant_id: str) -> str:

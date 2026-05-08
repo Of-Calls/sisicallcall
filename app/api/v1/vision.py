@@ -12,7 +12,7 @@ logger = get_logger(__name__)
 router = APIRouter()
 
 _session_svc = VisionSessionService()
-_classifier = ConvNeXtV2VisionService()
+_classifier: ConvNeXtV2VisionService | None = None
 
 _VISION_PAGE_HTML = (
     Path(__file__).parent.parent.parent / "static" / "vision_upload.html"
@@ -26,12 +26,24 @@ async def predict_image(vision_id: str, file: UploadFile = File(...)):
     if not session:
         raise HTTPException(status_code=404, detail="vision 세션이 없거나 만료됨")
     if session.get("status") not in ("pending", "analyzing"):
-        raise HTTPException(status_code=409, detail=f"잘못된 상태: {session.get('status')}")
+        raise HTTPException(
+            status_code=409, detail=f"잘못된 상태: {session.get('status')}"
+        )
 
     await _session_svc.set_analyzing(vision_id)
     image_bytes = await file.read()
     try:
+        global _classifier
+        if _classifier is None:
+            _classifier = ConvNeXtV2VisionService()
         result = await _classifier.classify(image_bytes)
+    except FileNotFoundError:
+        logger.exception("vision model/metadata 파일 누락")
+        await _session_svc.set_failed(vision_id, reason="vision_model_not_found")
+        raise HTTPException(
+            status_code=503,
+            detail="Vision 모델 파일이 없습니다. 관리자에게 문의하세요.",
+        )
     except Exception as exc:
         logger.exception("vision classify 실패: %s", exc)
         await _session_svc.set_failed(vision_id, reason=str(exc))
@@ -40,7 +52,9 @@ async def predict_image(vision_id: str, file: UploadFile = File(...)):
     label = str(result.get("label", ""))
     confidence = float(result.get("confidence", 0.0))
     await _session_svc.set_analyzed(vision_id, label, confidence)
-    logger.info("vision analyzed vision_id=%s label=%s conf=%.4f", vision_id, label, confidence)
+    logger.info(
+        "vision analyzed vision_id=%s label=%s conf=%.4f", vision_id, label, confidence
+    )
     return {
         "vision_id": vision_id,
         "status": "analyzed",

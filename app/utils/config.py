@@ -109,8 +109,9 @@ class Settings(BaseSettings):
     arcface_max_retries: int = 3
     liveness_instruction_count: int = 3
     liveness_hmac_secret: str = "change-me-in-production"
-    auth_session_ttl_sec: int = 600
+    auth_session_ttl_sec: int = 172800  # 2 days
     auth_enable_test_register: bool = False
+    auth_skip_sms: bool = False
     auth_web_base_url: str = "http://localhost:3000"
 
     # Vision (정수기 모델 분류 — TorchScript 단일 파일)

@@ -74,3 +74,5 @@ tmp/
 
 # models
 models/
+
+ocr_preprocess/
