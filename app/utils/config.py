@@ -55,6 +55,11 @@ class Settings(BaseSettings):
     env: str = "development"
     log_level: str = "INFO"
 
+    # Admin JWT
+    jwt_secret_key: str = "change-me"
+    jwt_algorithm: str = "HS256"
+    access_token_expire_minutes: int = 60
+
     # TTS Output Channel 모드 — "mock" (기본, 테스트/유닛) | "twilio" (프로덕션 WebSocket)
     tts_channel_mode: str = "mock"
 
@@ -124,13 +129,6 @@ class Settings(BaseSettings):
     auth_enable_test_register: bool = False
     auth_web_base_url: str = "http://localhost:3000"
 
-    # Vision (정수기 모델 분류 — TorchScript 단일 파일)
-    # metadata JSON 안에 input_size, normalize_mean/std, classes 정의.
-    # device="auto" 시 cuda 가능하면 cuda, 아니면 cpu 자동 선택.
-    vision_model_path: str = "models/water_purifier_convnextv2_femto_scripted.pt"
-    vision_metadata_path: str = "models/water_purifier_convnextv2_femto_metadata.json"
-    vision_device: str = "auto"
-
     # FAQ 시맨틱 캐시 (faq_branch 전용)
     # ChromaDB L2 squared distance (BGE-M3 normalized, L2sq = 2(1-cos_sim)).
     # 0.04 (cos_sim ≥ 0.98) — 진단 결과 (8 paraphrase + 8 unrelated) 에서
@@ -139,6 +137,12 @@ class Settings(BaseSettings):
     # 긴 task/예약 발화 (cos 0.99+) 위주로 캐시 효과. miss 시 RAG fallthrough 정답 보장.
     cache_distance_threshold: float = 0.04
     cache_ttl_seconds: int = 86400  # 24h
+
+    # Cold start warmup (Qwen3 첫 inference / OpenAI httpx / ChromaDB per-tenant).
+    # 시연/운영 = true (첫 통화 latency ↓). 개발 reload 빠르게 = false.
+    # 기존 워밍 4개 (embedding load / TitaNet / BM25 / TTS filler) 는 시스템 작동에
+    # 필요해서 toggle 대상 아님 — 항상 실행.
+    warmup_enabled: bool = True
 
     # extra="ignore" — .env 에 코드에서 제거된 잔여 키(예: 과거 GOOGLE_APPLICATION_CREDENTIALS)
     # 가 있어도 ValidationError 로 죽지 않게. 신규 키는 위 클래스 필드로 명시 정의 필요.

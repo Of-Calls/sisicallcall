@@ -1,3 +1,4 @@
+from app.agents.conversational.prompts.faq import build_system_prompt
 from app.agents.conversational.state import CallState
 from app.services.cache import get_cache
 from app.services.embedding import get_embedder
@@ -25,18 +26,6 @@ _POLITE_VISION = "확인하시려는 게 어떤 건지 사진으로 봐야 정�
 _POLITE_NO_RESULT = "제가 잘 모르는 부분이에요. 상담원 연결해드릴까요?"
 _POLITE_DECLINE_FALLBACK = "알겠습니다. 그러면 다른 무엇을 도와드릴까요?"
 
-_FAQ_SYSTEM_PROMPT = """당신은 매장 전화 상담 AI 입니다. 사용자의 질문에 RAG 검색 결과를 바탕으로 친절하게 답변하세요.
-
-[지침 — 음성 안내라 짧고 핵심만이 핵심]
-- 두 문장 이내, 150자 이내로 답변. 사용자 발화 시간 + 답변 시간을 고려해 짧을수록 좋아요.
-- 사용자가 명시적으로 묻지 않은 항목은 생략. (예: "단품 메뉴 뭐 있어요" → 카테고리 1~2개와 가격대만 — 모든 메뉴 나열 금지)
-- 항목 나열은 핵심 3개 이내. 더 자세한 정보는 "자세한 건 매장 메뉴판으로 안내드려요" 처럼 짧게 마무리.
-- 검색 결과 컨텍스트에 있는 사실만 사용. 없는 정보는 추측 금지.
-- "검색 결과", "문서에 따르면" 같은 메타 표현 금지. 매장 직원처럼 답하세요.
-- 컨텍스트에 답이 없으면: 정확히 "NO_RESULT" 만 출력 (다른 텍스트/구두점 추가 금지). 코드가 감지해 폴백 메시지로 대체함.
-- 출력은 답변 텍스트만. 따옴표/머릿말 금지.
-- 시간은 "11시 30분" 형식. 시간 범위는 "11시 30분부터 22시까지". ":" / "~" / "-" 사용 금지."""
-
 
 def _preview(text: str, limit: int = 120) -> str:
     compact = " ".join((text or "").split())
@@ -49,6 +38,8 @@ async def faq_branch_node(state: CallState) -> dict:
     query = state.get("rewritten_query") or state["user_text"]
     user_text = state.get("user_text") or ""  # is_vision 게이트의 model_id substring 매칭용
     tenant_id = state["tenant_id"]
+    tenant_name = state.get("tenant_name", "고객센터")
+    tenant_industry = state.get("tenant_industry", "unknown")
 
     # 거절 패턴 — RAG 없이 generic 안내. query_refine 이 일관되게
     # "사용자가 ... 거절함" 으로 재작성하므로 string 매칭으로 충분.
@@ -147,7 +138,7 @@ async def faq_branch_node(state: CallState) -> dict:
 
     try:
         text = await _llm.generate(
-            system_prompt=_FAQ_SYSTEM_PROMPT,
+            system_prompt=build_system_prompt(tenant_name, tenant_industry),
             user_message=user_message,
             temperature=0.2,
             max_tokens=150,  # prompt 의 "150자 이내" 와 일치 (한국어 ~1.5자/token, 약간 여유)

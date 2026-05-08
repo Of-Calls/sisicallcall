@@ -21,7 +21,8 @@ from app.repositories import (
     save_summary, get_summary_by_call_id,
     seed_call_context, get_call_context,
     save_voc_analysis, get_voc_by_call_id,
-    save_action_logs, find_successful_action, get_action_logs_by_call_id, get_action_logs,
+    save_action_logs, find_successful_action, get_action_logs_by_call_id,
+    get_action_logs_by_call_id_for_tenant, get_action_logs,
     upsert_dashboard_payload, get_dashboard_payload,
     get_post_call_detail, get_dashboard_overview,
     get_emotion_distribution, get_priority_queue,
@@ -71,6 +72,31 @@ async def test_save_and_get_summary():
 async def test_get_summary_not_found():
     result = await get_summary_by_call_id("nonexistent")
     assert result is None
+
+
+@pytest.mark.asyncio
+async def test_get_summary_tenant_filter():
+    summary = {"summary_short": "tenant scoped", "customer_emotion": "neutral"}
+    await save_summary("call-tenant-001", "tenant-a", summary)
+
+    same_tenant = await get_summary_by_call_id("call-tenant-001", tenant_id="tenant-a")
+    other_tenant = await get_summary_by_call_id("call-tenant-001", tenant_id="tenant-b")
+
+    assert same_tenant is not None
+    assert same_tenant["tenant_id"] == "tenant-a"
+    assert other_tenant is None
+
+
+@pytest.mark.asyncio
+async def test_call_summary_repository_save_preserves_tenant_id():
+    repo = summary_mod.CallSummaryRepository()
+    summary = {"summary_short": "repository scoped", "customer_emotion": "neutral"}
+
+    await repo.save_summary("call-repo-tenant-001", summary, tenant_id="tenant-a")
+
+    same_tenant = await get_summary_by_call_id("call-repo-tenant-001", tenant_id="tenant-a")
+    assert same_tenant is not None
+    assert same_tenant["tenant_id"] == "tenant-a"
 
 
 # ── 2. save_voc_analysis / get_voc_by_call_id ────────────────────────────────
@@ -134,6 +160,65 @@ async def test_save_and_get_action_logs():
 
 
 # ── 4. save_action_logs 재저장 시 기존 logs 보존 + append ───────────────────
+
+@pytest.mark.asyncio
+async def test_get_action_logs_by_call_id_for_tenant_filters_file_store():
+    action = {
+        "action_type": "send_manager_email",
+        "tool": "gmail",
+        "status": "success",
+        "external_id": None,
+        "error": None,
+        "result": {},
+        "params": {},
+    }
+    await save_action_logs("call-tenant-filter", "tenant-a", [action])
+    await save_action_logs("call-tenant-filter", "tenant-b", [action])
+
+    logs = await get_action_logs_by_call_id_for_tenant("call-tenant-filter", "tenant-a")
+
+    assert len(logs) == 1
+    assert logs[0]["tenant_id"] == "tenant-a"
+
+
+@pytest.mark.asyncio
+async def test_save_action_logs_preserves_mcp_metadata_in_response_payload():
+    """MCP mode executed_actions[].result 의 source/via_mcp/execution_mode/mcp_tool
+    이 mcp_action_logs.response_payload 로 손실 없이 저장돼야 한다.
+
+    이게 보장되어야 발표용 SQL 에서
+        response_payload->>'source' = 'mcp_server'
+    같은 검증이 의미 있다.
+    """
+    actions = [{
+        "action_type": "send_slack_alert",
+        "tool": "slack",
+        "status": "success",
+        "external_id": "C123:ts",
+        "error": None,
+        "result": {
+            "channel": "C123",
+            "ts": "ts",
+            "source": "mcp_server",
+            "via_mcp": True,
+            "execution_mode": "mcp",
+            "mcp_tool": "slack.send_slack_alert",
+            "mcp_latency_ms": 12,
+        },
+        "params": {"message": "x"},
+    }]
+    await save_action_logs("call-mcp-meta", "tenant-x", actions)
+
+    logs = await get_action_logs_by_call_id("call-mcp-meta")
+    assert len(logs) == 1
+    payload = logs[0]["response_payload"]
+    assert payload["source"] == "mcp_server"
+    assert payload["via_mcp"] is True
+    assert payload["execution_mode"] == "mcp"
+    assert payload["mcp_tool"] == "slack.send_slack_alert"
+    assert payload["channel"] == "C123"
+    assert payload["mcp_latency_ms"] == 12
+
 
 @pytest.mark.asyncio
 async def test_save_action_logs_appends_without_replacing():

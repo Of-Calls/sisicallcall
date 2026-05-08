@@ -75,4 +75,6 @@ tmp/
 # models
 models/
 
+requirements-local.txt
+
 .dump_chunks.py

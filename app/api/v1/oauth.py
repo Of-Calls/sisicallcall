@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timedelta
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import RedirectResponse
@@ -100,6 +100,56 @@ def _loggable_jira_resources(resources: list[dict]) -> list[dict]:
         }
         for item in resources
     ]
+
+
+# ── return_url 검증 (open redirect 방어) ─────────────────────────────────────
+
+_DEFAULT_ALLOWED_FRONTEND_ORIGINS = (
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:4173",
+)
+
+
+def _allowed_frontend_origins() -> tuple[str, ...]:
+    """env에서 추가 허용 origin을 읽어 기본 localhost 셋과 합친다."""
+    extras: list[str] = []
+    primary = os.getenv("FRONTEND_ORIGIN", "").strip()
+    if primary:
+        extras.append(primary)
+    csv = os.getenv("FRONTEND_ALLOWED_ORIGINS", "").strip()
+    if csv:
+        extras.extend(item.strip() for item in csv.split(",") if item.strip())
+    seen: list[str] = []
+    for origin in (*_DEFAULT_ALLOWED_FRONTEND_ORIGINS, *extras):
+        normalized = origin.rstrip("/")
+        if normalized and normalized not in seen:
+            seen.append(normalized)
+    return tuple(seen)
+
+
+def _is_safe_return_url(value: str) -> bool:
+    """return_url이 허용된 frontend origin으로 시작하는지 검증."""
+    if not value:
+        return False
+    try:
+        parsed = urlparse(value)
+    except Exception:
+        return False
+    if parsed.scheme not in ("http", "https"):
+        return False
+    if not parsed.netloc:
+        return False
+    origin = f"{parsed.scheme}://{parsed.netloc}".rstrip("/")
+    return origin in _allowed_frontend_origins()
+
+
+def _append_query(url: str, params: dict[str, str]) -> str:
+    """return_url에 query 파라미터를 안전하게 덧붙인다 (token/secret 절대 금지)."""
+    if not params:
+        return url
+    sep = "&" if ("?" in url) else "?"
+    return f"{url}{sep}{urlencode(params)}"
 
 # ── 프로바이더 레지스트리 ─────────────────────────────────────────────────────
 
@@ -284,11 +334,28 @@ async def callback(
         "expires_at": expires_at.isoformat() if expires_at else None,
         "return_url": entry.return_url,
     }
+    workspace_selection_required = False
     if provider == "jira":
-        response["workspace_selection_required"] = bool(
+        workspace_selection_required = bool(
             metadata.get("workspace_selection_required", False)
         )
+        response["workspace_selection_required"] = workspace_selection_required
         response["workspace_id"] = external_workspace_id
+
+    # return_url 이 있고 허용된 frontend origin 인 경우 — 프론트로 redirect.
+    # 비어 있거나 허용되지 않은 경우 기존 JSON 응답 유지 (open redirect 방어).
+    if entry.return_url and _is_safe_return_url(entry.return_url):
+        params: dict[str, str] = {
+            "provider": provider,
+            "status": status.value,
+        }
+        if provider == "jira" and workspace_selection_required:
+            params["status"] = "incomplete"
+            params["reason"] = "workspace_selection_required"
+            params["workspace_selection_required"] = "true"
+        redirect_url = _append_query(entry.return_url, params)
+        return RedirectResponse(url=redirect_url, status_code=302)
+
     return response
 
 
@@ -377,9 +444,17 @@ async def get_status(
     """특정 테넌트의 연동 상태 조회."""
     integration = get_integration(tenant_id, provider)
     if integration is None:
-        return {"status": "not_connected", "tenant_id": tenant_id, "provider": provider}
+        response: dict = {
+            "status": "not_connected",
+            "tenant_id": tenant_id,
+            "provider": provider,
+        }
+        if provider == "jira":
+            response["workspace_selection_required"] = False
+            response["workspace_id"] = None
+        return response
 
-    return {
+    response = {
         "status": integration.status.value,
         "tenant_id": tenant_id,
         "provider": provider,
@@ -388,6 +463,13 @@ async def get_status(
         "expires_at": integration.expires_at.isoformat() if integration.expires_at else None,
         "scopes": integration.scopes,
     }
+    if provider == "jira":
+        metadata = integration.metadata or {}
+        response["workspace_selection_required"] = bool(
+            metadata.get("workspace_selection_required", False)
+        )
+        response["workspace_id"] = integration.external_workspace_id
+    return response
 
 
 @router.delete("/{provider}/disconnect")

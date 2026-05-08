@@ -20,6 +20,7 @@ from typing import Optional
 
 import asyncpg
 
+from app.repositories.rag_document_repo import upsert_rag_document_chunks_for_tenant
 from app.services.embedding.base import BaseEmbeddingService
 from app.services.llm.base import BaseLLMService
 from app.services.llm.gpt4o_mini import GPT4OMiniService
@@ -106,8 +107,19 @@ def _table_text_dump(raw_table: dict) -> str:
 
 def _flatten_json(data: dict) -> list[FlatElement]:
     """opendataloader JSON kids 트리를 평탄한 list 로 (heading/paragraph/list/table 채택)."""
+    kids = data.get("kids") or []
+
+    # PDF 좌표계(y=0 페이지 하단, y 증가=위쪽)기준 page → top-y 내림차순 정렬.
+    # cross-page 단락이 heading보다 앞에 오는 opendataloader 순서 버그 방어.
+    def _sort_key(k: dict) -> tuple:
+        page = int(k.get("page number") or 0)
+        bbox = k.get("bounding box") or []
+        top_y = bbox[3] if len(bbox) >= 4 else 0
+        return (page, -top_y)
+
+    kids = sorted(kids, key=_sort_key)
     out: list[FlatElement] = []
-    for kid in data.get("kids") or []:
+    for kid in kids:
         if not isinstance(kid, dict):
             continue
         kt = kid.get("type")
@@ -193,7 +205,7 @@ class Chunk:
     raw_table: Optional[dict] = None  # table 청크만 — 자연어화 LLM 입력용
     heading_path: list[str] = field(
         default_factory=list
-    )  # L2 이상 hierarchy (L1 은 거의 모든 청크 공통이라 제외)
+    )  # heading hierarchy (L1 포함 전체)
 
 
 def _group_into_chunks(elements: list[FlatElement]) -> list[Chunk]:
@@ -203,7 +215,7 @@ def _group_into_chunks(elements: list[FlatElement]) -> list[Chunk]:
       - heading 만나면 누적 section flush + heading stack 갱신 (heading 자체는 본문에 X)
       - table 만나면 누적 flush 후 단독 청크 (절대 split X)
       - paragraph/list 누적, MAX_CHUNK_CHARS 초과 시 자동 flush
-      - chunk 마다 현재 heading hierarchy snapshot — L1 제외 L2 이상만 path 로
+      - chunk 마다 현재 heading hierarchy snapshot — L1 포함 전체 path 로
     """
     chunks: list[Chunk] = []
     heading_stack: list[tuple[int, str]] = (
@@ -215,7 +227,7 @@ def _group_into_chunks(elements: list[FlatElement]) -> list[Chunk]:
         return heading_stack[-1][1] if heading_stack else ""
 
     def current_path() -> list[str]:
-        return [t for lv, t in heading_stack if lv >= 2]
+        return [t for _, t in heading_stack]
 
     def flush_section():
         nonlocal current_section
@@ -711,6 +723,7 @@ class PDFProcessor:
 
             # 5. ChromaDB upsert
             collection_name = self._rag._collection_name(tenant_id)
+            db_chunks: list[dict] = []
             for i, (chunk, embedding, llm_meta) in enumerate(
                 zip(chunks_obj, embeddings, llm_metas)
             ):
@@ -745,8 +758,41 @@ class PDFProcessor:
                         "doc_type": doc_type,
                     },
                 )
+                db_chunks.append(
+                    {
+                        "chunk_index": i,
+                        "page_number": int(chunk.page),
+                        "content": chunk.text,
+                        "metadata": {
+                            "tenant_id": tenant_id,
+                            "document_id": str(document_id),
+                            "file_name": file_name,
+                            "chunk_index": i,
+                            "industry": industry,
+                            "chunk_type": chunk.chunk_type,
+                            "page_number": int(chunk.page),
+                            "bbox": bbox_str,
+                            "heading_path": " > ".join(chunk.heading_path),
+                            "llm_title": title[:100],
+                            "llm_summary": llm_meta.get("summary", ""),
+                            "llm_keywords": keywords_str,
+                            "llm_topic": llm_meta.get("topic", "湲고?"),
+                            "is_auth": False,
+                            "is_vision": False,
+                            "doc_type": doc_type,
+                        },
+                        "embedding_status": "ready",
+                        "chroma_id": f"{document_id}_chunk_{i}",
+                    }
+                )
 
             # 6. tenant 가용 카테고리 (Redis) — 부가 산출물. 실패해도 인덱싱은 성공.
+            await upsert_rag_document_chunks_for_tenant(
+                document_id=str(document_id),
+                tenant_id=tenant_id,
+                chunks=db_chunks,
+            )
+
             topics = [m.get("topic", "") for m in llm_metas]
             refined_categories = await _refine_categories(topics, self._llm)
             if refined_categories:
@@ -842,7 +888,10 @@ class PDFProcessor:
             row = await conn.fetchrow(
                 """
                 SELECT id FROM rag_documents
-                WHERE tenant_id = $1::uuid AND file_name = $2 AND status != 'failed'
+                WHERE tenant_id = $1::uuid
+                  AND file_name = $2
+                  AND status != 'failed'
+                  AND deleted_at IS NULL
                 ORDER BY uploaded_at DESC LIMIT 1
                 """,
                 tenant_id,
@@ -855,6 +904,10 @@ class PDFProcessor:
     async def _delete_rag_document(self, document_id: uuid.UUID) -> None:
         conn = await asyncpg.connect(settings.database_url)
         try:
+            await conn.execute(
+                "DELETE FROM rag_document_chunks WHERE document_id = $1",
+                document_id,
+            )
             await conn.execute(
                 "DELETE FROM rag_documents WHERE id = $1",
                 document_id,

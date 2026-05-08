@@ -1,5 +1,9 @@
 ﻿# Web Framework
 fastapi==0.115.0
+# starlette 핀 — mcp 1.27 의 sse-starlette 가 starlette>=1.0 끌어오면 fastapi 0.115 의
+# Router(on_startup=...) 가 깨짐. fastapi 호환 범위로 강제. sse-starlette metadata 경고는
+# 런타임 무관 (mcp 가 stdio transport 만 사용).
+starlette>=0.37.2,<0.39
 uvicorn[standard]==0.30.6
 websockets==13.1
 
@@ -44,6 +48,12 @@ redis[asyncio]==5.1.0
 pydantic==2.9.2
 pydantic-settings==2.5.2
 python-dotenv==1.0.1
+email-validator==2.2.0
+
+# Admin Auth
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+bcrypt==4.0.1
 
 # Audio
 numpy==2.4.4
@@ -95,3 +105,7 @@ typing_extensions
 
 # OAuth token encryption (SaaS tenant integration)
 cryptography==41.0.7
+
+# MCP (Model Context Protocol) — KDT-101 진짜 MCP Server/Client.
+# Post-call Action 실행 경로를 stdio transport 기반 MCP protocol 로 분리.
+mcp>=1.27.0
