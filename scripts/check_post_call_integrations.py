@@ -16,12 +16,16 @@ import asyncio
 import json
 import os
 import sys
+from pathlib import Path
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(_PROJECT_ROOT))
 
 from dotenv import load_dotenv  # noqa: E402
 
-load_dotenv(override=False)
+# 프로젝트 루트의 .env 명시적 로드. override=False — OS env / secret manager 우선.
+# .env 가 없어도 죽지 않는다 (load_dotenv 가 missing-ok).
+load_dotenv(_PROJECT_ROOT / ".env", override=False)
 
 import asyncpg  # noqa: E402
 
@@ -74,6 +78,226 @@ def _notion_env_ready() -> tuple[bool, str | None]:
     if not db_id:
         missing.append("NOTION_DATABASE_ID")
     return False, f"missing env: {', '.join(missing)}"
+
+
+# ── SMS / Solapi readiness ────────────────────────────────────────────────────
+
+def _sms_env_state() -> dict:
+    """Solapi 서버 공통 env + customer_phone/SMS_TEST_TO 상태를 분해해서 보고한다.
+
+    Returns:
+        {
+          "solapi_installed":     bool,
+          "credentials_present":  bool,   # SOLAPI_API_KEY + SOLAPI_API_SECRET 모두 있음
+          "sender_present":       bool,   # SOLAPI_FROM 또는 SOLAPI_SENDER_NUMBER
+          "test_to_present":      bool,   # SMS_TEST_TO 있음 (로컬/시연용 fallback)
+          "missing":              list[str],
+        }
+
+    SMS 는 OAuth provider 가 아니므로 tenant_integrations DB 에 row 가 없다.
+    customer_phone 은 readiness 단계에서 알 수 없고 action 실행 시점에 결정된다.
+    여기서는 서버 공통 설정만 본다.
+    """
+    try:
+        import solapi  # noqa: F401
+        installed = True
+    except Exception:
+        installed = False
+
+    api_key = (os.getenv("SOLAPI_API_KEY") or "").strip()
+    api_secret = (os.getenv("SOLAPI_API_SECRET") or "").strip()
+    sender = (
+        os.getenv("SOLAPI_FROM")
+        or os.getenv("SOLAPI_SENDER_NUMBER")
+        or ""
+    ).strip()
+    test_to = (os.getenv("SMS_TEST_TO") or "").strip()
+
+    missing: list[str] = []
+    if not installed:
+        missing.append("solapi_package")
+    if not api_key:
+        missing.append("SOLAPI_API_KEY")
+    if not api_secret:
+        missing.append("SOLAPI_API_SECRET")
+    if not sender:
+        missing.append("SOLAPI_FROM")
+
+    return {
+        "solapi_installed":    installed,
+        "credentials_present": bool(api_key and api_secret),
+        "sender_present":      bool(sender),
+        "test_to_present":     bool(test_to),
+        "missing":             missing,
+    }
+
+
+def _sms_provider_status() -> dict:
+    """SMS provider 단계의 readiness (action_type 단계가 아님).
+
+    구분:
+      - solapi_not_installed       → not_ready
+      - solapi_credentials_missing → not_ready
+      - solapi_sender_missing      → not_ready
+      - 그 외                       → configured (server-common env OK)
+    """
+    state = _sms_env_state()
+    if not state["solapi_installed"]:
+        return {
+            "status": "missing",
+            "ready": False,
+            "reason": "solapi_not_installed",
+            "details": state,
+        }
+    if not state["credentials_present"]:
+        return {
+            "status": "missing",
+            "ready": False,
+            "reason": "solapi_credentials_missing",
+            "details": state,
+        }
+    if not state["sender_present"]:
+        return {
+            "status": "missing",
+            "ready": False,
+            "reason": "solapi_sender_missing",
+            "details": state,
+        }
+    return {
+        "status": "configured",
+        "ready": True,
+        "reason": None,
+        "details": state,
+    }
+
+
+# ── Jira readiness ────────────────────────────────────────────────────────────
+
+_JIRA_ENV_REQUIRED = (
+    "JIRA_BASE_URL",
+    "JIRA_EMAIL",
+    "JIRA_API_TOKEN",
+    "JIRA_PROJECT_KEY",
+)
+
+
+def _jira_env_fallback_allowed() -> bool:
+    """env fallback 허용 여부 — 로컬/시연/legacy 경로용."""
+    return (os.getenv("MCP_ALLOW_ENV_FALLBACK") or "").strip().lower() in ("1", "true")
+
+
+def _jira_env_state() -> dict:
+    """Jira env fallback (local/legacy) 상태."""
+    values = {k: (os.getenv(k) or "").strip() for k in _JIRA_ENV_REQUIRED}
+    missing = [k for k, v in values.items() if not v]
+    return {
+        "fallback_allowed": _jira_env_fallback_allowed(),
+        "configured":       not missing,
+        "missing":          missing,
+    }
+
+
+def _jira_db_status(integration: object | None) -> dict:
+    """tenant_integrations 의 Jira row 를 분해해서 readiness 를 결정한다.
+
+    DB row 가 connected 라도 workspace_id (cloud_id) / project_key 가
+    빠지면 실제 issue create 가 실패하므로 별도 reason 으로 구분한다.
+
+    Returns dict with: status / ready / reason / scopes
+    """
+    if integration is None:
+        return {
+            "status": "missing",
+            "ready": False,
+            "reason": "tenant_integration_not_connected",
+            "scopes": [],
+        }
+
+    raw_status = getattr(integration, "status", None)
+    status_value = raw_status.value if hasattr(raw_status, "value") else str(raw_status or "unknown")
+    scopes = list(getattr(integration, "scopes", []) or [])
+
+    if status_value != "connected":
+        # 만료/disconnect/error 는 일반 OAuth 분기와 동일하게 처리
+        return {
+            "status": status_value if status_value in ("expired", "disconnected") else "invalid",
+            "ready": False,
+            "reason": {
+                "expired":      "token expired",
+                "disconnected": "manually disconnected",
+            }.get(status_value, "provider returned error"),
+            "scopes": scopes,
+        }
+
+    metadata = getattr(integration, "metadata", None) or {}
+    cloud_id = (
+        metadata.get("cloud_id")
+        or metadata.get("cloudId")
+        or getattr(integration, "external_workspace_id", None)
+        or ""
+    )
+    if not cloud_id or metadata.get("workspace_selection_required"):
+        return {
+            "status": "incomplete",
+            "ready": False,
+            "reason": "jira_workspace_not_selected",
+            "scopes": scopes,
+        }
+
+    project_key = (
+        metadata.get("project_key")
+        or os.getenv("JIRA_PROJECT_KEY", "").strip()
+    )
+    if not project_key:
+        return {
+            "status": "incomplete",
+            "ready": False,
+            "reason": "jira_project_not_configured",
+            "scopes": scopes,
+        }
+
+    return {"status": "connected", "ready": True, "reason": None, "scopes": scopes}
+
+
+def _jira_readiness(integration: object | None) -> dict:
+    """Jira readiness — DB 우선, env fallback 은 MCP_ALLOW_ENV_FALLBACK=true 일 때만.
+
+    우선순위:
+      1) DB row 가 충분 (connected + workspace + project) → connected/ready
+      2) DB row 가 있지만 workspace/project 부족 → incomplete + 명확한 reason
+      3) DB row 없음 + fallback 허용 + env 충분 → configured_env / ready_env
+      4) DB row 없음 + fallback 허용 + env 부족 → not_ready jira_env_config_missing
+      5) DB row 없음 + fallback 비허용 → not_ready tenant_integration_not_connected
+    """
+    db = _jira_db_status(integration)
+    if db["ready"]:
+        return db
+    if integration is not None:
+        # DB row 는 있지만 workspace/project 등 일부 부족. env fallback 보다
+        # DB 보강이 우선이라 env 로 우회하지 않는다 — reason 그대로 노출.
+        return db
+
+    env = _jira_env_state()
+    if not env["fallback_allowed"]:
+        return {
+            "status": "missing",
+            "ready": False,
+            "reason": "tenant_integration_not_connected",
+            "scopes": [],
+        }
+    if env["configured"]:
+        return {
+            "status": "configured_env",
+            "ready": True,
+            "reason": "env_fallback",
+            "scopes": [],
+        }
+    return {
+        "status": "missing",
+        "ready": False,
+        "reason": f"jira_env_config_missing: {','.join(env['missing'])}",
+        "scopes": [],
+    }
 
 # All providers we surface in the report. Order matters for console display.
 ALL_PROVIDERS = [
@@ -219,12 +443,32 @@ def normalize_provider_status(
                 "scopes": [],
                 **base_meta,
             }
+        if provider == "sms":
+            sms = _sms_provider_status()
+            return {
+                "status": sms["status"],
+                "ready": sms["ready"],
+                "reason": sms["reason"],
+                "scopes": [],
+                **base_meta,
+                "sms_env": sms["details"],
+            }
         return {
             "status": "configured",
             "ready": True,
             "reason": "env/provider level config required",
             "scopes": [],
             **base_meta,
+        }
+    if provider == "jira":
+        jira = _jira_readiness(integration)
+        return {
+            "status": jira["status"],
+            "ready": jira["ready"],
+            "reason": jira["reason"],
+            "scopes": jira["scopes"],
+            **base_meta,
+            "jira_env": _jira_env_state(),
         }
     if integration is None:
         return {
@@ -294,14 +538,43 @@ def build_action_readiness(provider_statuses: dict[str, dict]) -> dict[str, dict
                     "reason": None if ready else (info.get("reason") or "notion_not_configured"),
                 }
             else:
-                # sms requires both Solapi env config AND a customer_phone — the
-                # readiness check can only confirm one half here.
-                actions[action_type] = {
-                    "provider": provider,
-                    "ready": False,
-                    "ready_label": "needs_customer_phone_or_sms_config",
-                    "reason": "sms tool depends on env config + customer_phone",
-                }
+                # SMS — server-common Solapi env 가 부족하면 customer_phone 단계까지
+                # 가지도 못한다. env 부족 reason 을 그대로 surface 하고, env 가
+                # 충족되어 있더라도 customer_phone 은 readiness 단계에서는 알 수
+                # 없으므로 needs_customer_phone_or_sms_config 라벨을 유지한다.
+                info = provider_statuses.get(provider, {})
+                if info.get("ready"):
+                    # SOLAPI env 충분. SMS_TEST_TO 가 있으면 시연 fallback 으로 ready.
+                    test_to_present = bool((info.get("sms_env") or {}).get("test_to_present"))
+                    actions[action_type] = {
+                        "provider": provider,
+                        "ready": test_to_present,
+                        "ready_label": (
+                            "ready_test_fallback" if test_to_present
+                            else "needs_customer_phone_or_sms_config"
+                        ),
+                        "reason": None if test_to_present else (
+                            "sms tool depends on env config + customer_phone"
+                        ),
+                    }
+                else:
+                    actions[action_type] = {
+                        "provider": provider,
+                        "ready": False,
+                        "ready_label": "not_ready",
+                        "reason": info.get("reason") or "sms_not_configured",
+                    }
+        elif provider == "jira":
+            # Jira 는 DB row → workspace → project 단계별 reason 을 잃지 않게
+            # provider 의 reason 을 그대로 전달한다.
+            info = provider_statuses.get(provider, {})
+            ready = bool(info.get("ready"))
+            actions[action_type] = {
+                "provider": provider,
+                "ready": ready,
+                "ready_label": "ready" if ready else "not_ready",
+                "reason": None if ready else (info.get("reason") or "tenant_integration_not_connected"),
+            }
         elif provider_statuses.get(provider, {}).get("ready"):
             actions[action_type] = {
                 "provider": provider,

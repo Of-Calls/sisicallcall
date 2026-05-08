@@ -29,19 +29,22 @@ class AuthSessionService:
     ) -> str:
         auth_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc).isoformat()
-        await self._redis.hset(_key(auth_id), mapping={
-            "auth_id": auth_id,
-            "tenant_id": tenant_id,
-            "customer_ref": customer_ref,
-            "customer_phone": customer_phone,
-            "call_id": call_id,
-            "status": "pending",
-            "liveness_passed": "false",
-            "ocr_passed": "false",
-            "face_verified": "false",
-            "face_attempts": "0",
-            "created_at": now,
-        })
+        await self._redis.hset(
+            _key(auth_id),
+            mapping={
+                "auth_id": auth_id,
+                "tenant_id": tenant_id,
+                "customer_ref": customer_ref,
+                "customer_phone": customer_phone,
+                "call_id": call_id,
+                "status": "pending",
+                "liveness_passed": "true",  # liveness 단계 미구현 — 항상 통과
+                "ocr_passed": "false",
+                "face_verified": "false",
+                "face_attempts": "0",
+                "created_at": now,
+            },
+        )
         await self._redis.expire(_key(auth_id), _AUTH_SESSION_TTL)
         logger.info("auth session 생성 auth_id=%s tenant=%s", auth_id, tenant_id)
         return auth_id
@@ -54,25 +57,34 @@ class AuthSessionService:
         await self._redis.hset(_key(auth_id), "status", status)
 
     async def set_liveness_passed(self, auth_id: str) -> None:
-        await self._redis.hset(_key(auth_id), mapping={
-            "liveness_passed": "true",
-            "status": "liveness_passed",
-        })
+        await self._redis.hset(
+            _key(auth_id),
+            mapping={
+                "liveness_passed": "true",
+                "status": "liveness_passed",
+            },
+        )
 
     async def set_ocr_passed(self, auth_id: str) -> None:
-        await self._redis.hset(_key(auth_id), mapping={
-            "ocr_passed": "true",
-            "status": "ocr_passed",
-        })
+        await self._redis.hset(
+            _key(auth_id),
+            mapping={
+                "ocr_passed": "true",
+                "status": "ocr_passed",
+            },
+        )
 
     async def increment_face_attempts(self, auth_id: str) -> int:
         return await self._redis.hincrby(_key(auth_id), "face_attempts", 1)
 
     async def set_face_verified(self, auth_id: str) -> None:
-        await self._redis.hset(_key(auth_id), mapping={
-            "face_verified": "true",
-            "status": "verified",
-        })
+        await self._redis.hset(
+            _key(auth_id),
+            mapping={
+                "face_verified": "true",
+                "status": "verified",
+            },
+        )
 
     async def set_blocked(self, auth_id: str) -> None:
         await self._redis.hset(_key(auth_id), "status", "blocked")

@@ -704,7 +704,7 @@ async def test_jira_real_api_success_with_cloud_id(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_jira_real_api_no_site_skipped(monkeypatch):
-    """Jira real mode + tenant token + cloud_id/base_url 없음 → jira_site_not_configured."""
+    """Jira real mode + tenant token + cloud_id/base_url 없음 → jira_workspace_not_selected."""
     from cryptography.fernet import Fernet
     from app.services.oauth.token_crypto import reset_fernet_cache, encrypt_token
 
@@ -726,7 +726,7 @@ async def test_jira_real_api_no_site_skipped(monkeypatch):
     )
 
     assert result["status"] == "skipped"
-    assert result["error"] == "jira_site_not_configured"
+    assert result["error"] == "jira_workspace_not_selected"
 
     from app.repositories.tenant_integration_repo import tenant_integration_repo
     tenant_integration_repo.clear_integrations()
@@ -1824,3 +1824,133 @@ async def test_notion_connector_missing_config_skipped(monkeypatch):
 
     assert result["status"] == "skipped"
     assert result["error"] == "notion_not_configured"
+
+
+# ── Timezone-safe expires_at 비교 ─────────────────────────────────────────────
+#
+# 회귀 가드: tenant_integrations.expires_at 은 DB(asyncpg, TIMESTAMPTZ)에서
+# aware datetime 으로 돌아오고, file mode legacy 직렬화는 naive 다.
+# connector 의 _is_token_expired() 는 두 형태를 모두 받아도 TypeError
+# 없이 정상 판정해야 한다 — KDT-99 DB mode 전환에서 발견된 버그
+# (``can't compare offset-naive and offset-aware datetimes``) 회귀 방지.
+
+from datetime import datetime, timedelta, timezone
+
+
+class _StubIntegration:
+    """expires_at 만 검사하는 connector 헬퍼용 더미. Pydantic 모델 우회."""
+    def __init__(self, expires_at):
+        self.expires_at = expires_at
+
+
+def test_is_token_expired_handles_naive_datetime():
+    """naive datetime 이 들어와도 TypeError 가 나지 않는다."""
+    naive_future = datetime.utcnow() + timedelta(hours=1)
+    naive_past = datetime.utcnow() - timedelta(hours=1)
+
+    connector = SlackConnector()
+    # 실제 호출이 raise 하지 않고 boolean 을 돌려줘야 한다
+    assert connector._is_token_expired(_StubIntegration(naive_future)) is False
+    assert connector._is_token_expired(_StubIntegration(naive_past)) is True
+
+
+def test_is_token_expired_handles_aware_datetime():
+    """asyncpg 가 돌려주는 aware datetime 이어도 TypeError 가 나지 않는다."""
+    aware_future = datetime.now(timezone.utc) + timedelta(hours=1)
+    aware_past = datetime.now(timezone.utc) - timedelta(hours=1)
+
+    connector = GmailConnector()
+    assert connector._is_token_expired(_StubIntegration(aware_future)) is False
+    assert connector._is_token_expired(_StubIntegration(aware_past)) is True
+
+
+def test_is_token_expired_returns_false_when_expires_at_none():
+    """expires_at = None 이면 만료되지 않은 것으로 본다 (정책 보존)."""
+    connector = CalendarConnector()
+    assert connector._is_token_expired(_StubIntegration(None)) is False
+
+
+def test_is_token_expired_mixed_types_do_not_raise():
+    """naive vs aware 비교가 raise 없이 수행되는지 — 핵심 회귀 가드."""
+    cases = [
+        datetime.utcnow() + timedelta(minutes=5),                      # naive 미래
+        datetime.utcnow() - timedelta(minutes=5),                      # naive 과거
+        datetime.now(timezone.utc) + timedelta(minutes=5),             # aware 미래
+        datetime.now(timezone.utc) - timedelta(minutes=5),             # aware 과거
+        # 비-UTC tz 도 UTC aware 로 변환된 후 비교돼야 한다
+        datetime.now(timezone(timedelta(hours=9))) + timedelta(minutes=5),
+    ]
+    connector = JiraConnector()
+    for expires_at in cases:
+        # raise 안 하면 통과
+        result = connector._is_token_expired(_StubIntegration(expires_at))
+        assert isinstance(result, bool)
+
+
+@pytest.mark.asyncio
+async def test_gmail_oauth_does_not_raise_with_aware_expires_at(monkeypatch):
+    """asyncpg 가 돌려주는 aware datetime expires_at 으로도 _oauth_execute 가
+    TypeError 없이 진행된다 (token 복호화 단계에서 skipped/failed 로 끝나는
+    것은 OK — 핵심은 datetime 비교에서 raise 하지 않는 것)."""
+    from app.models.tenant_integration import IntegrationStatus, TenantIntegration
+
+    monkeypatch.setenv("GMAIL_MCP_REAL", "true")
+    monkeypatch.setenv("MCP_USE_TENANT_OAUTH", "true")
+    monkeypatch.setenv("GMAIL_MANAGER_TO", "manager@co.com")
+
+    aware_future = datetime.now(timezone.utc) + timedelta(hours=1)
+    integration = TenantIntegration(
+        tenant_id="tid-tz",
+        provider="google_gmail",
+        status=IntegrationStatus.connected,
+        access_token_encrypted="enc",   # 복호화는 실패해도 OK (테스트 목적은 비교 단계)
+        refresh_token_encrypted=None,
+        expires_at=aware_future,
+    )
+
+    monkeypatch.setattr(
+        "app.repositories.tenant_integration_repo.get_integration",
+        lambda tenant_id, provider: integration,
+    )
+
+    connector = GmailConnector()
+    # raise 없이 결과를 돌려주면 회귀 가드 통과
+    result = await connector.execute(
+        "send_manager_email", {"to": "u@co.com"},
+        call_id="tz-1", tenant_id="tid-tz",
+    )
+    assert isinstance(result, dict)
+    assert "status" in result
+
+
+@pytest.mark.asyncio
+async def test_calendar_oauth_does_not_raise_with_aware_expires_at(monkeypatch):
+    """Calendar 동일 회귀 가드 — DB mode 에서 가장 빈번하게 터졌던 경로."""
+    from app.models.tenant_integration import IntegrationStatus, TenantIntegration
+
+    monkeypatch.setenv("CALENDAR_MCP_REAL", "true")
+    monkeypatch.setenv("MCP_USE_TENANT_OAUTH", "true")
+
+    aware_future = datetime.now(timezone.utc) + timedelta(hours=1)
+    integration = TenantIntegration(
+        tenant_id="tid-tz",
+        provider="google_calendar",
+        status=IntegrationStatus.connected,
+        access_token_encrypted="enc",
+        refresh_token_encrypted=None,
+        expires_at=aware_future,
+    )
+
+    monkeypatch.setattr(
+        "app.repositories.tenant_integration_repo.get_integration",
+        lambda tenant_id, provider: integration,
+    )
+
+    connector = CalendarConnector()
+    result = await connector.execute(
+        "schedule_callback",
+        {"customer_phone": "+82-10-0000-0000"},
+        call_id="tz-2", tenant_id="tid-tz",
+    )
+    assert isinstance(result, dict)
+    assert "status" in result

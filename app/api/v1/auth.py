@@ -53,7 +53,9 @@ async def initiate_auth(body: AuthInitiateRequest):
             message=f"SMS 스킵 모드 — 얼굴 인증 링크: {face_link}",
         )
 
-    face_sent = await _sms_svc.send_sms(to=body.customer_phone, body=build_face_auth_sms(auth_id))
+    face_sent = await _sms_svc.send_sms(
+        to=body.customer_phone, body=build_face_auth_sms(auth_id)
+    )
     if not face_sent:
         logger.error(
             "얼굴 인증 SMS 발송 실패 auth_id=%s phone=%s",
@@ -63,7 +65,11 @@ async def initiate_auth(body: AuthInitiateRequest):
     return AuthInitiateResponse(
         auth_id=auth_id,
         status="pending",
-        message="얼굴 인증 SMS 발송 완료" if face_sent else "얼굴 인증 SMS 발송 실패 — 인증 세션은 유효",
+        message=(
+            "얼굴 인증 SMS 발송 완료"
+            if face_sent
+            else "얼굴 인증 SMS 발송 실패 — 인증 세션은 유효"
+        ),
     )
 
 
@@ -74,7 +80,9 @@ async def get_liveness_instructions(auth_id: str):
     if not session:
         raise HTTPException(status_code=404, detail="인증 세션이 없거나 만료됨")
     if session.get("status") not in ("pending", "liveness_pending"):
-        raise HTTPException(status_code=409, detail=f"잘못된 상태: {session.get('status')}")
+        raise HTTPException(
+            status_code=409, detail=f"잘못된 상태: {session.get('status')}"
+        )
 
     await _session_svc.update_status(auth_id, "liveness_pending")
     result = await _liveness_svc.generate_instructions(auth_id)
@@ -92,11 +100,15 @@ async def complete_liveness(auth_id: str, body: LivenessCompleteRequest):
     if not session:
         raise HTTPException(status_code=404, detail="인증 세션이 없거나 만료됨")
     if session.get("status") != "liveness_pending":
-        raise HTTPException(status_code=409, detail=f"잘못된 상태: {session.get('status')}")
+        raise HTTPException(
+            status_code=409, detail=f"잘못된 상태: {session.get('status')}"
+        )
 
     valid = await _liveness_svc.validate_token(auth_id, body.token)
     if not valid:
-        raise HTTPException(status_code=400, detail="Liveness 토큰 검증 실패 — 다시 시도하세요")
+        raise HTTPException(
+            status_code=400, detail="Liveness 토큰 검증 실패 — 다시 시도하세요"
+        )
 
     await _session_svc.set_liveness_passed(auth_id)
     return LivenessCompleteResponse(auth_id=auth_id, liveness_passed=True)
@@ -113,11 +125,15 @@ async def verify_face(auth_id: str, file: UploadFile = File(...)):
     if not session:
         raise HTTPException(status_code=404, detail="인증 세션이 없거나 만료됨")
     if session.get("liveness_passed") != "true":
-        raise HTTPException(status_code=409, detail="Liveness 미완료 — 먼저 Liveness 인증을 완료하세요")
+        raise HTTPException(
+            status_code=409, detail="Liveness 미완료 — 먼저 Liveness 인증을 완료하세요"
+        )
     if session.get("ocr_passed") != "true":
         raise HTTPException(status_code=409, detail="신분증 OCR을 먼저 완료해주세요")
     if session.get("status") == "blocked":
-        raise HTTPException(status_code=403, detail="인증 차단됨 — 상담원 연결로 전환됩니다")
+        raise HTTPException(
+            status_code=403, detail="인증 차단됨 — 상담원 연결로 전환됩니다"
+        )
     if session.get("face_verified") == "true":
         raise HTTPException(status_code=409, detail="이미 인증 완료된 세션입니다")
 
@@ -144,7 +160,9 @@ async def verify_face(auth_id: str, file: UploadFile = File(...)):
     if remaining <= 0:
         await _session_svc.set_blocked(auth_id)
         logger.warning("얼굴 인증 최대 재시도 초과 → 차단 auth_id=%s", auth_id)
-        raise HTTPException(status_code=403, detail="인증 실패 — 상담원 연결로 전환됩니다")
+        raise HTTPException(
+            status_code=403, detail="인증 실패 — 상담원 연결로 전환됩니다"
+        )
 
     return FaceVerifyResponse(
         auth_id=auth_id,
@@ -182,7 +200,10 @@ async def register_face(
     운영 배포에서는 절대 활성화하지 말 것.
     """
     if not settings.auth_enable_test_register:
-        raise HTTPException(status_code=403, detail="임시 등록 엔드포인트 비활성 — AUTH_ENABLE_TEST_REGISTER=true 필요")
+        raise HTTPException(
+            status_code=403,
+            detail="임시 등록 엔드포인트 비활성 — AUTH_ENABLE_TEST_REGISTER=true 필요",
+        )
     image_bytes = await file.read()
     await _auth_svc.register_face(
         image_bytes=image_bytes,

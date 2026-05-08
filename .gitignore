@@ -76,3 +76,5 @@ tmp/
 models/
 
 ocr_preprocess/
+
+requirements-local.txt

@@ -36,17 +36,9 @@
   <p class="subtitle" id="auth-id-label"></p>
   <p class="hint">신분증 OCR은 <a class="ocr-link" id="ocr-link" href="#">별도 페이지</a>에서 진행합니다. (Liveness 완료 후 신분증 촬영 → 이 페이지로 돌아와 정면 촬영)</p>
 
-  <div class="step active" id="step1">
-    <div class="step-title">1단계 <span class="badge" id="b1">대기</span></div>
-    <p style="font-size:13px;color:#555;margin-bottom:8px">아래 버튼을 눌러 Liveness 확인을 시작합니다.</p>
-    <div id="instructions-box" class="instructions" style="display:none"></div>
-    <button class="btn-primary" id="btn-start" onclick="startLiveness()">인증 시작</button>
-    <button class="btn-primary" id="btn-done-liveness" style="display:none" onclick="completeLiveness()">✅ 동작 완료</button>
-  </div>
-
-  <div class="step" id="step2" style="display:none">
-    <div class="step-title">2단계 <span class="badge" id="b2">대기</span></div>
-    <p style="font-size:13px;color:#555;margin-bottom:4px">정면을 바라보고 📷 버튼을 누르세요. (신분증 OCR을 먼저 완료했는지 확인하세요)</p>
+  <div class="step active" id="step2">
+    <div class="step-title">본인 인증 <span class="badge" id="b2">대기</span></div>
+    <p style="font-size:13px;color:#555;margin-bottom:4px">정면을 바라보고 📷 버튼을 누르세요.</p>
     <video id="video" autoplay playsinline muted></video>
     <canvas id="canvas" style="display:none"></canvas>
     <button class="btn-blue" onclick="captureAndVerify()">📷 촬영 후 인증</button>
@@ -69,14 +61,9 @@ const authId = (() => {
   return m ? m[1] : null;
 })();
 document.getElementById('auth-id-label').textContent = 'session: ' + authId;
-const ocrLink = document.getElementById('ocr-link');
-if (ocrLink && authId) {
-  ocrLink.href = '/ocr-auth/' + authId;
-}
+let _token = null;
 
 function setStatus(msg) { document.getElementById('status').textContent = msg; }
-
-let _token = null;
 
 async function startLiveness() {
   document.getElementById('btn-start').disabled = true;
@@ -118,7 +105,7 @@ async function completeLiveness() {
       document.getElementById('step2').className = 'step active';
       document.getElementById('b2').textContent = '진행 중';
       await startCamera();
-      setStatus('신분증 OCR을 완료한 뒤 정면 촬영을 진행하세요.');
+      setStatus('카메라가 열렸습니다. 정면을 바라보세요.');
     } else {
       setStatus('Liveness 실패. 다시 시도하세요.');
       document.getElementById('btn-done-liveness').disabled = false;
@@ -188,7 +175,6 @@ async function checkStatus() {
     document.getElementById('status-json').textContent = '오류: ' + e.message;
   }
 }
-
 </script>
 </body>
 </html>
