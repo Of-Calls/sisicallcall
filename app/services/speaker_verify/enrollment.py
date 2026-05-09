@@ -6,6 +6,8 @@ voiceprint 등록. 빈 STT (잡음) 오디오는 누적 자체 차단 — voicep
 cleanup() 은 call.py 의 stop event 에서 호출 (메모리 해제).
 """
 
+import numpy as np
+
 from app.services.speaker_verify.titanet_onnx import get_speaker_verify_service
 from app.utils.config import settings
 from app.utils.logger import get_logger

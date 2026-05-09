@@ -2,6 +2,7 @@
 
 각 파이프라인에 `asyncio.gather`로 청크를 동시에 넣어 VAD 경계를 일치시킨다.
 """
+
 from __future__ import annotations
 
 import audioop
@@ -89,21 +90,27 @@ def _stt_text(result: str | BaseException) -> str:
     return result or ""
 
 
-def _triple_from_branch_finetuned(res: Any) -> tuple[str, str | None, CompareSnapshot | None]:
+def _triple_from_branch_finetuned(
+    res: Any,
+) -> tuple[str, str | None, CompareSnapshot | None]:
     """branch_finetuned gather 결과 → (stt_text, 검증_스킵_사유, NeMo 비교 스냅샷)."""
     if isinstance(res, BaseException):
         return "", f"처리 예외: {res!s}", None
     if isinstance(res, tuple) and len(res) == 3:
         a, b, c = res[0], res[1], res[2]
         snap = c if isinstance(c, CompareSnapshot) or c is None else None
-        return (a if isinstance(a, str) else ""), (
-            b if isinstance(b, str) or b is None else None
-        ), snap
+        return (
+            (a if isinstance(a, str) else ""),
+            (b if isinstance(b, str) or b is None else None),
+            snap,
+        )
     if isinstance(res, tuple) and len(res) == 2:
         a, b = res[0], res[1]
-        return (a if isinstance(a, str) else ""), (
-            b if isinstance(b, str) or b is None else None
-        ), None
+        return (
+            (a if isinstance(a, str) else ""),
+            (b if isinstance(b, str) or b is None else None),
+            None,
+        )
     if isinstance(res, str):
         return res, None, None
     return "", "알 수 없는 branch 반환", None
@@ -133,7 +140,9 @@ class SttLatencyAccumulator:
         self.no_verify.clear()
 
 
-def log_call_stt_latency_summary(acc: SttLatencyAccumulator, *, stream_sid: str) -> None:
+def log_call_stt_latency_summary(
+    acc: SttLatencyAccumulator, *, stream_sid: str
+) -> None:
     """통화당 한 번 — 갈래별 평균 STT 레이턴시(스트림/VAD 모드별 의미는 SttLatencyAccumulator 주석 참고)."""
 
     def part(name: str, samples: list[float]) -> str:
@@ -235,7 +244,9 @@ async def on_utterance_triple(
             return transcript_override
         return await _timed_transcribe(stt, mulaw, t0=t0, bucket=bucket)
 
-    async def branch_finetuned(done: bool) -> tuple[str, str | None, CompareSnapshot | None]:
+    async def branch_finetuned(
+        done: bool,
+    ) -> tuple[str, str | None, CompareSnapshot | None]:
         """(STT 텍스트, 검증·모델 사유, baseline/finetuned ONNX 비교 스냅샷 — CSV 기록용)."""
         if finetuned.load_error:
             return "", "모델 로드 실패", None
@@ -264,9 +275,9 @@ async def on_utterance_triple(
     t_baseline_path = ""
     skip_baseline: str | None = None
 
-    async def _parallel_verify_and_stt() -> tuple[
-        str, str | None, str, str | None, str, CompareSnapshot
-    ]:
+    async def _parallel_verify_and_stt() -> (
+        tuple[str, str | None, str, str | None, str, CompareSnapshot]
+    ):
         """검증 1회 → Path A(finetuned)·Path B(baseline)는 각각 임계 통과 시만 STT(동시). no_verify 는 이후 순차."""
         assert cmp_compare is not None and stt_baseline_compare is not None
         snap = await cmp_compare.verify_compare_async(
@@ -324,6 +335,7 @@ async def on_utterance_triple(
         r1 = await branch_finetuned(done_flag)
         t1, skip1, cmp_snap = _triple_from_branch_finetuned(r1)
     else:
+
         async def branch_no_verify() -> str:
             t = await branch_no_verify_transcribe()
             if gated and not enrollment_done():
@@ -361,7 +373,9 @@ async def on_utterance_triple(
         if text.startswith("STT 실패"):
             _logger.info("[utt=%d] [%s] %s", utt_seq, tag, text)
             return
-        _logger.info("[utt=%d] [%s] %s", utt_seq, tag, text if text.strip() else "(빈 인식)")
+        _logger.info(
+            "[utt=%d] [%s] %s", utt_seq, tag, text if text.strip() else "(빈 인식)"
+        )
 
     def _finetuned_line() -> str:
         if skip1:
@@ -472,9 +486,7 @@ class TripleStreamContext:
     stt_finetuned: DeepgramSTTService = field(default_factory=DeepgramSTTService)
     stt_no_verify: DeepgramSTTService = field(default_factory=DeepgramSTTService)
     # 이중 ONNX 병렬 경로: Path A(stt_finetuned)와 동시 STT 시 stt_no_verify 와 충돌 방지
-    stt_baseline_compare: DeepgramSTTService = field(
-        default_factory=DeepgramSTTService
-    )
+    stt_baseline_compare: DeepgramSTTService = field(default_factory=DeepgramSTTService)
     stt_latency: SttLatencyAccumulator = field(default_factory=SttLatencyAccumulator)
     utterance_seq: int = 0
     _dg_live: DeepgramLiveMulawSession | None = field(default=None, repr=False)
@@ -514,7 +526,11 @@ class TripleStreamContext:
             cid0 = self._stream_call_id
 
             async def _on_final(
-                mulaw_seg: bytes, transcript: str, _start: float, _dur: float, e2e: float
+                mulaw_seg: bytes,
+                transcript: str,
+                _start: float,
+                _dur: float,
+                e2e: float,
             ) -> None:
                 cid = triple._stream_call_id or cid0 or "no-stream"
                 triple.utterance_seq += 1

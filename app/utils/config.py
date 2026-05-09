@@ -62,6 +62,8 @@ class Settings(BaseSettings):
 
     # TTS Output Channel 모드 — "mock" (기본, 테스트/유닛) | "twilio" (프로덕션 WebSocket)
     tts_channel_mode: str = "mock"
+    # Twilio 통화 WebSocket에서 STT 결과를 conversational graph로 보낼지 여부.
+    graph_integration_enabled: bool = True
 
     # Speaker Verification (TitaNet-L ONNX, runtime enrollment)
     # ONNX 도착 전엔 enabled=False 권장 (회귀 안전망 — verify 자동 bypass).
@@ -71,10 +73,33 @@ class Settings(BaseSettings):
     speaker_verify_model_path: str = "models/speech_verification/titanet_large.onnx"
     speaker_verify_threshold: float = 0.4
     speaker_verify_enrollment_sec: float = 3.0
+    enroll_utt_count: int = 1
     # TitaNet 짧은 발화 한계 — 2.0초 미만 발화는 임베딩 신뢰성 낮아 본인 reject 위험.
     # 미만은 verify 스킵하고 통과 (짧은 응답 보호 + 시연 안정성 우선).
     # 임베딩 신뢰성 곡선: <1s 매우 불안정, 1~1.5s 불안정, 1.5~2s 경계, 2s+ 안정.
     speaker_verify_min_audio_sec: float = 2.0
+
+    # Speaker Verification 비교/실험 설정 (baseline ONNX vs finetuned ONNX).
+    speaker_verify_compare_enabled: bool = False
+    speaker_verify_compare_log_path: str = "logs/speaker_verify_compare.csv"
+    speaker_verify_compare_baseline_onnx_path: str = ""
+    speaker_verify_finetuned_threshold: float | None = None
+    speaker_verify_nemo_force_cpu: bool = False
+    speaker_verify_nemo_onnx_compare_on_call: bool = False
+
+    # TitaNet ONNX / mel frontend 설정.
+    titanet_finetuned_onnx_path: str = ""
+    titanet_finetuned_infer_max_sec: float = 3.0
+    titanet_finetuned_onnx_max_mel_frames: int = 0
+    titanet_mel_backend: str = "torchaudio"
+    titanet_speaker_nemo_path: str = ""
+    warmup_nemo_mel_at_startup: bool = False
+    titanet_onnx_mel_n_fft: int = 512
+    titanet_onnx_mel_n_mels: int = 80
+    titanet_onnx_mel_win_length: int = 400
+    titanet_onnx_mel_hop_length: int = 160
+    titanet_onnx_mel_fmin: float = 0.0
+    titanet_onnx_mel_fmax: float = 8000.0
 
     # Silero VAD (v6.2+, 2026-04-30 채택 — 짧은 발화 + 긴 trailing silence reject 해결).
     # logs/2026-04-30/server_100651.log Turn 4/5 사례: "예약은어떻게해요" 0.5s + trailing 1.3s

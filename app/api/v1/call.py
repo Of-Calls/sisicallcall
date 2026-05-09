@@ -4,7 +4,6 @@ import base64
 import csv
 import html
 import json
-import os
 import time
 import traceback
 from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
@@ -30,8 +29,11 @@ from app.services.tts.azure import AzureTTSService
 from app.services.tts.filler import pick_filler, pick_filler_continuation
 from app.services.vad.silero_vad import SileroVADService
 from app.utils.config import settings
+from app.utils.logger import get_logger
 
 router = APIRouter()
+_logger = get_logger(__name__)
+
 _stt = DeepgramSTTService()
 _tts = AzureTTSService()
 _vad = SileroVADService()
@@ -44,12 +46,8 @@ _twilio_rest = (
     else None
 )
 
-# Stage 4a — graph 통합 (echo 회귀 환경변수)
-_GRAPH_ENABLED = os.getenv("GRAPH_INTEGRATION_ENABLED", "false").lower() in (
-    "1",
-    "true",
-    "yes",
-)
+# Stage 4a — graph 통합. 꺼져 있으면 STT 결과를 그대로 echo 하는 fallback 으로 동작.
+_GRAPH_ENABLED = settings.graph_integration_enabled
 
 _VAD_FRAME_BYTES = 1024  # linear16 16kHz, 512 samples
 _SILENCE_THRESHOLD = 45  # 연속 침묵 VAD 프레임 수 (~1440ms)

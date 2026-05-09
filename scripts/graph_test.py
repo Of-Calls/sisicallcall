@@ -31,7 +31,7 @@ async def main():
     session = RedisSessionService()
 
     call_id = str(uuid.uuid4())
-    tenant_id = "22cde253-370d-4f2b-9a6b-93f633cb059a"  # 시시콜콜금융
+    tenant_id = "8699eb2a-e1cb-477a-a1e2-108c830e0c43"  # 시시콜콜금융
     tenant_name, tenant_industry = await get_tenant_meta(tenant_id)
 
     print(
