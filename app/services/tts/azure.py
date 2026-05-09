@@ -23,6 +23,10 @@ class AzureTTSService(BaseTTSService):
         if not text:
             return b""
 
+        # 결정적 후처리 — '~' 가 LLM 응답에 남으면 Azure TTS 가 "에서" 로 어색하게 읽음.
+        # prompt 룰로도 차단하지만 LLM 비결정성 안전망. 'X~Y' → 'X에서 Y'.
+        text = text.replace("~", "에서 ")
+
         synthesizer = speechsdk.SpeechSynthesizer(
             speech_config=self._speech_config,
             audio_config=None,  # 스피커 출력 비활성화 → 바이트만 반환

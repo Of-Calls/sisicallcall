@@ -3,7 +3,11 @@ import json
 from app.agents.conversational.state import CallState
 from app.agents.conversational.prompts.query_refine import build_system_prompt
 from app.services.llm.gpt4o_mini import GPT4OMiniService
-from app.utils.korean_time import extract_absolute_datetime, format_iso
+from app.utils.korean_time import (
+    extract_absolute_date_only,
+    extract_absolute_datetime,
+    format_iso,
+)
 
 _llm = GPT4OMiniService()
 _HISTORY_TURN_LIMIT = 6  # 직전 3턴 (user+assistant 합쳐 6개 항목)
@@ -54,15 +58,24 @@ async def query_refine_node(state: CallState) -> dict:
         rewritten = user_text
 
     # 코드로 절대 날짜 강제 — LLM 의 한국어 요일/주 산수 비결정성 보완.
-    # 사용자 발화에서 "이번주/다음주 X요일", "오늘/내일/모레/글피" + 시간 표현이
-    # 잡히면 코드 결과를 rewritten 앞에 prepend → task_branch 가 첫 매칭 우선 사용.
+    # 사용자 발화에서 "이번주/다음주 X요일", "오늘/내일/모레/글피" 가 잡히면
+    # 코드 결과를 rewritten 앞에 prepend.
+    # - 시간 표현까지 함께 있으면 "(날짜: YYYY-MM-DD HH:MM)" — task_branch 가 그대로 사용.
+    # - 시간 표현 없으면 "(날짜: YYYY-MM-DD)" — 시간 부재 신호 — task_branch 가 시간 인자 빈값 처리.
     if is_clear and not is_goodbye:
         code_dt = extract_absolute_datetime(user_text)
         if code_dt is not None:
             iso = format_iso(code_dt)
             if iso not in rewritten:
                 rewritten = f"(날짜: {iso}) {rewritten}"
-                print(f"[query_refine] 코드 절대 날짜 강제: {iso}")
+                print(f"[query_refine] 코드 절대 날짜+시간 강제: {iso}")
+        else:
+            code_d = extract_absolute_date_only(user_text)
+            if code_d is not None:
+                iso_d = code_d.strftime("%Y-%m-%d")
+                if iso_d not in rewritten:
+                    rewritten = f"(날짜: {iso_d}) {rewritten}"
+                    print(f"[query_refine] 코드 날짜만 강제 (시간 부재): {iso_d}")
 
     print(f"[query_refine] is_clear={is_clear} rewritten='{rewritten}' missing='{missing}' goodbye={is_goodbye}")
     return {

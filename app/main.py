@@ -39,6 +39,50 @@ async def lifespan(app: FastAPI):
     await prewarm_fillers(AzureTTSService())
     _logger.info("startup: filler ready")
 
+    # Cold start warmup — Qwen3 첫 inference / OpenAI httpx / ChromaDB per-tenant.
+    # 첫 통화 첫 turn latency ~2.3s 단축. fail-tolerant — 워밍 실패해도 startup 진행.
+    if settings.warmup_enabled:
+        _logger.info("startup: warming up embedding model (first inference)...")
+        dummy_emb: list[float] | None = None
+        try:
+            dummy_emb = await get_embedder().embed_query("warmup")
+            _logger.info("startup: embedding model warm")
+        except Exception as e:
+            _logger.warning("embedding warmup failed: %s", e)
+
+        _logger.info("startup: warming up OpenAI client...")
+        try:
+            from app.services.llm.gpt4o_mini import GPT4OMiniService
+            await GPT4OMiniService().generate("ping", "ok", max_tokens=5)
+            _logger.info("startup: OpenAI client warm")
+        except Exception as e:
+            _logger.warning("OpenAI warmup failed: %s", e)
+
+        if dummy_emb:
+            _logger.info("startup: warming up ChromaDB per-tenant...")
+            try:
+                import asyncpg
+                from app.services.rag.chroma import ChromaRAGService
+                rag = ChromaRAGService()
+                conn = await asyncpg.connect(settings.database_url)
+                try:
+                    rows = await conn.fetch("SELECT id FROM tenants")
+                finally:
+                    await conn.close()
+                warmed = 0
+                for r in rows:
+                    tid = str(r["id"])
+                    try:
+                        await rag.search_with_meta(dummy_emb, tid, top_k=1)
+                        warmed += 1
+                    except Exception as e:
+                        _logger.warning("ChromaDB warmup failed tenant=%s: %s", tid[:8], e)
+                _logger.info("startup: ChromaDB warm (%d/%d tenants)", warmed, len(rows))
+            except Exception as e:
+                _logger.warning("ChromaDB warmup failed: %s", e)
+    else:
+        _logger.info("startup: warmup disabled (WARMUP_ENABLED=false)")
+
     yield
 
 

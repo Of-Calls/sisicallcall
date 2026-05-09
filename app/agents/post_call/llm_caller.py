@@ -229,8 +229,12 @@ class PostCallOpenAIService(BaseLLMService):
             raise RuntimeError("OPENAI_API_KEY is required for POST_CALL_LLM_MODE=real")
         if self._client is None:
             from openai import AsyncOpenAI  # noqa: PLC0415
+            from app.services.llm._http import get_openai_http_client
 
-            self._client = AsyncOpenAI(api_key=self._api_key())
+            self._client = AsyncOpenAI(
+                api_key=self._api_key(),
+                http_client=get_openai_http_client(),
+            )
         return self._client
 
     async def generate(

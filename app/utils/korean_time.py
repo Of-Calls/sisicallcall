@@ -142,6 +142,31 @@ def extract_absolute_datetime(
     return datetime(target_date.year, target_date.month, target_date.day, hour, minute)
 
 
+def extract_absolute_date_only(
+    text: str, today: date | None = None
+) -> date | None:
+    """한국어 상대 날짜 표현에서 절대 date 만 추출 (시간 정보 X 도 OK).
+
+    extract_absolute_datetime 의 시간-제외 변형. 시간 표현 없는 발화 ("다음주
+    화요일") 에서도 날짜를 코드로 결정적 변환하기 위함. query_refine 후처리가
+    datetime 매칭 실패 시 fallback 으로 사용.
+    """
+    if today is None:
+        today = date.today()
+
+    text = _normalize_korean_hour(text)
+
+    weekday_m = _WEEK_WEEKDAY_RE.search(text)
+    if weekday_m:
+        return _resolve_week_weekday(
+            weekday_m.group(1), _WEEKDAY_NUM[weekday_m.group(2)], today
+        )
+    rel_m = _RELATIVE_DAY_RE.search(text)
+    if rel_m:
+        return _resolve_relative_day(rel_m.group(1), today)
+    return None
+
+
 def _hour_label(hour: int) -> tuple[str, int]:
     """24h → (한국어 라벨, 12h-style hour).
 

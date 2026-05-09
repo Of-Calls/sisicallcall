@@ -19,7 +19,7 @@ from app.services.speaker_verify import get_speaker_verify_service
 from app.services.stt.deepgram import DeepgramSTTService
 from app.services.tenant import DEFAULT_INDUSTRY, DEFAULT_NAME, get_greeting, get_tenant_meta, resolve_tenant_id
 from app.services.tts.azure import AzureTTSService
-from app.services.tts.filler import pick_filler
+from app.services.tts.filler import pick_filler, pick_filler_continuation
 from app.services.vad.silero_vad import SileroVADService
 from app.utils.config import settings
 
@@ -40,7 +40,7 @@ _twilio_rest = (
 _GRAPH_ENABLED = os.getenv("GRAPH_INTEGRATION_ENABLED", "false").lower() in ("1", "true", "yes")
 
 _VAD_FRAME_BYTES = 1024     # linear16 16kHz, 512 samples
-_SILENCE_THRESHOLD = 50     # 연속 침묵 VAD 프레임 수 (~1600ms)
+_SILENCE_THRESHOLD = 45     # 연속 침묵 VAD 프레임 수 (~1440ms)
 _TWILIO_CHUNK_BYTES = 160   # 20ms mulaw 8kHz — Twilio 권장 단위
 
 
@@ -61,6 +61,19 @@ def _intent_to_response_path(intent: str | None) -> str | None:
     return None
 
 
+async def _warmup_openai_for_incoming() -> None:
+    """incoming POST 시점에 OpenAI connection 워밍 — production idle 후 첫 통화 대응.
+    startup 워밍은 5분 keepalive 만료 시 무효화되므로, 매 통화마다 fire-and-forget 으로
+    재워밍. 첫 LLM 호출 (~12-19초 후) 까지 connection hot 보장.
+    """
+    try:
+        from app.services.llm.gpt4o_mini import GPT4OMiniService
+        await GPT4OMiniService().generate("ping", "ok", max_tokens=5)
+        print("[WARMUP] OpenAI connection warmed for incoming call")
+    except Exception as e:
+        print(f"[WARMUP] OpenAI warmup failed: {e}")
+
+
 @router.post("/incoming")
 async def incoming_call(request: Request):
     form = await request.form()
@@ -71,6 +84,10 @@ async def incoming_call(request: Request):
     # SIP URI / e164 / single digit 모두 처리 — 매칭 실패 시 raw 값 반환됨 (UUID 아님 → echo).
     tenant_id = await resolve_tenant_id(to_field)
     print(f"[INCOMING] to={to_field!r} caller={caller_number!r} call_sid={twilio_call_sid!r} tenant_id={tenant_id!r}")
+
+    # OpenAI connection 워밍 fire-and-forget — 첫 LLM 호출 (~12-19s 후) 까지 hot 보장.
+    if settings.warmup_enabled:
+        asyncio.create_task(_warmup_openai_for_incoming())
 
     host = request.headers.get("host", "")
     ws_url = f"wss://{host}/call/ws"
@@ -136,7 +153,10 @@ async def _run_conversational_graph(
     should_hangup = bool(result.get("should_hangup", False))
     print(f"[GRAPH] intent={graph_intent} resp='{graph_resp[:60]}' hangup={should_hangup} ({graph_ms:.0f}ms)")
     if graph_resp:
+        print("[DIAG] append_turn 시작")
         await _session.append_turn(call_id, transcript, graph_resp)
+        print("[DIAG] append_turn 끝")
+    print("[DIAG] _run_conversational_graph return")
     return graph_resp, graph_intent, should_hangup
 
 
@@ -345,13 +365,32 @@ async def call_ws(websocket: WebSocket):
                                     except Exception as exc:
                                         print(f"[FILLER] 송출 실패 (continue): {exc}")
 
+                                # 2단계 filler — filler 1 끝났는데 graph 아직 진행 중이면
+                                # 짧은 자연 호흡 갭 (~2.2s) 후 추가 송출. graph 가 빠르면 skip
+                                # 으로 응답 지연 방지. silence 분산으로 체감 latency ↓.
+                                if graph_task is not None and not graph_task.done():
+                                    await asyncio.sleep(2.2)
+                                    if not graph_task.done():
+                                        filler2 = pick_filler_continuation()
+                                        if filler2:
+                                            is_speaking = True
+                                            try:
+                                                await _send_audio_to_twilio(websocket, stream_sid, filler2)
+                                                filler2_play = len(filler2) / 8000
+                                                await asyncio.sleep(filler2_play)
+                                                print(f"[FILLER2] 재생 끝 ({filler2_play:.2f}s)")
+                                            except Exception as exc:
+                                                print(f"[FILLER2] 송출 실패 (continue): {exc}")
+
                                 # graph 결과 await — 실패/empty 시 echo fallback
                                 response_text = transcript
                                 graph_intent: str | None = None
                                 should_hangup = False
                                 if graph_task is not None:
+                                    print("[DIAG] graph_task await 진입")
                                     try:
                                         graph_resp, graph_intent, should_hangup = await graph_task
+                                        print("[DIAG] graph_task await 복귀")
                                         if graph_resp:
                                             response_text = graph_resp
                                         else:
@@ -362,6 +401,7 @@ async def call_ws(websocket: WebSocket):
                                 # Stage 4c-2 — transcripts INSERT 양방향 (TTS 송출 전).
                                 # DB 실패해도 통화 지속 (DB 누락만, traceback 명시).
                                 if db_call_id:
+                                    print("[DIAG] transcripts INSERT 시작")
                                     try:
                                         await insert_transcript(
                                             db_call_id, turn_index, "customer", transcript,
@@ -371,12 +411,14 @@ async def call_ws(websocket: WebSocket):
                                             response_path=_intent_to_response_path(graph_intent),
                                         )
                                         turn_index += 1
+                                        print("[DIAG] transcripts INSERT 끝")
                                     except Exception as exc:
                                         print(f"[DB] transcripts INSERT 실패 (통화 지속): {type(exc).__name__}: {exc}")
                                         traceback.print_exc()
 
                                 # TTS synth — 실패 시 polite fallback 멘트로 1회 재시도, 그것도 실패면 silent skip.
                                 tts_audio = b""
+                                print("[DIAG] TTS synth 진입 직전")
                                 try:
                                     t_tts = time.perf_counter()
                                     tts_audio = await _tts.synthesize(response_text)
