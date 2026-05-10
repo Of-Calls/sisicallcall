@@ -58,8 +58,8 @@
   <h2>신분증 OCR</h2>
   <p class="subtitle" id="auth-id-label"></p>
   <p class="hint" style="margin-bottom:12px">
-    이 페이지는 <b>신분증 OCR 인증 페이지</b>입니다. 신분증을 네모칸에 맞추면 자동 촬영 후 OCR을 수행하고,
-    결과가 서버 로그에 출력됩니다.
+    이 페이지는 <b>신분증 인증</b> 화면입니다. 신분증을 네모 안에 맞추면 화면에서 안내하는
+    조건이 충족될 때 자동으로 촬영·인증이 진행됩니다.
   </p>
 
   <div class="step active" id="step-ocr">
@@ -71,8 +71,7 @@
       <div class="roi-profile-box" id="roi-profile-box">OCR ROI</div>
     </div>
     <canvas id="ocr-canvas" style="display:none"></canvas>
-    <div class="ocr-msg" id="ocr-quality-msg">카메라 준비 중...</div>
-    <button class="btn-blue" id="btn-ocr-manual" onclick="captureOcrAndSend()">수동 촬영 (Fallback)</button>
+    <div class="ocr-msg" id="ocr-quality-msg">카드를 네모 안에 맞춰주세요</div>
     <pre id="ocr-result" style="font-size:11px;color:#777;margin-top:8px;white-space:pre-wrap"></pre>
     <p class="hint" id="next-hint" style="display:none">
       신분증 인식이 끝났습니다. 이어서
@@ -89,6 +88,8 @@ const authId = (() => {
   return m ? m[1] : null;
 })();
 const base = '';
+const MSG_ALIGN_CARD = '카드를 네모 안에 맞춰주세요';
+const MSG_AUTH_IN_PROGRESS = '인증 중입니다..';
 document.getElementById('auth-id-label').textContent = 'session: ' + authId;
 const faceLinkEl = document.getElementById('face-link');
 if (faceLinkEl && authId) {
@@ -140,7 +141,7 @@ async function startOcrCamera() {
       video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } },
     });
     video.srcObject = _ocrStream;
-    setOcrMsg('카드를 네모 안에 맞춰주세요');
+    setOcrMsg(MSG_ALIGN_CARD);
     _ocrChecking = true;
     _ocrTimer = setInterval(runOcrQualityCheck, 700);
     setStatus('촬영 준비됨');
@@ -161,6 +162,22 @@ function stopOcrCamera() {
   if (_ocrStream) {
     _ocrStream.getTracks().forEach(function (t) { t.stop(); });
     _ocrStream = null;
+  }
+  const video = document.getElementById('ocr-video');
+  if (video) video.srcObject = null;
+}
+
+/** 수동 촬영 없이 재시도: 카메라를 다시 켜고 임계값 충족 시에만 자동 전송 */
+async function resumeOcrAfterFailure(statusDetail) {
+  _ocrCaptured = false;
+  _ocrReadyFrames = 0;
+  stopOcrCamera();
+  setStatus(statusDetail || '촬영을 다시 준비합니다...');
+  try {
+    await startOcrCamera();
+  } catch (e) {
+    setOcrMsg('카메라를 다시 켤 수 없습니다: ' + e.message);
+    setStatus('HTTPS 및 권한을 확인해주세요');
   }
 }
 
@@ -287,21 +304,21 @@ function runOcrQualityCheck() {
   const brightness = sumL / (w * h);
   if (brightness < 70) {
     _ocrReadyFrames = 0;
-    setOcrMsg('너무 어두워요');
+    setOcrMsg(MSG_ALIGN_CARD);
     return;
   }
 
   const reflectionRatio = brightCount / (w * h);
   if (reflectionRatio > 0.12) {
     _ocrReadyFrames = 0;
-    setOcrMsg('빛 반사가 있어요');
+    setOcrMsg(MSG_ALIGN_CARD);
     return;
   }
 
   const blurVar = calcBlurMetric(gray, w, h);
   if (blurVar < 55) {
     _ocrReadyFrames = 0;
-    setOcrMsg('이미지가 흐려요');
+    setOcrMsg(MSG_ALIGN_CARD);
     return;
   }
 
@@ -315,7 +332,7 @@ function runOcrQualityCheck() {
   const y2 = Math.min(h, Math.floor((guideRect.bottom - videoRect.top) * scaleY));
   if (x2 <= x1 || y2 <= y1) {
     _ocrReadyFrames = 0;
-    setOcrMsg('가이드 박스를 다시 확인해주세요');
+    setOcrMsg(MSG_ALIGN_CARD);
     return;
   }
 
@@ -323,7 +340,7 @@ function runOcrQualityCheck() {
   _lastGuideAlignment = alignment;
   if (!alignment.pass) {
     _ocrReadyFrames = 0;
-    setOcrMsg('신분증을 네모칸에 맞춰주세요');
+    setOcrMsg(MSG_ALIGN_CARD);
     return;
   }
 
@@ -341,18 +358,19 @@ function runOcrQualityCheck() {
   // 네모칸 판정만 완화: 약간의 공백이 있어도 통과.
   if (edgeRatio < 0.03) {
     _ocrReadyFrames = 0;
-    setOcrMsg('카드를 네모 안에 맞춰주세요');
+    setOcrMsg(MSG_ALIGN_CARD);
     return;
   }
 
   _ocrReadyFrames += 1;
-  setOcrMsg('품질 양호 — 자동 촬영 준비 중...');
+  setOcrMsg(MSG_ALIGN_CARD);
   if (_ocrReadyFrames >= 3) {
-    captureOcrAndSend();
+    captureOcrAndSendFromQualityGate();
   }
 }
 
-async function captureOcrAndSend() {
+/** 품질 검사에서 연속 프레임 임계값을 통과했을 때만 호출 — 수동 트리거 없음 */
+async function captureOcrAndSendFromQualityGate() {
   if (_ocrCaptured) return;
   if (!authId) {
     setOcrMsg('세션 ID가 없습니다. 문자 링크로 다시 열어주세요.');
@@ -360,19 +378,18 @@ async function captureOcrAndSend() {
   }
   if (!_ocrStream) {
     await startOcrCamera();
-    setOcrMsg('카메라가 다시 켜졌어요. 신분증을 네모 안에 맞춘 뒤 다시 눌러주세요.');
     return;
   }
   const video = document.getElementById('ocr-video');
   if (!video.videoWidth || !video.videoHeight) {
-    setOcrMsg('카메라 준비가 아직 안 됐어요');
+    setOcrMsg(MSG_ALIGN_CARD);
     return;
   }
   _ocrCaptured = true;
   _ocrChecking = false;
   if (_ocrTimer) clearInterval(_ocrTimer);
-  setOcrMsg('인증 중입니다..');
-  setStatus('인증 중입니다.. 잠시만 기다려주세요.');
+  setOcrMsg(MSG_AUTH_IN_PROGRESS);
+  setStatus('인증 중입니다.. 잠시만 기다려 주세요.');
 
   const canvas = document.getElementById('ocr-canvas');
   const ctx = canvas.getContext('2d');
@@ -383,9 +400,7 @@ async function captureOcrAndSend() {
 
   canvas.toBlob(async (blob) => {
     if (!blob) {
-      setOcrMsg('촬영 이미지 생성 실패');
-      setStatus('재시도하려면 수동 촬영 버튼을 눌러주세요.');
-      _ocrCaptured = false;
+      await resumeOcrAfterFailure('이미지를 만들지 못했습니다. 다시 맞춰 주세요.');
       return;
     }
     const form = new FormData();
@@ -413,16 +428,15 @@ async function captureOcrAndSend() {
         document.getElementById('next-hint').style.display = 'block';
         setStatus('인증 완료');
       } else {
-        setOcrMsg(data.reason ? ('재시도 필요: ' + data.reason) : '재시도 필요');
-        setStatus('재시도하려면 수동 촬영 버튼을 눌러주세요.');
-        _ocrCaptured = false;
-        _ocrReadyFrames = 0;
+        await resumeOcrAfterFailure(
+          data.reason ? ('인증에 실패했습니다. ' + data.reason) : '인증에 실패했습니다. 다시 맞춰 주세요.'
+        );
       }
     } catch (e) {
-      const msg = e.name === 'AbortError' ? 'OCR 요청 시간이 초과되었습니다' : ('OCR 요청 실패: ' + e.message);
-      setOcrMsg(msg);
-      setStatus('재시도하려면 수동 촬영 버튼을 눌러주세요.');
-      _ocrCaptured = false;
+      const detail = e.name === 'AbortError'
+        ? '인증 처리 시간이 초과되었습니다. 다시 맞춰 주세요.'
+        : ('일시적인 오류가 발생했습니다. (' + e.message + ')');
+      await resumeOcrAfterFailure(detail);
     } finally {
       clearTimeout(timeoutId);
     }

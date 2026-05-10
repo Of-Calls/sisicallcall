@@ -22,7 +22,7 @@ from app.api.v1 import (
     vision,
 )
 from app.api.v1.oauth import router as oauth_router
-from app.services.embedding import get_embedder
+# from app.services.embedding import get_embedder  # 임시: startup 임베딩 로드 끔
 from app.utils.config import settings
 from app.utils.logger import get_logger
 
@@ -56,13 +56,14 @@ async def lifespan(app: FastAPI):
     # Cold start warmup — Qwen3 첫 inference / OpenAI httpx / ChromaDB per-tenant.
     # 첫 통화 첫 turn latency ~2.3s 단축. fail-tolerant — 워밍 실패해도 startup 진행.
     if settings.warmup_enabled:
-        _logger.info("startup: warming up embedding model (first inference)...")
         dummy_emb: list[float] | None = None
-        try:
-            dummy_emb = await get_embedder().embed_query("warmup")
-            _logger.info("startup: embedding model warm")
-        except Exception as e:
-            _logger.warning("embedding warmup failed: %s", e)
+        # 임시: 기동 시 임베딩 모델 로드·워밍업 생략 (첫 RAG/FAQ 요청 시 lazy load)
+        # _logger.info("startup: warming up embedding model (first inference)...")
+        # try:
+        #     dummy_emb = await get_embedder().embed_query("warmup")
+        #     _logger.info("startup: embedding model warm")
+        # except Exception as e:
+        #     _logger.warning("embedding warmup failed: %s", e)
 
         _logger.info("startup: warming up OpenAI client...")
         try:
