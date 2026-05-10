@@ -1,11 +1,32 @@
+"""
+MCPActionLogRepository — Postgres `mcp_action_logs` 백엔드.
+
+운영 모드는 db 단일. memory / file 백엔드는 제거됐다 — 운영 데이터의 단일 진실
+소스는 Postgres 다 (TenantIntegrationRepository 와 동일 패턴).
+
+연결 정보는 ``settings.database_url`` 사용 (asyncpg). 환경변수 ``MCP_ACTION_LOG_STORE``
+``MCP_ACTION_LOG_FILE`` 등은 더 이상 사용되지 않는다.
+
+── DB 스키마 ──────────────────────────────────────────────────────────────────
+db/init/09_mcp_action_logs.sql 참조:
+  id (UUID PK), call_id, tenant_id, action_type, tool_name,
+  request_payload (JSONB), response_payload (JSONB),
+  status, external_id, error_message, created_at, updated_at
+
+idempotency 정책:
+- application-level: ``find_successful_action(call_id, action_type, tool, idempotency_token?)``
+  이 SELECT 로 성공 row 를 찾고 executor 가 skip 처리.
+- token 이 주어지면 ``request_payload->>'idempotency_token'`` JSONB 매치도 함께
+  적용 — 같은 action_type 이라도 의도가 다르면 별개로 인식됨 (다중 의도 통화).
+- DB UNIQUE 제약은 없음. 동시 호출 시 race 가능성은 application-level 의 한계로
+  남기고, executor 가 sequential 처리하므로 실제 발생 빈도 낮음.
+"""
 from __future__ import annotations
 
 import copy
 import json
-import os
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
 
 import asyncpg
 
@@ -14,18 +35,7 @@ from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# ── In-memory store ───────────────────────────────────────────────────────────
-
-_DEFAULT_STORE_PATH = Path(".local/mcp_action_logs.json")
-_action_store: dict[str, list[dict]] = {}   # call_id → [log_entry, ...]
-
 _VALID_STATUSES = frozenset({"success", "failed", "fail", "skipped", "pending"})
-_STORE_MODE_FILE = "file"
-_STORE_MODE_DB = "db"
-
-
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _now_dt() -> datetime:
@@ -43,29 +53,6 @@ def _coerce_datetime(value) -> datetime:
         except ValueError:
             return _now_dt()
     return _now_dt()
-
-
-def _json_safe(value):
-    if isinstance(value, datetime):
-        return value.isoformat().replace("+00:00", "Z")
-    if isinstance(value, dict):
-        return {k: _json_safe(v) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_json_safe(v) for v in value]
-    return value
-
-
-def _get_store_path() -> Path:
-    return Path(os.getenv("MCP_ACTION_LOG_FILE", str(_DEFAULT_STORE_PATH)))
-
-
-def _get_store_mode() -> str:
-    mode = os.getenv("MCP_ACTION_LOG_STORE", _STORE_MODE_FILE).strip().lower()
-    if mode == _STORE_MODE_DB:
-        return _STORE_MODE_DB
-    if mode != _STORE_MODE_FILE:
-        logger.warning("unknown MCP_ACTION_LOG_STORE=%s; falling back to file", mode)
-    return _STORE_MODE_FILE
 
 
 def _database_url() -> str:
@@ -118,67 +105,23 @@ def _row_to_log_entry(row) -> dict:
     }
 
 
-def _load_store_from_file() -> dict[str, list[dict]]:
-    path = _get_store_path()
-    if not path.exists():
-        return {}
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        logger.warning("mcp_action_logs file load failed path=%s err=%s", path, exc)
-        return {}
-    if not isinstance(raw, dict):
-        logger.warning("mcp_action_logs file ignored path=%s reason=not_dict", path)
-        return {}
-    store: dict[str, list[dict]] = {}
-    for call_id, entries in raw.items():
-        if isinstance(call_id, str) and isinstance(entries, list):
-            store[call_id] = [
-                copy.deepcopy(entry)
-                for entry in entries
-                if isinstance(entry, dict)
-            ]
-    return store
-
-
-def _save_store_to_file(store: dict[str, list[dict]]) -> None:
-    path = _get_store_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    # TODO: replace local file mode with a DB-backed action log before production.
-    # Local demo mode intentionally avoids file locking.
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    tmp_path.write_text(
-        json.dumps(_json_safe(store), ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    tmp_path.replace(path)
-
-
-def _load_into_memory() -> None:
-    for call_id, entries in _load_store_from_file().items():
-        _action_store[call_id] = entries
-
-
-def _reset(remove_file: bool = False) -> None:
-    """테스트 격리용."""
-    _action_store.clear()
-    if remove_file:
-        path = _get_store_path()
-        if path.exists():
-            path.unlink()
-
-
 def _to_log_entry(action: dict, *, call_id: str, tenant_id: str, now: datetime) -> dict:
     status = action.get("status", "pending")
     if status not in _VALID_STATUSES:
         status = "pending"
+    request_payload = copy.deepcopy(action.get("params", {})) or {}
+    # idempotency_token 은 action 의 top-level 메타 — request_payload 에 mirror 해서
+    # find_successful_action(...token) 의 JSONB 매치가 동작하도록 한다.
+    token = action.get("idempotency_token")
+    if token and isinstance(request_payload, dict):
+        request_payload.setdefault("idempotency_token", str(token))
     return {
         "id": str(uuid.uuid4()),
         "call_id": call_id,
         "tenant_id": tenant_id,
         "action_type": action.get("action_type", ""),
         "tool_name": action.get("tool", ""),
-        "request_payload": copy.deepcopy(action.get("params", {})),
+        "request_payload": request_payload,
         "response_payload": copy.deepcopy(action.get("result", {})),
         "status": status,
         "external_id": action.get("external_id"),
@@ -188,22 +131,14 @@ def _to_log_entry(action: dict, *, call_id: str, tenant_id: str, now: datetime) 
     }
 
 
-# ── Module-level functions (KDT-77 interface) ─────────────────────────────────
+def _normalize_tenant_id(tenant_id: str | None, call_id: str) -> str:
+    if tenant_id:
+        return str(tenant_id)
+    logger.warning("action_logs save without tenant_id call_id=%s", call_id)
+    return ""
 
-def _with_log_id(entry: dict) -> dict:
-    out = copy.deepcopy(entry)
-    if not out.get("id"):
-        key = ":".join([
-            "mcp-action",
-            str(out.get("call_id") or ""),
-            str(out.get("tenant_id") or ""),
-            str(out.get("action_type") or ""),
-            str(out.get("tool_name") or ""),
-            str(out.get("created_at") or ""),
-        ])
-        out["id"] = str(uuid.uuid5(uuid.NAMESPACE_URL, key))
-    return out
 
+# ── 모듈 레벨 인터페이스 — db only ───────────────────────────────────────────
 
 async def save_action_logs(
     call_id: str,
@@ -212,33 +147,6 @@ async def save_action_logs(
 ) -> None:
     tenant_id = _normalize_tenant_id(tenant_id, call_id)
     executed_actions = executed_actions or []
-    if _get_store_mode() == _STORE_MODE_DB:
-        await _save_action_logs_to_db(call_id, tenant_id, executed_actions)
-        return
-
-    _load_into_memory()
-    now = _now_dt()
-    entries = [
-        _to_log_entry(a, call_id=call_id, tenant_id=tenant_id, now=now)
-        for a in executed_actions
-    ]
-    _action_store.setdefault(call_id, []).extend(entries)
-    _save_store_to_file(_action_store)
-    logger.debug("action_logs saved call_id=%s count=%d", call_id, len(entries))
-
-
-def _normalize_tenant_id(tenant_id: str | None, call_id: str) -> str:
-    if tenant_id:
-        return str(tenant_id)
-    logger.warning("action_logs save without tenant_id call_id=%s", call_id)
-    return ""
-
-
-async def _save_action_logs_to_db(
-    call_id: str,
-    tenant_id: str,
-    executed_actions: list[dict],
-) -> None:
     now = _now_dt()
     entries = [
         _to_log_entry(a, call_id=call_id, tenant_id=tenant_id, now=now)
@@ -290,54 +198,63 @@ async def find_successful_action(
     call_id: str,
     action_type: str,
     tool: str,
+    idempotency_token: str | None = None,
 ) -> dict | None:
-    if _get_store_mode() == _STORE_MODE_DB:
-        return await _find_successful_action_from_db(call_id, action_type, tool)
+    """동일 (call_id, action_type, tool) 의 성공 row 조회.
 
-    _load_into_memory()
-    entries = _action_store.get(call_id, [])
-    for entry in reversed(entries):
-        if (
-            entry.get("action_type") == action_type
-            and entry.get("tool_name") == tool
-            and entry.get("status") == "success"
-        ):
-            return copy.deepcopy(entry)
-    return None
-
-
-async def _find_successful_action_from_db(
-    call_id: str,
-    action_type: str,
-    tool: str,
-) -> dict | None:
+    idempotency_token 이 주어지면 ``request_payload->>'idempotency_token'`` JSONB
+    매치도 함께 적용 (다중 의도: 같은 action_type 이라도 token 이 다르면 별개).
+    None 이면 (call_id, action_type, tool) 3-tuple 만 매칭.
+    """
     conn = None
     try:
         conn = await asyncpg.connect(_database_url())
-        row = await conn.fetchrow(
-            """
-            SELECT id, call_id, tenant_id, action_type, tool_name,
-                   request_payload, response_payload, status,
-                   external_id, error_message, created_at, updated_at
-            FROM mcp_action_logs
-            WHERE call_id = $1
-              AND action_type = $2
-              AND tool_name = $3
-              AND status = 'success'
-            ORDER BY created_at DESC
-            LIMIT 1
-            """,
-            call_id,
-            action_type,
-            tool,
-        )
+        if idempotency_token is None:
+            row = await conn.fetchrow(
+                """
+                SELECT id, call_id, tenant_id, action_type, tool_name,
+                       request_payload, response_payload, status,
+                       external_id, error_message, created_at, updated_at
+                FROM mcp_action_logs
+                WHERE call_id = $1
+                  AND action_type = $2
+                  AND tool_name = $3
+                  AND status = 'success'
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                call_id,
+                action_type,
+                tool,
+            )
+        else:
+            row = await conn.fetchrow(
+                """
+                SELECT id, call_id, tenant_id, action_type, tool_name,
+                       request_payload, response_payload, status,
+                       external_id, error_message, created_at, updated_at
+                FROM mcp_action_logs
+                WHERE call_id = $1
+                  AND action_type = $2
+                  AND tool_name = $3
+                  AND status = 'success'
+                  AND request_payload->>'idempotency_token' = $4
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                call_id,
+                action_type,
+                tool,
+                idempotency_token,
+            )
         return _row_to_log_entry(row) if row is not None else None
     except Exception as exc:
         logger.warning(
-            "action_logs db find_successful failed call_id=%s action_type=%s tool=%s err=%s",
+            "action_logs db find_successful failed call_id=%s action_type=%s tool=%s token=%s err=%s",
             call_id,
             action_type,
             tool,
+            idempotency_token,
             exc,
         )
         return None
@@ -347,32 +264,6 @@ async def _find_successful_action_from_db(
 
 
 async def get_action_logs_by_call_id(call_id: str) -> list[dict]:
-    if _get_store_mode() == _STORE_MODE_DB:
-        return await _get_action_logs_by_call_id_from_db(call_id)
-
-    _load_into_memory()
-    entries = _action_store.get(call_id, [])
-    return [_with_log_id(entry) for entry in entries]
-
-
-async def get_action_logs_by_call_id_for_tenant(
-    call_id: str,
-    tenant_id: str,
-) -> list[dict]:
-    if _get_store_mode() == _STORE_MODE_DB:
-        return await _get_action_logs_by_call_id_for_tenant_from_db(call_id, tenant_id)
-
-    _load_into_memory()
-    entries = _action_store.get(call_id, [])
-    normalized_tenant_id = str(tenant_id).lower()
-    return [
-        _with_log_id(entry)
-        for entry in entries
-        if str(entry.get("tenant_id") or "").lower() == normalized_tenant_id
-    ]
-
-
-async def _get_action_logs_by_call_id_from_db(call_id: str) -> list[dict]:
     conn = None
     try:
         conn = await asyncpg.connect(_database_url())
@@ -396,7 +287,7 @@ async def _get_action_logs_by_call_id_from_db(call_id: str) -> list[dict]:
             await conn.close()
 
 
-async def _get_action_logs_by_call_id_for_tenant_from_db(
+async def get_action_logs_by_call_id_for_tenant(
     call_id: str,
     tenant_id: str,
 ) -> list[dict]:
@@ -431,32 +322,6 @@ async def _get_action_logs_by_call_id_for_tenant_from_db(
 
 
 async def get_action_logs(
-    tenant_id: str | None = None,
-    started_from: str | None = None,
-    started_to: str | None = None,
-) -> list[dict]:
-    if _get_store_mode() == _STORE_MODE_DB:
-        return await _get_action_logs_from_db(
-            tenant_id=tenant_id,
-            started_from=started_from,
-            started_to=started_to,
-        )
-
-    _load_into_memory()
-    all_logs: list[dict] = []
-    for entries in _action_store.values():
-        all_logs.extend(copy.deepcopy(entries))
-
-    if tenant_id is not None:
-        all_logs = [e for e in all_logs if e.get("tenant_id") == tenant_id]
-    if started_from is not None:
-        all_logs = [e for e in all_logs if e.get("created_at", "") >= started_from]
-    if started_to is not None:
-        all_logs = [e for e in all_logs if e.get("created_at", "") <= started_to]
-    return all_logs
-
-
-async def _get_action_logs_from_db(
     tenant_id: str | None = None,
     started_from: str | None = None,
     started_to: str | None = None,
@@ -500,6 +365,14 @@ async def _get_action_logs_from_db(
 # ── Backward-compatible class interface (used by save_result_node) ────────────
 
 class MCPActionLogRepository:
+    """모듈 함수 wrapper. 인스턴스 생성에 별도 인자가 필요 없다.
+
+    ``settings.database_url`` 만 유효하면 동작한다.
+    """
+
+    def __init__(self) -> None:
+        logger.info("MCPActionLogRepo db mode")
+
     async def save_action_log(
         self,
         call_id: str,

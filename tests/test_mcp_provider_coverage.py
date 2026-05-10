@@ -155,7 +155,7 @@ def test_executor_routes_each_provider_to_correct_mcp_tool(
         lambda: gateway,
     )
 
-    async def _no_idem(*, call_id, action_type, tool):
+    async def _no_idem(*, call_id, action_type, tool, idempotency_token=None):
         return None
     monkeypatch.setattr(
         "app.agents.post_call.actions.executor.find_successful_action", _no_idem,
@@ -192,14 +192,41 @@ async def test_response_payload_carries_provider_metadata(
     monkeypatch, tmp_path, tool, action_type, expected,
 ):
     """provider 별 executed_action[] 을 mcp_action_logs 에 저장 후 response_payload
-    의 metadata 가 손실 없이 보존됨을 검증한다."""
-    monkeypatch.setenv("MCP_ACTION_LOG_STORE", "file")
-    monkeypatch.setenv(
-        "MCP_ACTION_LOG_FILE",
-        str(tmp_path / f"action_logs_{tool}_{action_type}.json"),
-    )
+    의 metadata 가 손실 없이 보존됨을 검증한다.
+
+    mcp_action_log_repo 가 db-only 로 단순화돼 asyncpg.connect 를 fake 로 패치한다.
+    """
     import app.repositories.mcp_action_log_repo as action_mod
-    action_mod._reset(remove_file=True)
+
+    rows: list[dict] = []
+
+    class _FakeConn:
+        async def execute(self, sql, *args):
+            if "INSERT INTO mcp_action_logs" in sql:
+                rows.append({
+                    "call_id": args[0],
+                    "tenant_id": args[1],
+                    "action_type": args[2],
+                    "tool_name": args[3],
+                    "request_payload": args[4],
+                    "response_payload": args[5],
+                    "status": args[6],
+                    "external_id": args[7],
+                    "error_message": args[8],
+                    "created_at": args[9],
+                    "updated_at": args[10],
+                })
+
+        async def fetch(self, sql, *args):
+            return [r for r in rows if r["call_id"] == args[0]]
+
+        async def close(self):
+            return None
+
+    async def _fake_connect(url):
+        return _FakeConn()
+
+    monkeypatch.setattr(action_mod.asyncpg, "connect", _fake_connect)
 
     call_id = f"call-{tool}-{action_type}"
     actions = [{
@@ -231,8 +258,6 @@ async def test_response_payload_carries_provider_metadata(
     assert payload["execution_mode"] == "mcp"
     assert payload["mcp_tool"] == expected
     assert payload["mcp_latency_ms"] == 7
-
-    action_mod._reset(remove_file=True)
 
 
 # ── 5. Post-call action package 에서 direct handler/registry 자취가 없다 ────

@@ -66,18 +66,51 @@ def _set_current_tenant(tenant_id: str = DEFAULT_TENANT_ID) -> None:
 
 # ── Store 격리 픽스처 ─────────────────────────────────────────────────────────
 
+# mcp_action_log 는 db-only — 테스트는 module-level row buffer 에 직접 append 후
+# asyncpg.connect 를 fake 로 패치해 SELECT 가 buffer 를 돌려주게 한다.
+_DASHBOARD_ACTION_LOG_ROWS: list[dict] = []
+
+
 @pytest.fixture(autouse=True)
-def reset_stores():
+def reset_stores(monkeypatch):
     _set_current_tenant()
     summary_mod._reset()
     voc_mod._reset()
-    action_mod._reset()
     dashboard_mod._reset()
+    _DASHBOARD_ACTION_LOG_ROWS.clear()
+
+    class _FakeConn:
+        async def execute(self, sql, *args):
+            if "INSERT INTO mcp_action_logs" in sql:
+                _DASHBOARD_ACTION_LOG_ROWS.append({
+                    "call_id": args[0], "tenant_id": args[1],
+                    "action_type": args[2], "tool_name": args[3],
+                    "request_payload": args[4], "response_payload": args[5],
+                    "status": args[6], "external_id": args[7],
+                    "error_message": args[8],
+                    "created_at": args[9], "updated_at": args[10],
+                })
+            return "INSERT 0 1"
+
+        async def fetch(self, sql, *args):
+            return [r for r in _DASHBOARD_ACTION_LOG_ROWS
+                    if not args or r["call_id"] == args[0]]
+
+        async def fetchrow(self, sql, *args):
+            return None
+
+        async def close(self): return None
+
+    async def _fake_connect(url):
+        return _FakeConn()
+
+    monkeypatch.setattr(action_mod.asyncpg, "connect", _fake_connect)
+
     yield
     summary_mod._reset()
     voc_mod._reset()
-    action_mod._reset()
     dashboard_mod._reset()
+    _DASHBOARD_ACTION_LOG_ROWS.clear()
     _set_current_tenant()
 
 
@@ -102,10 +135,11 @@ def _seed_all_samples() -> None:
 
 
 def _seed_action_logs(call_id: str, tenant_id: str, actions: list[dict]) -> None:
+    """db-only 시뮬레이터의 row buffer 에 직접 INSERT 한 것처럼 append."""
     from datetime import datetime, timezone
     now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-    action_mod._action_store[call_id] = [
-        {
+    for a in actions:
+        _DASHBOARD_ACTION_LOG_ROWS.append({
             "call_id": call_id,
             "tenant_id": tenant_id,
             "action_type": a.get("action_type", ""),
@@ -117,9 +151,7 @@ def _seed_action_logs(call_id: str, tenant_id: str, actions: list[dict]) -> None
             "error_message": a.get("error"),
             "created_at": now,
             "updated_at": now,
-        }
-        for a in actions
-    ]
+        })
 
 
 # ── 7. GET /dashboard/stats 성공 ──────────────────────────────────────────────

@@ -67,17 +67,49 @@ _app.dependency_overrides[get_current_admin_user] = _fake_current_admin_user
 
 # ── Store 격리 픽스처 ─────────────────────────────────────────────────────────
 
+# mcp_action_log 는 db-only — _action_store 직접 접근 대신 row buffer + asyncpg fake.
+_API_ACTION_LOG_ROWS: list[dict] = []
+
+
 @pytest.fixture(autouse=True)
-def reset_stores():
+def reset_stores(monkeypatch):
     summary_mod._reset()
     voc_mod._reset()
-    action_mod._reset()
     dashboard_mod._reset()
+    _API_ACTION_LOG_ROWS.clear()
+
+    class _FakeConn:
+        async def execute(self, sql, *args):
+            if "INSERT INTO mcp_action_logs" in sql:
+                _API_ACTION_LOG_ROWS.append({
+                    "call_id": args[0], "tenant_id": args[1],
+                    "action_type": args[2], "tool_name": args[3],
+                    "request_payload": args[4], "response_payload": args[5],
+                    "status": args[6], "external_id": args[7],
+                    "error_message": args[8],
+                    "created_at": args[9], "updated_at": args[10],
+                })
+            return "INSERT 0 1"
+
+        async def fetch(self, sql, *args):
+            return [r for r in _API_ACTION_LOG_ROWS
+                    if not args or r["call_id"] == args[0]]
+
+        async def fetchrow(self, sql, *args):
+            return None
+
+        async def close(self): return None
+
+    async def _fake_connect(url):
+        return _FakeConn()
+
+    monkeypatch.setattr(action_mod.asyncpg, "connect", _fake_connect)
+
     yield
     summary_mod._reset()
     voc_mod._reset()
-    action_mod._reset()
     dashboard_mod._reset()
+    _API_ACTION_LOG_ROWS.clear()
     _ctx_store.clear()
 
 
@@ -119,11 +151,12 @@ def _seed_call_context(call_id: str, tenant_id: str = "default") -> None:
 
 
 def _seed_action_logs(call_id: str, tenant_id: str, actions: list[dict]) -> None:
+    """db-only 시뮬레이터의 row buffer 에 직접 INSERT 한 것처럼 append."""
     from datetime import datetime, timezone
     from uuid import uuid4
 
     now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-    action_mod._action_store[call_id] = [
+    _seeded = [
         {
             "id": str(uuid4()),
             "call_id": call_id,
@@ -140,6 +173,7 @@ def _seed_action_logs(call_id: str, tenant_id: str, actions: list[dict]) -> None
         }
         for a in actions
     ]
+    _API_ACTION_LOG_ROWS.extend(_seeded)
 
 
 def _patch_call_lookup(monkeypatch, *, exists: bool = True, tenant_id: str = "tenant-a") -> None:

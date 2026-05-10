@@ -40,18 +40,18 @@ class ActionExecutor:
             return []
         results: list[dict] = []
         for action in actions:
+            # D-4: ActionItem.priority 가 있으면 params 에 자동 주입 (외부 시스템에 priority 전달 보장).
+            # post-call agent 가 priority 를 ActionItem 에만 두고 params 에서 뺐으므로
+            # connector 가 params 만 보는 경우를 안전하게 커버.
+            normalized = dict(action)
+            if "priority" in normalized:
+                params = dict(normalized.get("params") or {})
+                params.setdefault("priority", normalized["priority"])
+                normalized["params"] = params
             results.append(
-                await self._execute_one(action, call_id=call_id, tenant_id=tenant_id)
+                await self._execute_one(normalized, call_id=call_id, tenant_id=tenant_id)
             )
         return results
-
-    async def execute_all(self, actions: list[dict], *, call_id: str) -> list[dict]:
-        """후방 호환 인터페이스 — action_router_node 가 호출한다."""
-        return await self.execute_actions(
-            call_id=call_id,
-            tenant_id="",
-            actions=actions,
-        )
 
     async def _execute_one(
         self,
@@ -68,19 +68,25 @@ class ActionExecutor:
 
         tool_key = action.get("tool", "")
         action_type = action.get("action_type", "")
+        idempotency_token = action.get("idempotency_token")
 
         # ── idempotency check ───────────────────────────────────────────────
+        # token 이 있으면 (call_id, action_type, tool, token) 4-tuple 매칭 — 같은
+        # action_type 이라도 의도가 다르면 token 이 달라 별개 액션으로 처리됨.
+        # token 이 없으면 (call_id, action_type, tool) 3-tuple — 옛 동작 유지.
         previous = await find_successful_action(
             call_id=call_id,
             action_type=action_type,
             tool=tool_key,
+            idempotency_token=idempotency_token,
         )
         if previous:
             logger.info(
-                "action idempotency skip call_id=%s tool=%s action_type=%s previous_external_id=%s",
+                "action idempotency skip call_id=%s tool=%s action_type=%s token=%s previous_external_id=%s",
                 call_id,
                 tool_key,
                 action_type,
+                idempotency_token,
                 previous.get("external_id"),
             )
             skip_result: dict = {
