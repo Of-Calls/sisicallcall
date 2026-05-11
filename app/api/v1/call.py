@@ -201,6 +201,39 @@ async def call_ws(websocket: WebSocket):
     # 임시 진단 — TTS 송출 중 media 이벤트가 진짜 들어오는지 raw 카운트
     bg_raw_media_count = 0
 
+    async def _handle_clean_disconnect(reason: str) -> None:
+        """WebSocketDisconnect 와 RuntimeError(closed ws) 공통 cleanup.
+
+        reason: 로그 suffix tag ('disconnect' | 'runtime')
+        """
+        if auth_listener_task and not auth_listener_task.done():
+            auth_listener_task.cancel()
+            print(f"[PUSH] listener cancelled ({reason})")
+        if bg_session.active_play_task and not bg_session.active_play_task.done():
+            bg_session.active_play_task.cancel()
+            print(f"[TTS] play_task cancelled ({reason})")
+        if stream_sid:
+            _verifier.cleanup(stream_sid)
+            voiceprint_enrollment.cleanup(stream_sid)
+            if _GRAPH_ENABLED:
+                try:
+                    await _session.clear(stream_sid)
+                except Exception as e:
+                    print(f"[GRAPH] session clear failed: {e}")
+        if db_call_id:
+            duration_sec = int(time.perf_counter() - call_started_at) if call_started_at else None
+            try:
+                await finalize_call(db_call_id, "abandoned", duration_sec)
+                print(f"[DB] finalize_call db_call_id={db_call_id} status=abandoned dur={duration_sec}s")
+            except Exception as e:
+                print(f"[DB] finalize_call failed: {e}")
+                traceback.print_exc()
+            if tenant_id:
+                asyncio.create_task(
+                    run_post_call_agent_safely(db_call_id, "call_ended", tenant_id)
+                )
+                print(f"[POST_CALL] triggered db_call_id={db_call_id} tenant_id={tenant_id}")
+
     try:
         # ── Phase 2/3 inner 함수 — call_ws 의 local closure 캡처 ───────────────
         async def _push_speak(text: str) -> None:
@@ -738,35 +771,17 @@ async def call_ws(websocket: WebSocket):
 
     except WebSocketDisconnect:
         print("[WS] 연결 끊김 (사용자/Twilio)")
-        if auth_listener_task and not auth_listener_task.done():
-            auth_listener_task.cancel()
-            print("[PUSH] listener cancelled (disconnect)")
-        if bg_session.active_play_task and not bg_session.active_play_task.done():
-            bg_session.active_play_task.cancel()
-            print("[TTS] play_task cancelled (disconnect)")
-        if stream_sid:
-            _verifier.cleanup(stream_sid)
-            voiceprint_enrollment.cleanup(stream_sid)
-            if _GRAPH_ENABLED:
-                try:
-                    await _session.clear(stream_sid)
-                except Exception as e:
-                    print(f"[GRAPH] session clear failed: {e}")
-        # Stage 4c-1 — calls UPDATE finalize (사용자 먼저 끊음)
-        if db_call_id:
-            duration_sec = int(time.perf_counter() - call_started_at) if call_started_at else None
-            try:
-                await finalize_call(db_call_id, "abandoned", duration_sec)
-                print(f"[DB] finalize_call db_call_id={db_call_id} status=abandoned dur={duration_sec}s")
-            except Exception as e:
-                print(f"[DB] finalize_call failed: {e}")
-                traceback.print_exc()
-            # Stage 4c-3 — post_call agent fire-and-forget (abandoned 통화도 분석 트리거)
-            if tenant_id:
-                asyncio.create_task(
-                    run_post_call_agent_safely(db_call_id, "call_ended", tenant_id)
-                )
-                print(f"[POST_CALL] triggered db_call_id={db_call_id} tenant_id={tenant_id}")
+        await _handle_clean_disconnect("disconnect")
+    except RuntimeError as exc:
+        # starlette WebSocket: 완전히 닫힌 후 send/receive → RuntimeError("...not connected...accept...")
+        # WebSocketDisconnect 와 동일 cleanup, traceback 안 찍음.
+        # 매칭 안 되는 RuntimeError 는 일반 분기로 fallthrough (silent swallow 방지).
+        msg = str(exc).lower()
+        if "not connected" in msg or "accept" in msg:
+            print(f"[WS] runtime disconnect: {exc}")
+            await _handle_clean_disconnect("runtime")
+        else:
+            raise
     except Exception as exc:
         # WebSocketDisconnect 외 unhandled 예외 — Twilio 입장에선 우리가 close = Error 31921.
         # traceback 을 stdout 으로 명시 출력해 logs/{date}/stdout_*.log 에 잡히게.
