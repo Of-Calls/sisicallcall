@@ -11,6 +11,10 @@ from twilio.rest import Client as TwilioRestClient
 
 from app.agents.conversational.graph import build_graph
 from app.agents.post_call.runner import run_post_call_agent_safely
+from app.barge_in.inline_verify import evaluate_bargein_during_tts, reset_bargein_state
+from app.barge_in.rolling_buffer import RollingPCMBuffer
+from app.barge_in.session_state import BargeInSessionState
+from app.barge_in.speculative import evaluate_speculative_frame
 from app.repositories.call_repo import finalize_call, insert_call
 from app.repositories.transcript_repo import insert_transcript
 from app.services.session.redis_session import RedisSessionService
@@ -20,6 +24,7 @@ from app.services.stt.deepgram import DeepgramSTTService
 from app.services.tenant import DEFAULT_INDUSTRY, DEFAULT_NAME, get_greeting, get_tenant_meta, resolve_tenant_id
 from app.services.tts.azure import AzureTTSService
 from app.services.tts.filler import pick_filler, pick_filler_continuation
+from app.services.tts.streaming import clear_twilio_audio
 from app.services.vad.silero_vad import SileroVADService
 from app.utils.config import settings
 
@@ -38,6 +43,9 @@ _twilio_rest = (
 
 # Stage 4a — graph 통합 (echo 회귀 환경변수)
 _GRAPH_ENABLED = os.getenv("GRAPH_INTEGRATION_ENABLED", "false").lower() in ("1", "true", "yes")
+# Step 2 — barge-in 회귀 안전망. settings.barge_in_enabled 기준 (pydantic-settings 가 .env 로드 보장).
+_BARGE_IN_ENABLED = settings.barge_in_enabled
+print(f"[BG] _BARGE_IN_ENABLED={_BARGE_IN_ENABLED}")
 
 _VAD_FRAME_BYTES = 1024     # linear16 16kHz, 512 samples
 _SILENCE_THRESHOLD = 45     # 연속 침묵 VAD 프레임 수 (~1440ms)
@@ -186,6 +194,12 @@ async def call_ws(websocket: WebSocket):
     turn_index = 0
     # Phase 2 — auth event listener task (verified/blocked/face_failed/ocr_failed → 자율 발화)
     auth_listener_task: asyncio.Task | None = None
+    # Barge-in Phase 2 — per-call state. _BARGE_IN_ENABLED=false 면 단순 보관용 (영향 없음).
+    bg_session = BargeInSessionState()
+    # Phase 3 — speculative 평가용 1024B 정렬 buffer (일반 pcm_buffer 와 분리, 충돌 회피)
+    bg_pre_buf = bytearray()
+    # 임시 진단 — TTS 송출 중 media 이벤트가 진짜 들어오는지 raw 카운트
+    bg_raw_media_count = 0
 
     try:
         # ── Phase 2/3 inner 함수 — call_ws 의 local closure 캡처 ───────────────
@@ -301,6 +315,10 @@ async def call_ws(websocket: WebSocket):
                 silence_count = 0
                 had_speech = False
                 is_speaking = False
+                # Phase 4 — barge-in 활성 시 rolling buffer 초기화
+                if _BARGE_IN_ENABLED:
+                    bg_session.rolling_pcm_buffer = RollingPCMBuffer()
+                    bg_pre_buf.clear()
                 tenant_id = ""  # 매칭 실패/graph 비활성 시 echo 모드 신호
                 db_call_id = ""
                 call_started_at = time.perf_counter()
@@ -358,10 +376,46 @@ async def call_ws(websocket: WebSocket):
                         print(f"[GRAPH] tenant_meta load failed: {e} → echo fallback this call")
 
             elif event == "media":
-                if is_speaking:
-                    continue  # TTS 송출 중엔 사용자 발화 무시 — barge-in 은 Stage 3 에서 도입
-
                 mulaw = base64.b64decode(msg["media"]["payload"])
+
+                # Step 2 — TTS 송출 중 barge-in 검증 (RMS pre-gate + 0.8s + VAD + TitaNet)
+                if is_speaking:
+                    if _BARGE_IN_ENABLED:
+                        # 임시 진단 — Twilio half-duplex 검증
+                        bg_raw_media_count += 1
+                        if bg_raw_media_count == 1 or bg_raw_media_count % 50 == 0:
+                            print(f"[BG-RAW] media in TTS count={bg_raw_media_count}")
+                        triggered = await evaluate_bargein_during_tts(
+                            mulaw, _vad, _verifier, stream_sid, bg_session,
+                        )
+                        if triggered:
+                            # active_turn_id +1 — play_task 의 stale 검사 트리거
+                            bg_session.active_turn_id += 1
+                            # graph_task cancel (bg_session 에 저장됨)
+                            if bg_session.active_graph_task and not bg_session.active_graph_task.done():
+                                bg_session.active_graph_task.cancel()
+                                print("[BARGEIN] graph_task cancelled")
+                            # play_task cancel (Step 3 — TTS 재생 task)
+                            if bg_session.active_play_task and not bg_session.active_play_task.done():
+                                bg_session.active_play_task.cancel()
+                                print("[BARGEIN] play_task cancelled")
+                            # Twilio 미재생 큐 비우기
+                            try:
+                                await clear_twilio_audio(websocket, stream_sid)
+                                print("[BARGEIN] twilio cleared")
+                            except Exception as e:
+                                print(f"[BARGEIN] clear failed: {e}")
+                            # lock 해제 + buffer reset (다음 사용자 발화 자연 처리)
+                            is_speaking = False
+                            audio_buffer.clear()
+                            pcm_buffer.clear()
+                            utterance_pcm.clear()
+                            ratecv_state = None
+                            silence_count = 0
+                            had_speech = False
+                            reset_bargein_state(bg_session)
+                    continue
+
                 audio_buffer.extend(mulaw)
 
                 pcm_8k = audioop.ulaw2lin(mulaw, 2)
@@ -449,6 +503,9 @@ async def call_ws(websocket: WebSocket):
                                             transcript, tenant_id, tenant_name, tenant_industry, stream_sid,
                                         )
                                     )
+                                    # Step 2 — bg_session 에 저장 (media 분기 cancel 접근용)
+                                    if _BARGE_IN_ENABLED:
+                                        bg_session.active_graph_task = graph_task
 
                                 # filler 즉시 송출 — graph 진행 중 사용자 무음 갭 채움.
                                 # cache 비어있으면 (startup 합성 실패) skip — 기존 흐름 그대로.
@@ -493,8 +550,16 @@ async def call_ws(websocket: WebSocket):
                                             response_text = graph_resp
                                         else:
                                             print("[GRAPH] empty response — echo fallback")
+                                    except asyncio.CancelledError:
+                                        # Step 2 — barge-in 으로 cancel 됨. TTS skip + 다음 사용자 발화 대기.
+                                        print("[GRAPH] cancelled (barge-in) → skip turn")
+                                        if _BARGE_IN_ENABLED:
+                                            bg_session.active_graph_task = None
+                                        continue
                                     except Exception as e:
                                         print(f"[GRAPH] error: {e} → echo fallback")
+                                    if _BARGE_IN_ENABLED:
+                                        bg_session.active_graph_task = None
 
                                 # Stage 4c-2 — transcripts INSERT 양방향 (TTS 송출 전).
                                 # DB 실패해도 통화 지속 (DB 누락만, traceback 명시).
@@ -553,39 +618,65 @@ async def call_ws(websocket: WebSocket):
                                     is_speaking = False
                                     continue
 
+                                # Step 3 — TTS 재생을 background task 로 분리 (근본 해결).
+                                # 이전 batch + await asyncio.sleep(play_sec) 패턴은 main loop 를
+                                # play_sec 동안 block → receive_text 호출 안 됨 → TTS 송출 중 사용자
+                                # media event 처리 못 함 → barge-in detection 원천 불가능.
+                                # task 로 분리하면 main loop 즉시 복귀 → receive_text 계속 동작.
                                 is_speaking = True
-                                # _send_audio_to_twilio 실패 = WebSocket 손상 신호. raise 해서
-                                # outer except Exception 분기가 정리/traceback 처리.
-                                t_send = time.perf_counter()
-                                await _send_audio_to_twilio(websocket, stream_sid, tts_audio)
-                                send_ms = (time.perf_counter() - t_send) * 1000
-                                print(f"[TTS] 송출 {send_ms:.0f}ms")
+                                bg_session.active_turn_id += 1
+                                _my_turn = bg_session.active_turn_id
+                                if _BARGE_IN_ENABLED:
+                                    bg_session.tts_started_at = time.time()
+                                    bg_session.last_bot_utterance = response_text
+                                _captured_audio = tts_audio
+                                _captured_should_hangup = should_hangup
+                                _captured_twilio_sid = twilio_call_sid
+                                _captured_play_sec = len(tts_audio) / 8000
 
-                                # 실제 재생 시간만큼 대기 — Twilio 큐가 비워질 때까지 is_speaking 유지
-                                # (송출 ≠ 재생. mulaw 8kHz = 8000B/s)
-                                play_sec = len(tts_audio) / 8000
-                                await asyncio.sleep(play_sec)
-                                is_speaking = False
-                                print(f"[TTS] 재생 끝 ({play_sec:.2f}s)")
-
-                                # TTS 후 buffer / VAD state 일괄 리셋 — 잔향/echo 누적 방지
-                                audio_buffer.clear()
-                                pcm_buffer.clear()
-                                utterance_pcm.clear()
-                                ratecv_state = None
-                                silence_count = 0
-                                had_speech = False
-
-                                # Polish — goodbye 분기에서 should_hangup=True → Twilio REST API hangup
-                                if should_hangup and twilio_call_sid and _twilio_rest is not None:
+                                async def _play_and_release(turn_id: int) -> None:
+                                    nonlocal is_speaking, ratecv_state, silence_count, had_speech
                                     try:
-                                        await asyncio.to_thread(
-                                            _twilio_rest.calls(twilio_call_sid).update,
-                                            status="completed",
-                                        )
-                                        print(f"[HANGUP] Twilio call terminated: {twilio_call_sid}")
-                                    except Exception as e:
-                                        print(f"[HANGUP] failed: {e}")
+                                        t = time.perf_counter()
+                                        await _send_audio_to_twilio(websocket, stream_sid, _captured_audio)
+                                        print(f"[TTS] 송출 {(time.perf_counter() - t) * 1000:.0f}ms")
+                                        await asyncio.sleep(_captured_play_sec)
+                                    except asyncio.CancelledError:
+                                        print(f"[TTS] play_task cancelled (barge-in turn={turn_id})")
+                                        return
+                                    except Exception as exc:
+                                        print(f"[TTS] play task error: {type(exc).__name__}: {exc}")
+                                        return
+                                    # stale 체크 — barge-in cancel 시 active_turn_id 가 증가됨
+                                    if turn_id != bg_session.active_turn_id:
+                                        print(f"[TTS] release skip (stale turn={turn_id} cur={bg_session.active_turn_id})")
+                                        return
+                                    is_speaking = False
+                                    audio_buffer.clear()
+                                    pcm_buffer.clear()
+                                    utterance_pcm.clear()
+                                    ratecv_state = None
+                                    silence_count = 0
+                                    had_speech = False
+                                    print(f"[TTS] 재생 끝 ({_captured_play_sec:.2f}s)")
+                                    if _BARGE_IN_ENABLED:
+                                        reset_bargein_state(bg_session)
+                                    # goodbye hangup (TTS 재생 완료 후)
+                                    if _captured_should_hangup and _captured_twilio_sid and _twilio_rest is not None:
+                                        try:
+                                            await asyncio.to_thread(
+                                                _twilio_rest.calls(_captured_twilio_sid).update,
+                                                status="completed",
+                                            )
+                                            print(f"[HANGUP] Twilio call terminated: {_captured_twilio_sid}")
+                                        except Exception as e:
+                                            print(f"[HANGUP] failed: {e}")
+
+                                bg_session.active_play_task = asyncio.create_task(
+                                    _play_and_release(_my_turn)
+                                )
+                                # main loop 즉시 복귀 — receive_text 가 계속 호출되어 media event 즉시 처리.
+                                # buffer reset / hangup 은 _play_and_release 안에서 처리됨.
                             else:
                                 # 빈 STT 또는 stream_sid 없음 — 처리 lock 해제 + buffer 정리.
                                 # STT 동안 큐에 쌓였던 audio (재발화 등) 폐기 → 다음 turn 깨끗.
@@ -598,11 +689,27 @@ async def call_ws(websocket: WebSocket):
                                 had_speech = False
                                 is_speaking = False
 
+            elif event == "mark":
+                # Phase 5 — Twilio 가 chunk 실제 재생 시 callback. last_played_chunk_index 갱신.
+                # 봇이 어디까지 말했는지 추적 (spoken_portion 계산용).
+                if not _BARGE_IN_ENABLED:
+                    continue
+                mark_name = (msg.get("mark") or {}).get("name", "")
+                bg_session.last_played_mark = mark_name
+                # 형식: "turn-N-chunk-K" — 마지막 segment 가 chunk index
+                try:
+                    bg_session.last_played_chunk_index = int(mark_name.rsplit("-", 1)[1])
+                except (IndexError, ValueError):
+                    pass
+
             elif event == "stop":
                 print("[WS] stop")
                 if auth_listener_task and not auth_listener_task.done():
                     auth_listener_task.cancel()
                     print("[PUSH] listener cancelled (stop)")
+                if bg_session.active_play_task and not bg_session.active_play_task.done():
+                    bg_session.active_play_task.cancel()
+                    print("[TTS] play_task cancelled (stop)")
                 if stream_sid:
                     _verifier.cleanup(stream_sid)
                     voiceprint_enrollment.cleanup(stream_sid)
@@ -634,6 +741,9 @@ async def call_ws(websocket: WebSocket):
         if auth_listener_task and not auth_listener_task.done():
             auth_listener_task.cancel()
             print("[PUSH] listener cancelled (disconnect)")
+        if bg_session.active_play_task and not bg_session.active_play_task.done():
+            bg_session.active_play_task.cancel()
+            print("[TTS] play_task cancelled (disconnect)")
         if stream_sid:
             _verifier.cleanup(stream_sid)
             voiceprint_enrollment.cleanup(stream_sid)
@@ -665,6 +775,9 @@ async def call_ws(websocket: WebSocket):
         if auth_listener_task and not auth_listener_task.done():
             auth_listener_task.cancel()
             print("[PUSH] listener cancelled (error)")
+        if bg_session.active_play_task and not bg_session.active_play_task.done():
+            bg_session.active_play_task.cancel()
+            print("[TTS] play_task cancelled (error)")
         if stream_sid:
             try:
                 _verifier.cleanup(stream_sid)
