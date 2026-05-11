@@ -142,17 +142,42 @@ async def get_priority_queue(tenant_id: str | None = None) -> list[dict]:
     if tenant_id is not None:
         records = [r for r in records if r.get("tenant_id") == tenant_id]
 
+    def _to_bool(value: object) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in {"true", "1", "yes", "y"}
+        if isinstance(value, (int, float)):
+            return value != 0
+        return False
+
+    def _normalize_resolution_status(value: object) -> str | None:
+        if not isinstance(value, str):
+            return None
+
+        normalized = value.strip().lower()
+        if normalized in {"resolved", "escalated", "abandoned"}:
+            return normalized
+
+        return None
+
     queue: list[dict] = []
     for r in records:
         pr = r.get("priority_result") or {}
         ap = r.get("action_plan") or {}
-        priority = pr.get("priority") or pr.get("tier") or "low"
-        action_required = bool(pr.get("action_required") or ap.get("action_required"))
+        summary = r.get("summary") or {}
+        voc = r.get("voc_analysis") or {}
+        intent = voc.get("intent_result") or {}
+
+        priority = str(pr.get("priority") or pr.get("tier") or "low").strip().lower()
+        action_required = _to_bool(pr.get("action_required")) or _to_bool(ap.get("action_required"))
+        resolution_status = _normalize_resolution_status(summary.get("resolution_status"))
+
+        # TODO: 상담원 연결 완료 상태를 별도로 저장하는 handoff_status 또는
+        # agent_handoff_status 필드가 생기면 이 계산식에 해당 상태를 반영해야 한다.
+        follow_up_required = action_required and resolution_status != "resolved"
 
         if priority in ("high", "critical") or action_required:
-            summary = r.get("summary") or {}
-            voc = r.get("voc_analysis") or {}
-            intent = voc.get("intent_result") or {}
             queue.append({
                 "call_id": r.get("call_id", ""),
                 "tenant_id": r.get("tenant_id", ""),
@@ -161,11 +186,13 @@ async def get_priority_queue(tenant_id: str | None = None) -> list[dict]:
                 "primary_category": intent.get("primary_category", ""),
                 "reason": pr.get("reason", ""),
                 "created_at": r.get("created_at", ""),
+                "action_required": action_required,
+                "resolution_status": resolution_status,
+                "follow_up_required": follow_up_required,
             })
 
     queue.sort(key=lambda x: _PRIORITY_ORDER.get(x["priority"], 99))
     return copy.deepcopy(queue)
-
 
 # ── Backward-compatible class interface (used by save_result_node) ────────────
 
