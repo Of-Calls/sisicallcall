@@ -2523,3 +2523,95 @@ async def test_corrections_to_analysis_applied_before_save(monkeypatch):
     last = saved_summaries[-1]
     assert last.get("handoff_notes") in (None, ""), \
         f"보정 적용 실패. handoff_notes={last.get('handoff_notes')!r}"
+
+
+# ── _SYSTEM_PROMPT_TEMPLATE: 옵션 A+B 반영 검증 (prompt 문자열 assertion) ──────
+# Planner LLM 판단 개선 PR — KDT-73/Post-call-Agent.
+# 옵션 A (명시적 의도 우선 규칙) + 옵션 B (다중 의도 분리 가이드 강화) 가
+# system prompt 에 반영되었는지 문자열 수준에서 확인. LLM 호출 없음.
+
+def test_system_prompt_has_explicit_intent_priority_section():
+    """[명시적 의도 우선 규칙] 섹션 존재 + emotion/priority 무관 명시."""
+    prompt = planner_mod._SYSTEM_PROMPT_TEMPLATE
+    assert "[명시적 의도 우선 규칙" in prompt, \
+        "[명시적 의도 우선 규칙] 섹션이 prompt 에 없음"
+    # 이 규칙은 emotion/priority/안전성 default 보다 우선한다는 명시
+    assert "emotion/priority" in prompt, \
+        "명시적 의도 우선 규칙의 emotion/priority 무관 명시 누락"
+
+
+def test_system_prompt_lists_explicit_intent_trigger_keywords():
+    """옵션 A — 5개 트리거 패턴이 prompt 에 모두 나열되어야 함."""
+    prompt = planner_mod._SYSTEM_PROMPT_TEMPLATE
+    # 1) 콜백 시간 + 전화번호 동시 명시
+    assert "콜백 시간" in prompt and "010-" in prompt, \
+        "콜백 시간 + 전화번호 트리거 누락"
+    assert "propose_schedule_callback" in prompt
+    # 2) 본인인증
+    assert "본인인증" in prompt and "신분증" in prompt, "본인인증 트리거 누락"
+    # 3) 별개 VOC 2건 이상
+    assert "별개 VOC" in prompt, "별개 VOC 다건 트리거 누락"
+    # 4) 교환 / 반품 / 환불
+    for kw in ("교환", "반품", "환불"):
+        assert kw in prompt, f"트리거 키워드 누락: {kw}"
+    # 5) 분쟁/신고/소송/법적 키워드
+    for kw in ("신고", "소송", "분쟁", "법적"):
+        assert kw in prompt, f"분쟁 키워드 누락: {kw}"
+    assert "propose_send_slack_alert" in prompt
+
+
+def test_system_prompt_block_order_safety_default_after_priority_rule():
+    """블록 순서: [명시적 의도 우선 규칙] 이 [안내성 1회 통합 — 안전성 default] 보다 앞.
+
+    안전성 default 가 명시적 의도를 덮어쓰는 학습 방지를 위한 진단상의 핵심 변경.
+    """
+    prompt = planner_mod._SYSTEM_PROMPT_TEMPLATE
+    pos_priority_rule = prompt.find("[명시적 의도 우선 규칙")
+    pos_safety_default = prompt.find("[안내성 1회 통합")
+    assert pos_priority_rule != -1, "[명시적 의도 우선 규칙] 섹션 누락"
+    assert pos_safety_default != -1, "[안내성 1회 통합] 섹션 누락"
+    assert pos_priority_rule < pos_safety_default, (
+        "블록 순서 위반 — [명시적 의도 우선 규칙] 이 [안내성 1회 통합 (안전성 default)] "
+        "보다 뒤에 있다. 안전성 default 가 명시 의도를 덮어쓰는 학습이 다시 발생할 위험."
+    )
+
+
+def test_system_prompt_safety_default_has_explicit_priority_exception():
+    """[안내성 1회 통합] 에 명시적 의도 우선 규칙 예외 조항이 있어야 함 (옵션 B)."""
+    prompt = planner_mod._SYSTEM_PROMPT_TEMPLATE
+    # "예외:" 표기 + 명시적 의도 우선 규칙 참조
+    assert "예외" in prompt, "안전성 default 예외 조항 누락"
+    # 별개 VOC × N 예시 명시
+    assert "create_jira_ticket × 2" in prompt or "create_jira_ticket × N" in prompt, \
+        "별개 VOC 다건 예외 예시 누락"
+
+
+def test_system_prompt_includes_good_examples_for_multi_intent_cases():
+    """옵션 B — e2e-verify-001 / e2e-complex-001 시나리오 대응 GOOD example 포함."""
+    prompt = planner_mod._SYSTEM_PROMPT_TEMPLATE
+    # GOOD 1 — 교환 + 콜백 (e2e-verify-001 류)
+    assert "[GOOD 1" in prompt, "GOOD example 1 (교환 + 콜백) 누락"
+    # GOOD 2 — 다중 VOC + 본인인증 + 콜백 + 상담원 연결 (e2e-complex-001 류)
+    assert "[GOOD 2" in prompt, "GOOD example 2 (다중 VOC) 누락"
+    # GOOD 2 에 "SMS 7번 반복 금지" 가이드 포함 (case B 재발 방지)
+    assert "SMS 7번 반복" in prompt or "같은 SMS" in prompt, \
+        "SMS 반복 금지 가이드 누락"
+    # GOOD 3 — 별개 VOC 2건 (기존 케이스 유지)
+    assert "[GOOD 3" in prompt, "GOOD example 3 (별개 VOC 2건) 누락"
+
+
+def test_system_prompt_token_budget_under_baseline_plus_10pct():
+    """토큰 예산 검증 — 변경 후 prompt 가 합리적 범위 안인지 (regression 가드).
+
+    KDT-73 진단 baseline = 1095 tokens (gpt-4o o200k_base). 본 PR 후 967 tokens.
+    회귀 방지로 1204 (= baseline * 1.1) 미만을 강제. tiktoken 없으면 skip.
+    """
+    pytest.importorskip("tiktoken")
+    import tiktoken
+    enc = tiktoken.encoding_for_model("gpt-4o")
+    prompt = planner_mod._SYSTEM_PROMPT_TEMPLATE
+    n = len(enc.encode(prompt))
+    assert n < 1205, (
+        f"prompt 토큰 {n} 이 baseline*1.10=1204 초과. "
+        "PR 변경에서 prompt 가 의도치 않게 비대해졌을 가능성."
+    )
