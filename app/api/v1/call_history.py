@@ -78,6 +78,10 @@ async def list_calls(
     )
 
     return {
+        "items": result["items"],
+        "total": result["total"],
+        "offset": offset,
+        "limit": effective_limit,
         "data": {
             "items": result["items"],
             "total": result["total"],

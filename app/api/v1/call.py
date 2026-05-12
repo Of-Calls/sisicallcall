@@ -74,6 +74,19 @@ async def _warmup_openai_for_incoming() -> None:
         print(f"[WARMUP] OpenAI warmup failed: {e}")
 
 
+async def _warmup_tts_for_incoming() -> None:
+    """incoming POST 시점에 Azure TTS connection 워밍 — 첫 본 응답 합성 cold start 회피.
+    Filler 는 startup 시 prebuilt bytes 캐시 → 새 통화에서 Azure TTS 호출 안 함.
+    본 응답 첫 합성 시점에 SDK connection setup 비용 (~5초) 발생하므로 incoming 시 더미 1회.
+    """
+    try:
+        from app.services.tts.azure import AzureTTSService
+        await AzureTTSService().synthesize("워밍")
+        print("[WARMUP] Azure TTS connection warmed for incoming call")
+    except Exception as e:
+        print(f"[WARMUP] Azure TTS warmup failed: {e}")
+
+
 @router.post("/incoming")
 async def incoming_call(request: Request):
     form = await request.form()
@@ -85,9 +98,10 @@ async def incoming_call(request: Request):
     tenant_id = await resolve_tenant_id(to_field)
     print(f"[INCOMING] to={to_field!r} caller={caller_number!r} call_sid={twilio_call_sid!r} tenant_id={tenant_id!r}")
 
-    # OpenAI connection 워밍 fire-and-forget — 첫 LLM 호출 (~12-19s 후) 까지 hot 보장.
+    # OpenAI / Azure TTS connection 워밍 fire-and-forget — 첫 호출까지 hot 보장.
     if settings.warmup_enabled:
         asyncio.create_task(_warmup_openai_for_incoming())
+        asyncio.create_task(_warmup_tts_for_incoming())
 
     host = request.headers.get("host", "")
     ws_url = f"wss://{host}/call/ws"
