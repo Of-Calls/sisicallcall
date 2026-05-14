@@ -52,6 +52,7 @@ GEMINI.md
 
 # docs
 docs/
+/data
 
 # 테스트 데이터 파일
 tests/*.pdf

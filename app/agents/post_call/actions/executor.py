@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from app.agents.post_call.actions.result import action_failed, action_skipped, action_success
-from app.repositories.mcp_action_log_repo import find_successful_action
+from app.repositories.mcp_action_log_repo import find_existing_action
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -40,18 +40,18 @@ class ActionExecutor:
             return []
         results: list[dict] = []
         for action in actions:
+            # D-4: ActionItem.priority 가 있으면 params 에 자동 주입 (외부 시스템에 priority 전달 보장).
+            # post-call agent 가 priority 를 ActionItem 에만 두고 params 에서 뺐으므로
+            # connector 가 params 만 보는 경우를 안전하게 커버.
+            normalized = dict(action)
+            if "priority" in normalized:
+                params = dict(normalized.get("params") or {})
+                params.setdefault("priority", normalized["priority"])
+                normalized["params"] = params
             results.append(
-                await self._execute_one(action, call_id=call_id, tenant_id=tenant_id)
+                await self._execute_one(normalized, call_id=call_id, tenant_id=tenant_id)
             )
         return results
-
-    async def execute_all(self, actions: list[dict], *, call_id: str) -> list[dict]:
-        """후방 호환 인터페이스 — action_router_node 가 호출한다."""
-        return await self.execute_actions(
-            call_id=call_id,
-            tenant_id="",
-            actions=actions,
-        )
 
     async def _execute_one(
         self,
@@ -68,25 +68,41 @@ class ActionExecutor:
 
         tool_key = action.get("tool", "")
         action_type = action.get("action_type", "")
+        idempotency_token = action.get("idempotency_token")
 
         # ── idempotency check ───────────────────────────────────────────────
-        previous = await find_successful_action(
+        # status 무관 매칭 — 같은 (call_id, action_type, tool, token) row 가
+        # 하나라도 있으면 (success/skipped/failed 무관) 차단.
+        # 이유: sms_config_missing / oauth_expired 등 환경 이슈로 skipped 된
+        # 케이스도 재시도 의미 없음. 한 통화에서 같은 의도의 액션은 1 row 만.
+        # token 이 None 이면 (call_id, action_type, tool) 3-tuple 매칭.
+        previous = await find_existing_action(
             call_id=call_id,
             action_type=action_type,
             tool=tool_key,
+            idempotency_token=idempotency_token,
         )
         if previous:
+            prev_status = previous.get("status") or "unknown"
+            reason = (
+                "already_succeeded"
+                if prev_status == "success"
+                else f"already_attempted({prev_status})"
+            )
             logger.info(
-                "action idempotency skip call_id=%s tool=%s action_type=%s previous_external_id=%s",
+                "action idempotency skip call_id=%s tool=%s action_type=%s token=%s "
+                "previous_status=%s previous_external_id=%s",
                 call_id,
                 tool_key,
                 action_type,
+                idempotency_token,
+                prev_status,
                 previous.get("external_id"),
             )
             skip_result: dict = {
-                "idempotency": "already_succeeded",
+                "idempotency": reason,
                 "previous_external_id": previous.get("external_id"),
-                "previous_status": previous.get("status"),
+                "previous_status": prev_status,
                 "source": "mcp_server",
                 "via_mcp": True,
                 "execution_mode": "mcp",
@@ -96,7 +112,7 @@ class ActionExecutor:
                 skip_result["mcp_tool"] = resolved_mcp_tool
             return action_skipped(
                 action,
-                reason="already_succeeded",
+                reason=reason,
                 result=skip_result,
             )
 

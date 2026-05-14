@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import json
+import uuid
 from datetime import datetime
 
 import pytest
@@ -36,19 +37,107 @@ from tests.fixtures.sample_transcripts import (
 )
 
 
+class _FakeActionLogConn:
+    """mcp_action_logs db-only 모드의 단위 테스트용 in-memory simulator.
+
+    SQL 텍스트를 거칠게 매칭해 INSERT 는 dict list 에 누적, SELECT 는 그 list 에서
+    필터링. 실제 Postgres 동작과 1:1 동등하지는 않지만 file/memory store 가
+    사라진 뒤에도 기존 통합 테스트 의도 (보존, 멱등, tenant 필터, idempotency
+    token) 를 유지하기에 충분하다.
+    """
+
+    def __init__(self, rows: list[dict]) -> None:
+        self._rows = rows
+
+    async def execute(self, sql: str, *args):
+        if "INSERT INTO mcp_action_logs" in sql:
+            self._rows.append({
+                "id": str(uuid.uuid4()),
+                "call_id": args[0],
+                "tenant_id": args[1],
+                "action_type": args[2],
+                "tool_name": args[3],
+                "request_payload": args[4],
+                "response_payload": args[5],
+                "status": args[6],
+                "external_id": args[7],
+                "error_message": args[8],
+                "created_at": args[9],
+                "updated_at": args[10],
+            })
+        return "INSERT 0 1"
+
+    async def fetch(self, sql: str, *args):
+        results = list(self._rows)
+        if "WHERE call_id = $1" in sql and args:
+            results = [r for r in results if r["call_id"] == args[0]]
+            if "lower(COALESCE(tenant_id" in sql and len(args) >= 2:
+                tlow = str(args[1]).lower()
+                results = [
+                    r for r in results
+                    if str(r.get("tenant_id") or "").lower() == tlow
+                ]
+        elif "WHERE tenant_id = $1" in sql and args:
+            results = [r for r in results if r.get("tenant_id") == args[0]]
+        results.sort(key=lambda r: str(r.get("created_at") or ""))
+        return results
+
+    async def fetchrow(self, sql: str, *args):
+        results = [
+            r for r in self._rows
+            if r["call_id"] == args[0]
+            and r["action_type"] == args[1]
+            and r["tool_name"] == args[2]
+            and r["status"] == "success"
+        ]
+        if "request_payload->>'idempotency_token'" in sql and len(args) >= 4:
+            token = args[3]
+            filtered = []
+            for r in results:
+                req = r.get("request_payload")
+                if isinstance(req, str):
+                    try:
+                        parsed = json.loads(req)
+                    except Exception:
+                        parsed = {}
+                else:
+                    parsed = req or {}
+                if isinstance(parsed, dict) and parsed.get("idempotency_token") == token:
+                    filtered.append(r)
+            results = filtered
+        if not results:
+            return None
+        # 가장 최근
+        results.sort(key=lambda r: str(r.get("created_at") or ""))
+        return results[-1]
+
+    async def close(self):
+        return None
+
+
 @pytest.fixture(autouse=True)
 def reset_stores(monkeypatch, tmp_path):
-    """모든 in-memory store를 테스트 전후로 초기화한다."""
-    monkeypatch.setenv("MCP_ACTION_LOG_STORE", "file")
-    monkeypatch.setenv("MCP_ACTION_LOG_FILE", str(tmp_path / "mcp_action_logs.json"))
+    """모든 in-memory store를 테스트 전후로 초기화한다.
+
+    NOTE: mcp_action_log_repo 는 db-only 로 단순화됨 — file/memory store 없음.
+    asyncpg.connect 를 fake 로 자동 치환해 단위 테스트가 DB 없이 동작.
+    """
     summary_mod._reset()
     voc_mod._reset()
-    action_mod._reset(remove_file=True)
     dashboard_mod._reset()
+
+    # mcp_action_logs db-only — fake asyncpg
+    action_log_rows: list[dict] = []
+
+    async def _fake_connect(url):
+        return _FakeActionLogConn(action_log_rows)
+
+    monkeypatch.setattr(action_mod.asyncpg, "connect", _fake_connect)
+
     yield
+
     summary_mod._reset()
     voc_mod._reset()
-    action_mod._reset(remove_file=True)
     dashboard_mod._reset()
 
 
@@ -242,7 +331,8 @@ async def test_save_action_logs_appends_without_replacing():
 
 
 @pytest.mark.asyncio
-async def test_save_action_logs_creates_file_store():
+async def test_save_action_logs_persists_via_db():
+    """db-only 모드 — INSERT 후 SELECT 가 같은 row 를 돌려준다."""
     actions = [{
         "action_type": "create_jira_issue",
         "tool": "jira",
@@ -253,11 +343,12 @@ async def test_save_action_logs_creates_file_store():
         "params": {"summary": "demo"},
     }]
 
-    await save_action_logs("call-file-001", "tenant-x", actions)
+    await save_action_logs("call-db-001", "tenant-x", actions)
 
-    path = action_mod._get_store_path()
-    assert path.exists()
-    assert "call-file-001" in path.read_text(encoding="utf-8")
+    logs = await get_action_logs_by_call_id("call-db-001")
+    assert len(logs) == 1
+    assert logs[0]["action_type"] == "create_jira_issue"
+    assert logs[0]["external_id"] == "KDT-1"
 
 
 @pytest.mark.asyncio
@@ -315,7 +406,7 @@ async def test_find_successful_action_loads_success_from_file():
             "params": {},
         }],
     )
-    action_mod._action_store.clear()
+    # NOTE: db-only — _action_store 가 사라졌으므로 별도 cache clear 불필요
 
     found = await find_successful_action("call-file-002", "create_jira_issue", "jira")
 
@@ -350,16 +441,17 @@ async def test_find_successful_action_ignores_failed_and_skipped_from_file():
             },
         ],
     )
-    action_mod._action_store.clear()
+    # NOTE: db-only — _action_store 가 사라졌으므로 별도 cache clear 불필요
 
     assert await find_successful_action("call-file-003", "create_jira_issue", "jira") is None
     assert await find_successful_action("call-file-003", "send_manager_email", "gmail") is None
 
 
 @pytest.mark.asyncio
-async def test_save_action_logs_appends_existing_file_logs():
+async def test_save_action_logs_preserves_existing_logs():
+    """동일 call_id 로 두 번 save 하면 두 INSERT 모두 보존 (UNIQUE 없음 → 다중 row)."""
     await save_action_logs(
-        "call-file-004",
+        "call-multi-004",
         "tenant-x",
         [{
             "action_type": "first_action",
@@ -371,10 +463,9 @@ async def test_save_action_logs_appends_existing_file_logs():
             "params": {},
         }],
     )
-    action_mod._action_store.clear()
 
     await save_action_logs(
-        "call-file-004",
+        "call-multi-004",
         "tenant-x",
         [{
             "action_type": "second_action",
@@ -386,52 +477,20 @@ async def test_save_action_logs_appends_existing_file_logs():
             "params": {},
         }],
     )
-    action_mod._action_store.clear()
 
-    logs = await get_action_logs_by_call_id("call-file-004")
+    logs = await get_action_logs_by_call_id("call-multi-004")
     assert len(logs) == 2
     assert logs[0]["action_type"] == "first_action"
     assert logs[1]["action_type"] == "second_action"
 
 
-@pytest.mark.asyncio
-async def test_action_log_reset_can_remove_file_store():
-    await save_action_logs(
-        "call-file-005",
-        "tenant-x",
-        [{
-            "action_type": "create_jira_issue",
-            "tool": "jira",
-            "status": "success",
-            "external_id": "KDT-5",
-            "error": None,
-            "result": {},
-            "params": {},
-        }],
-    )
-    path = action_mod._get_store_path()
-    assert path.exists()
-
-    action_mod._reset(remove_file=True)
-
-    assert not path.exists()
-
-
-def test_action_log_store_mode_defaults_to_file(monkeypatch):
-    monkeypatch.delenv("MCP_ACTION_LOG_STORE", raising=False)
-
-    assert action_mod._get_store_mode() == "file"
-
-
-def test_action_log_store_mode_can_select_db(monkeypatch):
-    monkeypatch.setenv("MCP_ACTION_LOG_STORE", "db")
-
-    assert action_mod._get_store_mode() == "db"
+# NOTE: file mode 테스트들 (test_action_log_reset_can_remove_file_store /
+# test_action_log_store_mode_*) 은 db-only 전환과 함께 삭제됨.
+# _reset / _get_store_mode / _get_store_path 함수 자체가 더 이상 존재하지 않는다.
 
 
 @pytest.mark.asyncio
 async def test_db_store_save_action_logs_inserts_rows(monkeypatch):
-    monkeypatch.setenv("MCP_ACTION_LOG_STORE", "db")
     calls: list[tuple] = []
 
     class FakeConn:
@@ -481,34 +540,14 @@ async def test_db_store_save_action_logs_inserts_rows(monkeypatch):
     assert args[10].tzinfo is not None, "updated_at은 timezone-aware datetime이어야 함"
 
 
-@pytest.mark.asyncio
-async def test_save_action_logs_file_created_at_is_iso_string():
-    """file mode로 저장된 JSON에서 created_at/updated_at은 ISO string이어야 한다."""
-    actions = [{
-        "action_type": "create_jira_issue",
-        "tool": "jira",
-        "status": "success",
-        "external_id": "KDT-dt-001",
-        "error": None,
-        "result": {},
-        "params": {},
-    }]
-    await save_action_logs("call-dt-001", "tenant-x", actions)
-
-    path = action_mod._get_store_path()
-    raw = json.loads(path.read_text(encoding="utf-8"))
-    entry = raw["call-dt-001"][0]
-
-    assert isinstance(entry["created_at"], str), "file JSON의 created_at은 str이어야 함"
-    assert isinstance(entry["updated_at"], str), "file JSON의 updated_at은 str이어야 함"
-    # ISO 형식 파싱 가능해야 함
-    datetime.fromisoformat(entry["created_at"].replace("Z", "+00:00"))
-    datetime.fromisoformat(entry["updated_at"].replace("Z", "+00:00"))
+# NOTE: test_save_action_logs_file_created_at_is_iso_string 은 file mode 전용
+# 직렬화 검증이라 db-only 전환과 함께 삭제. db 모드에서는 created_at/updated_at
+# 가 datetime 객체로 INSERT 되므로 test_db_store_save_action_logs_inserts_rows 에서
+# 이미 검증.
 
 
 @pytest.mark.asyncio
 async def test_db_store_find_successful_action_uses_idempotency_query(monkeypatch):
-    monkeypatch.setenv("MCP_ACTION_LOG_STORE", "db")
     calls: list[tuple] = []
     row = {
         "call_id": "call-db-002",
